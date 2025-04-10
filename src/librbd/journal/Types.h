@@ -13,9 +13,9 @@
 #include "librbd/Types.h"
 #include <iosfwd>
 #include <list>
+#include <variant>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
-#include <boost/variant.hpp>
 #include <boost/mpl/vector.hpp>
 
 namespace ceph {
@@ -372,12 +372,12 @@ struct UpdateFeaturesEvent : public OpEventBase {
 struct MetadataSetEvent : public OpEventBase {
   static const EventType TYPE = EVENT_TYPE_METADATA_SET;
 
-  string key;
-  string value;
+  std::string key;
+  std::string value;
 
   MetadataSetEvent() {
   }
-  MetadataSetEvent(uint64_t op_tid, const string &_key, const string &_value)
+  MetadataSetEvent(uint64_t op_tid, const std::string &_key, const std::string &_value)
     : OpEventBase(op_tid), key(_key), value(_value) {
   }
 
@@ -389,11 +389,11 @@ struct MetadataSetEvent : public OpEventBase {
 struct MetadataRemoveEvent : public OpEventBase {
   static const EventType TYPE = EVENT_TYPE_METADATA_REMOVE;
 
-  string key;
+  std::string key;
 
   MetadataRemoveEvent() {
   }
-  MetadataRemoveEvent(uint64_t op_tid, const string &_key)
+  MetadataRemoveEvent(uint64_t op_tid, const std::string &_key)
     : OpEventBase(op_tid), key(_key) {
   }
 
@@ -410,7 +410,7 @@ struct UnknownEvent {
   void dump(Formatter *f) const;
 };
 
-typedef boost::mpl::vector<AioDiscardEvent,
+using Event = std::variant<AioDiscardEvent,
                            AioWriteEvent,
                            AioFlushEvent,
                            OpFinishEvent,
@@ -430,8 +430,7 @@ typedef boost::mpl::vector<AioDiscardEvent,
                            MetadataRemoveEvent,
                            AioWriteSameEvent,
                            AioCompareAndWriteEvent,
-                           UnknownEvent> EventVector;
-typedef boost::make_variant_over<EventVector>::type Event;
+                           UnknownEvent>;
 
 struct EventEntry {
   static uint32_t get_fixed_size() {
@@ -575,10 +574,10 @@ struct UnknownClientMeta {
   void dump(Formatter *f) const;
 };
 
-typedef boost::variant<ImageClientMeta,
-                       MirrorPeerClientMeta,
-                       CliClientMeta,
-                       UnknownClientMeta> ClientMeta;
+using ClientMeta = std::variant<ImageClientMeta,
+                                MirrorPeerClientMeta,
+                                CliClientMeta,
+                                UnknownClientMeta>;
 
 struct ClientData {
   ClientData() {

@@ -1,7 +1,7 @@
 import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';
 import { TestBed } from '@angular/core/testing';
 
-import { configureTestBed } from '../../../testing/unit-test-helper';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { AlertmanagerNotification } from '../models/prometheus-alerts';
 import { PrometheusService } from './prometheus.service';
 import { SettingsService } from './settings.service';
@@ -16,8 +16,8 @@ describe('PrometheusService', () => {
   });
 
   beforeEach(() => {
-    service = TestBed.get(PrometheusService);
-    httpTesting = TestBed.get(HttpTestingController);
+    service = TestBed.inject(PrometheusService);
+    httpTesting = TestBed.inject(HttpTestingController);
   });
 
   afterEach(() => {
@@ -30,7 +30,7 @@ describe('PrometheusService', () => {
 
   it('should get alerts', () => {
     service.getAlerts().subscribe();
-    const req = httpTesting.expectOne('api/prometheus');
+    const req = httpTesting.expectOne('api/prometheus?cluster_filter=false');
     expect(req.request.method).toBe('GET');
   });
 
@@ -168,14 +168,14 @@ describe('PrometheusService', () => {
     let host: string;
 
     const receiveConfig = () => {
-      const req = httpTesting.expectOne('api/settings/alertmanager-api-host');
+      const req = httpTesting.expectOne('ui-api/prometheus/alertmanager-api-host');
       expect(req.request.method).toBe('GET');
       req.flush({ value: host });
     };
 
     beforeEach(() => {
       x = false;
-      TestBed.get(SettingsService)['settings'] = {};
+      TestBed.inject(SettingsService)['settings'] = {};
       service.ifAlertmanagerConfigured(
         (v) => (x = v),
         () => (x = [])
@@ -209,14 +209,14 @@ describe('PrometheusService', () => {
     let host: string;
 
     const receiveConfig = () => {
-      const req = httpTesting.expectOne('api/settings/prometheus-api-host');
+      const req = httpTesting.expectOne('ui-api/prometheus/prometheus-api-host');
       expect(req.request.method).toBe('GET');
       req.flush({ value: host });
     };
 
     beforeEach(() => {
       x = false;
-      TestBed.get(SettingsService)['settings'] = {};
+      TestBed.inject(SettingsService)['settings'] = {};
       service.ifPrometheusConfigured(
         (v) => (x = v),
         () => (x = [])

@@ -2,10 +2,10 @@ overrides:
   ceph:
     conf:
       osd:
-        osd_class_load_list: "cephfs hello journal lock log numops rbd refcount 
-                              rgw sdk timeindex user version"
-        osd_class_default_list: "cephfs hello journal lock log numops rbd refcount 
-                                 rgw sdk timeindex user version"
+        osd_class_load_list: "*"
+        osd_class_default_list: "*"
+    log-ignorelist:
+      - \(POOL_APP_NOT_ENABLED\)
 tasks:
 - workunit:
     clients:

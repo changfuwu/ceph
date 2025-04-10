@@ -1,8 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#ifndef CEPH_RGW_POLICY_S3V2_KEYWORDS_H
-#define CEPH_RGW_POLICY_S3V2_KEYWORDS_H
+#pragma once
 
 namespace rgw {
 namespace IAM {
@@ -29,6 +28,9 @@ enum class TokenID {
   // String!
   StringEquals, StringNotEquals, StringEqualsIgnoreCase,
   StringNotEqualsIgnoreCase, StringLike, StringNotLike,
+  ForAllValuesStringEquals, ForAnyValueStringEquals,
+  ForAllValuesStringLike, ForAnyValueStringLike,
+  ForAllValuesStringEqualsIgnoreCase, ForAnyValueStringEqualsIgnoreCase,
 
   // Numeric!
   NumericEquals, NumericNotEquals, NumericLessThan, NumericLessThanEquals,
@@ -75,6 +77,7 @@ enum class TokenID {
   s3x_amz_grant_permission,
   s3x_amz_copy_source,
   s3x_amz_server_side_encryption,
+  s3x_amz_server_side_encryption_customer_algorithm,
   s3x_amz_server_side_encryption_aws_kms_key_id,
   s3x_amz_metadata_directive,
   s3x_amz_storage_class,
@@ -87,6 +90,7 @@ enum class TokenID {
   s3authType,
   s3signatureAge,
   s3x_amz_content_sha256,
+  rgwsubuser,
 #else
   CondKey,
 #endif
@@ -135,5 +139,3 @@ enum class Type {
 };
 }
 }
-
-#endif // CEPH_RGW_POLICY_S3V2_KEYWORDS_H

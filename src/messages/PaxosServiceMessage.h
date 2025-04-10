@@ -5,6 +5,11 @@
 
 #include "msg/Message.h"
 #include "mon/Session.h"
+#include "include/encoding.h"
+#include "include/types.h" // for epoch_t
+
+#include <cstdint>
+#include <string_view>
 
 class PaxosServiceMessage : public Message {
 public:
@@ -25,7 +30,7 @@ public:
       version(v), deprecated_session_mon(-1), deprecated_session_mon_tid(0),
       rx_election_epoch(0)  { }
  protected:
-  virtual ~PaxosServiceMessage() override {}
+  ~PaxosServiceMessage() override {}
 
  public:
   void paxos_encode() {

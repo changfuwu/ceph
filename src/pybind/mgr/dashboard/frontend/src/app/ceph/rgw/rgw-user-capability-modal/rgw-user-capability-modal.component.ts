@@ -1,22 +1,21 @@
 import { Component, EventEmitter, Output } from '@angular/core';
 import { Validators } from '@angular/forms';
 
-import * as _ from 'lodash';
-import { BsModalRef } from 'ngx-bootstrap/modal';
+import _ from 'lodash';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
-import { ActionLabelsI18n } from '../../../shared/constants/app.constants';
-import { CdFormBuilder } from '../../../shared/forms/cd-form-builder';
-import { CdFormGroup } from '../../../shared/forms/cd-form-group';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { CdFormBuilder } from '~/app/shared/forms/cd-form-builder';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
 import { RgwUserCapabilities } from '../models/rgw-user-capabilities';
 import { RgwUserCapability } from '../models/rgw-user-capability';
+import { BaseModal } from 'carbon-components-angular';
 
 @Component({
   selector: 'cd-rgw-user-capability-modal',
   templateUrl: './rgw-user-capability-modal.component.html',
   styleUrls: ['./rgw-user-capability-modal.component.scss']
 })
-export class RgwUserCapabilityModalComponent {
+export class RgwUserCapabilityModalComponent extends BaseModal {
   /**
    * The event that is triggered when the 'Add' or 'Update' button
    * has been pressed.
@@ -30,13 +29,9 @@ export class RgwUserCapabilityModalComponent {
   resource: string;
   action: string;
 
-  constructor(
-    private formBuilder: CdFormBuilder,
-    public bsModalRef: BsModalRef,
-    private i18n: I18n,
-    public actionLabels: ActionLabelsI18n
-  ) {
-    this.resource = this.i18n('capability');
+  constructor(private formBuilder: CdFormBuilder, public actionLabels: ActionLabelsI18n) {
+    super();
+    this.resource = $localize`capability`;
     this.createForm();
   }
 
@@ -89,6 +84,6 @@ export class RgwUserCapabilityModalComponent {
   onSubmit() {
     const capability: RgwUserCapability = this.formGroup.value;
     this.submitAction.emit(capability);
-    this.bsModalRef.hide();
+    this.closeModal();
   }
 }

@@ -1,6 +1,6 @@
 import { Injectable } from '@angular/core';
 
-import * as _ from 'lodash';
+import _ from 'lodash';
 
 import { PrometheusService } from '../api/prometheus.service';
 import {
@@ -17,15 +17,18 @@ export class PrometheusAlertService {
   private canAlertsBeNotified = false;
   alerts: AlertmanagerAlert[] = [];
   rules: PrometheusRule[] = [];
+  activeAlerts: number;
+  activeCriticalAlerts: number;
+  activeWarningAlerts: number;
 
   constructor(
     private alertFormatter: PrometheusAlertFormatter,
     private prometheusService: PrometheusService
   ) {}
 
-  getAlerts() {
+  getAlerts(clusterFilteredAlerts?: boolean) {
     this.prometheusService.ifAlertmanagerConfigured(() => {
-      this.prometheusService.getAlerts().subscribe(
+      this.prometheusService.getAlerts(clusterFilteredAlerts).subscribe(
         (alerts) => this.handleAlerts(alerts),
         (resp) => {
           if ([404, 504].includes(resp.status)) {
@@ -51,8 +54,8 @@ export class PrometheusAlertService {
     });
   }
 
-  refresh() {
-    this.getAlerts();
+  refresh(clusterFilteredAlerts?: boolean) {
+    this.getAlerts(clusterFilteredAlerts);
     this.getRules();
   }
 
@@ -60,7 +63,26 @@ export class PrometheusAlertService {
     if (this.canAlertsBeNotified) {
       this.notifyOnAlertChanges(alerts, this.alerts);
     }
-    this.alerts = alerts;
+    this.activeAlerts = _.reduce<AlertmanagerAlert, number>(
+      alerts,
+      (result, alert) => (alert.status.state === 'active' ? ++result : result),
+      0
+    );
+    this.activeCriticalAlerts = _.reduce<AlertmanagerAlert, number>(
+      alerts,
+      (result, alert) =>
+        alert.status.state === 'active' && alert.labels.severity === 'critical' ? ++result : result,
+      0
+    );
+    this.activeWarningAlerts = _.reduce<AlertmanagerAlert, number>(
+      alerts,
+      (result, alert) =>
+        alert.status.state === 'active' && alert.labels.severity === 'warning' ? ++result : result,
+      0
+    );
+    this.alerts = alerts
+      .reverse()
+      .sort((a, b) => a.labels.severity.localeCompare(b.labels.severity));
     this.canAlertsBeNotified = true;
   }
 
@@ -69,7 +91,10 @@ export class PrometheusAlertService {
       this.alertFormatter.convertToCustomAlerts(alerts),
       this.alertFormatter.convertToCustomAlerts(oldAlerts)
     );
-    const notifications = changedAlerts.map((alert) =>
+    const suppressedFiltered = _.filter(changedAlerts, (alert) => {
+      return alert.status !== 'suppressed';
+    });
+    const notifications = suppressedFiltered.map((alert) =>
       this.alertFormatter.convertAlertToNotification(alert)
     );
     this.alertFormatter.sendNotifications(notifications);

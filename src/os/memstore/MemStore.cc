@@ -23,13 +23,13 @@
 
 #include "include/types.h"
 #include "include/stringify.h"
-#include "include/unordered_map.h"
+#include "common/debug.h"
 #include "common/errno.h"
 #include "MemStore.h"
 #include "include/compat.h"
 
 #define dout_context cct
-#define dout_subsys ceph_subsys_filestore
+#define dout_subsys ceph_subsys_memstore
 #undef dout_prefix
 #define dout_prefix *_dout << "memstore(" << path << ") "
 
@@ -248,7 +248,7 @@ objectstore_perf_stat_t MemStore::get_cur_stats()
 MemStore::CollectionRef MemStore::get_collection(const coll_t& cid)
 {
   std::shared_lock l{coll_lock};
-  ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
+  auto cp = coll_map.find(cid);
   if (cp == coll_map.end())
     return CollectionRef();
   return cp->second;
@@ -384,7 +384,7 @@ int MemStore::getattr(CollectionHandle &c_, const ghobject_t& oid,
 }
 
 int MemStore::getattrs(CollectionHandle &c_, const ghobject_t& oid,
-		       std::map<std::string,ceph::buffer::ptr>& aset)
+		       std::map<std::string,ceph::buffer::ptr,std::less<>>& aset)
 {
   Collection *c = static_cast<Collection*>(c_.get());
   dout(10) << __func__ << " " << c->cid << " " << oid << dendl;
@@ -403,9 +403,7 @@ int MemStore::list_collections(std::vector<coll_t>& ls)
 {
   dout(10) << __func__ << dendl;
   std::shared_lock l{coll_lock};
-  for (ceph::unordered_map<coll_t,CollectionRef>::iterator p = coll_map.begin();
-       p != coll_map.end();
-       ++p) {
+  for (auto p = coll_map.begin(); p != coll_map.end(); ++p) {
     ls.push_back(p->first);
   }
   return 0;
@@ -558,61 +556,48 @@ int MemStore::omap_check_keys(
   return 0;
 }
 
-class MemStore::OmapIteratorImpl : public ObjectMap::ObjectMapIteratorImpl {
-  CollectionRef c;
-  ObjectRef o;
-  std::map<std::string,ceph::buffer::list>::iterator it;
-public:
-  OmapIteratorImpl(CollectionRef c, ObjectRef o)
-    : c(c), o(o), it(o->omap.begin()) {}
-
-  int seek_to_first() override {
-    std::lock_guard lock{o->omap_mutex};
-    it = o->omap.begin();
-    return 0;
-  }
-  int upper_bound(const std::string &after) override {
-    std::lock_guard lock{o->omap_mutex};
-    it = o->omap.upper_bound(after);
-    return 0;
-  }
-  int lower_bound(const std::string &to) override {
-    std::lock_guard lock{o->omap_mutex};
-    it = o->omap.lower_bound(to);
-    return 0;
-  }
-  bool valid() override {
-    std::lock_guard lock{o->omap_mutex};
-    return it != o->omap.end();
-  }
-  int next() override {
-    std::lock_guard lock{o->omap_mutex};
-    ++it;
-    return 0;
-  }
-  std::string key() override {
-    std::lock_guard lock{o->omap_mutex};
-    return it->first;
-  }
-  ceph::buffer::list value() override {
-    std::lock_guard lock{o->omap_mutex};
-    return it->second;
-  }
-  int status() override {
-    return 0;
-  }
-};
-
-ObjectMap::ObjectMapIterator MemStore::get_omap_iterator(
-  CollectionHandle& ch,
-  const ghobject_t& oid)
+int MemStore::omap_iterate(
+  CollectionHandle &ch,   ///< [in] collection
+  const ghobject_t &oid, ///< [in] object
+  ObjectStore::omap_iter_seek_t start_from, ///< [in] where the iterator should point to at the beginning
+  std::function<omap_iter_ret_t(std::string_view, std::string_view)> f)
 {
-  dout(10) << __func__ << " " << ch->cid << " " << oid << dendl;
   Collection *c = static_cast<Collection*>(ch.get());
   ObjectRef o = c->get_object(oid);
-  if (!o)
-    return ObjectMap::ObjectMapIterator();
-  return ObjectMap::ObjectMapIterator(new OmapIteratorImpl(c, o));
+  if (!o) {
+    return -ENOENT;
+  }
+
+  bool more = false;
+  {
+    std::shared_lock lock{o->omap_mutex};
+
+    // obtain seek the iterator
+    decltype(o->omap)::iterator it;
+    {
+      if (start_from.seek_type == omap_iter_seek_t::LOWER_BOUND) {
+        it = o->omap.lower_bound(start_from.seek_position);
+      } else {
+        it = o->omap.upper_bound(start_from.seek_position);
+      }
+    }
+
+    // iterate!
+    while (it != o->omap.end()) {
+      // potentially rectifying memcpy but who cares for memstore?
+      omap_iter_ret_t ret =
+        f(it->first, std::string_view{it->second.c_str(), it->second.length()});
+      if (ret == omap_iter_ret_t::STOP) {
+        more = true;
+        break;
+      } else if (ret == omap_iter_ret_t::NEXT) {
+        ++it;
+      } else {
+        ceph_abort();
+      }
+    }
+  }
+  return more;
 }
 
 
@@ -800,7 +785,7 @@ void MemStore::_do_transaction(Transaction& t)
     case Transaction::OP_COLL_HINT:
       {
         coll_t cid = i.get_cid(op->cid);
-        uint32_t type = op->hint_type;
+        uint32_t type = op->hint;
         ceph::buffer::list hint;
         i.decode_bl(hint);
         auto hiter = hint.cbegin();
@@ -1008,7 +993,11 @@ void MemStore::_do_transaction(Transaction& t)
 	f.close_section();
 	f.flush(*_dout);
 	*_dout << dendl;
-	ceph_abort_msg("unexpected error");
+        if (!g_conf().get_val<bool>("objectstore_debug_throw_on_failed_txc")) {
+	  ceph_abort_msg("unexpected error");
+        } else {
+	  throw r;
+        }
       }
     }
 
@@ -1107,8 +1096,14 @@ int MemStore::_setattrs(const coll_t& cid, const ghobject_t& oid,
   if (!o)
     return -ENOENT;
   std::lock_guard lock{o->xattr_mutex};
-  for (auto p = aset.begin(); p != aset.end(); ++p)
-    o->xattr[p->first] = p->second;
+  for (auto p = aset.begin(); p != aset.end(); ++p) {
+    if (p->second.is_partial()) {
+      o->xattr[p->first] = bufferptr(p->second.c_str(), p->second.length());
+    } else {
+      o->xattr[p->first] = p->second;
+    }
+  }
+
   return 0;
 }
 
@@ -1317,7 +1312,7 @@ int MemStore::_destroy_collection(const coll_t& cid)
 {
   dout(10) << __func__ << " " << cid << dendl;
   std::lock_guard l{coll_lock};
-  ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
+  auto cp = coll_map.find(cid);
   if (cp == coll_map.end())
     return -ENOENT;
   {
@@ -1446,7 +1441,7 @@ int MemStore::_merge_collection(const coll_t& cid, uint32_t bits, coll_t dest)
 
   {
     std::lock_guard l{coll_lock};
-    ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
+    auto cp = coll_map.find(cid);
     ceph_assert(cp != coll_map.end());
     used_bytes -= cp->second->used_bytes();
     coll_map.erase(cp);
@@ -1517,7 +1512,7 @@ int BufferlistObject::write(uint64_t offset, const ceph::buffer::list &src)
     newdata.append(tail);
   }
 
-  data.claim(newdata);
+  data = std::move(newdata);
   return 0;
 }
 
@@ -1546,7 +1541,7 @@ int BufferlistObject::truncate(uint64_t size)
   if (get_size() > size) {
     ceph::buffer::list bl;
     bl.substr_of(data, 0, size);
-    data.claim(bl);
+    data = std::move(bl);
   } else if (get_size() == size) {
     // do nothing
   } else {
@@ -1796,5 +1791,5 @@ int MemStore::PageSetObject::truncate(uint64_t size)
 MemStore::ObjectRef MemStore::Collection::create_object() const {
   if (use_page_set)
     return ceph::make_ref<PageSetObject>(cct->_conf->memstore_page_size);
-  return new BufferlistObject();
+  return make_ref<BufferlistObject>();
 }

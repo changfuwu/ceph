@@ -12,17 +12,14 @@
  * 
  */
 
-#include <string_view>
-
-#include <errno.h>
-#include <fcntl.h>
+#include "MDSAuthCaps.h"
 
 #include <boost/spirit/include/qi.hpp>
-#include <boost/spirit/include/phoenix_operator.hpp>
-#include <boost/spirit/include/phoenix.hpp>
+#include <boost/phoenix/operator.hpp>
+#include <boost/phoenix.hpp>
 
 #include "common/debug.h"
-#include "MDSAuthCaps.h"
+#include "mdstypes.h"
 #include "include/ipaddr.h"
 
 #define dout_subsys ceph_subsys_mds
@@ -33,6 +30,7 @@
 using std::ostream;
 using std::string;
 using std::vector;
+using std::string_view;
 namespace qi = boost::spirit::qi;
 namespace ascii = boost::spirit::ascii;
 namespace phoenix = boost::phoenix;
@@ -42,6 +40,8 @@ struct MDSCapParser : qi::grammar<Iterator, MDSAuthCaps()>
 {
   MDSCapParser() : MDSCapParser::base_type(mdscaps)
   {
+    using qi::attr;
+    using qi::bool_;
     using qi::char_;
     using qi::int_;
     using qi::uint_;
@@ -51,6 +51,8 @@ struct MDSCapParser : qi::grammar<Iterator, MDSAuthCaps()>
     using qi::_1;
     using qi::_2;
     using qi::_3;
+    using qi::_4;
+    using qi::_5;
     using qi::eps;
     using qi::lit;
 
@@ -61,28 +63,35 @@ struct MDSCapParser : qi::grammar<Iterator, MDSAuthCaps()>
       lexeme[lit("'") >> *(char_ - '\'') >> '\''];
     unquoted_path %= +char_("a-zA-Z0-9_./-");
     network_str %= +char_("/.:a-fA-F0-9][");
+    fs_name_str %= +char_("a-zA-Z0-9_.-");
 
-    // match := [path=<path>] [uid=<uid> [gids=<gid>[,<gid>...]]
-    path %= (spaces >> lit("path") >> lit('=') >> (quoted_path | unquoted_path));
-    uid %= (spaces >> lit("uid") >> lit('=') >> uint_);
+    path %= -(spaces >> lit("path") >> lit('=') >> (quoted_path | unquoted_path));
+    uid %= -(spaces >> lit("uid") >> lit('=') >> uint_);
     uintlist %= (uint_ % lit(','));
     gidlist %= -(spaces >> lit("gids") >> lit('=') >> uintlist);
-    match = -(
-	     (uid >> gidlist)[_val = phoenix::construct<MDSCapMatch>(_1, _2)] |
-	     (path >> uid >> gidlist)[_val = phoenix::construct<MDSCapMatch>(_1, _2, _3)] |
-             (path)[_val = phoenix::construct<MDSCapMatch>(_1)]);
+    fs_name %= -(spaces >> lit("fsname") >> lit('=') >> fs_name_str);
+    root_squash %= -(spaces >> lit("root_squash") >> attr(true));
+    match = (fs_name >> path >> root_squash >> uid >> gidlist)[_val = phoenix::construct<MDSCapMatch>(_1, _2, _3, _4, _5)];
 
-    // capspec = * | r[w][p][s]
+    // capspec = * | r[w][f][p][s]
     capspec = spaces >> (
         lit("*")[_val = MDSCapSpec(MDSCapSpec::ALL)]
         |
         lit("all")[_val = MDSCapSpec(MDSCapSpec::ALL)]
         |
+        (lit("rwfps"))[_val = MDSCapSpec(MDSCapSpec::RWFPS)]
+        |
         (lit("rwps"))[_val = MDSCapSpec(MDSCapSpec::RWPS)]
+        |
+        (lit("rwfp"))[_val = MDSCapSpec(MDSCapSpec::RWFP)]
+        |
+        (lit("rwfs"))[_val = MDSCapSpec(MDSCapSpec::RWFS)]
         |
         (lit("rwp"))[_val = MDSCapSpec(MDSCapSpec::RWP)]
         |
         (lit("rws"))[_val = MDSCapSpec(MDSCapSpec::RWS)]
+        |
+        (lit("rwf"))[_val = MDSCapSpec(MDSCapSpec::RWF)]
         |
         (lit("rw"))[_val = MDSCapSpec(MDSCapSpec::RW)]
         |
@@ -97,14 +106,15 @@ struct MDSCapParser : qi::grammar<Iterator, MDSAuthCaps()>
   }
   qi::rule<Iterator> spaces;
   qi::rule<Iterator, string()> quoted_path, unquoted_path, network_str;
+  qi::rule<Iterator, string()> fs_name_str, fs_name, path;
+  qi::rule<Iterator, bool()> root_squash;
   qi::rule<Iterator, MDSCapSpec()> capspec;
-  qi::rule<Iterator, string()> path;
   qi::rule<Iterator, uint32_t()> uid;
-  qi::rule<Iterator, std::vector<uint32_t>() > uintlist;
-  qi::rule<Iterator, std::vector<uint32_t>() > gidlist;
+  qi::rule<Iterator, vector<uint32_t>() > uintlist;
+  qi::rule<Iterator, vector<uint32_t>() > gidlist;
   qi::rule<Iterator, MDSCapMatch()> match;
   qi::rule<Iterator, MDSCapGrant()> grant;
-  qi::rule<Iterator, std::vector<MDSCapGrant>()> grants;
+  qi::rule<Iterator, vector<MDSCapGrant>()> grants;
   qi::rule<Iterator, MDSAuthCaps()> mdscaps;
 };
 
@@ -120,7 +130,7 @@ void MDSCapMatch::normalize_path()
   // drop ..
 }
 
-bool MDSCapMatch::match(std::string_view target_path,
+bool MDSCapMatch::match(string_view target_path,
 			const int caller_uid,
 			const int caller_gid,
 			const vector<uint64_t> *caller_gid_list) const
@@ -132,7 +142,7 @@ bool MDSCapMatch::match(std::string_view target_path,
       bool gid_matched = false;
       if (std::find(gids.begin(), gids.end(), caller_gid) != gids.end())
 	gid_matched = true;
-      if (caller_gid_list) {
+      else if (caller_gid_list) {
 	for (auto i = caller_gid_list->begin(); i != caller_gid_list->end(); ++i) {
 	  if (std::find(gids.begin(), gids.end(), *i) != gids.end()) {
 	    gid_matched = true;
@@ -152,16 +162,31 @@ bool MDSCapMatch::match(std::string_view target_path,
   return true;
 }
 
-bool MDSCapMatch::match_path(std::string_view target_path) const
+bool MDSCapMatch::match_path(string_view target_path) const
 {
-  if (path.length()) {
-    if (target_path.find(path) != 0)
+  string _path = path;
+  // drop any tailing /
+  while (_path.length() && _path[_path.length() - 1] == '/') {
+    _path = path.substr(0, _path.length() - 1);
+  }
+
+  if (_path.length()) {
+    if (target_path.find(_path) != 0)
       return false;
-    // if path doesn't already have a trailing /, make sure the target
-    // does so that path=/foo doesn't match target_path=/food
-    if (target_path.length() > path.length() &&
-	path[path.length()-1] != '/' &&
-	target_path[path.length()] != '/')
+    /* In case target_path.find(_path) == 0 && target_path.length() == _path.length():
+     *  path=/foo  _path=/foo target_path=/foo     --> match
+     *  path=/foo/ _path=/foo target_path=/foo     --> match
+     *
+     * In case target_path.find(_path) == 0 && target_path.length() > _path.length():
+     *  path=/foo/ _path=/foo target_path=/foo/    --> match
+     *  path=/foo  _path=/foo target_path=/foo/    --> match
+     *  path=/foo/ _path=/foo target_path=/foo/d   --> match
+     *  path=/foo  _path=/foo target_path=/food    --> mismatch
+     *
+     * All the other cases                         --> mismatch
+     */
+    if (target_path.length() > _path.length() &&
+	target_path[_path.length()] != '/')
       return false;
   }
 
@@ -178,7 +203,7 @@ void MDSCapGrant::parse_network()
  * Is the client *potentially* able to access this path?  Actual
  * permission will depend on uids/modes in the full is_capable.
  */
-bool MDSAuthCaps::path_capable(std::string_view inode_path) const
+bool MDSAuthCaps::path_capable(string_view inode_path) const
 {
   for (const auto &i : grants) {
     if (i.match.match_path(inode_path)) {
@@ -196,7 +221,7 @@ bool MDSAuthCaps::path_capable(std::string_view inode_path) const
  * This is true if any of the 'grant' clauses in the capability match the
  * requested path + op.
  */
-bool MDSAuthCaps::is_capable(std::string_view inode_path,
+bool MDSAuthCaps::is_capable(string_view inode_path,
 			     uid_t inode_uid, gid_t inode_gid,
 			     unsigned inode_mode,
 			     uid_t caller_uid, gid_t caller_gid,
@@ -205,15 +230,14 @@ bool MDSAuthCaps::is_capable(std::string_view inode_path,
 			     uid_t new_uid, gid_t new_gid,
 			     const entity_addr_t& addr) const
 {
-  if (cct)
-    ldout(cct, 10) << __func__ << " inode(path /" << inode_path
-		   << " owner " << inode_uid << ":" << inode_gid
-		   << " mode 0" << std::oct << inode_mode << std::dec
-		   << ") by caller " << caller_uid << ":" << caller_gid
+  ldout(g_ceph_context, 10) << __func__ << " inode(path /" << inode_path
+		 << " owner " << inode_uid << ":" << inode_gid
+		 << " mode 0" << std::oct << inode_mode << std::dec
+		 << ") by caller " << caller_uid << ":" << caller_gid
 // << "[" << caller_gid_list << "]";
-		   << " mask " << mask
-		   << " new " << new_uid << ":" << new_gid
-		   << " cap: " << *this << dendl;
+		 << " mask " << mask
+		 << " new " << new_uid << ":" << new_gid
+		 << " cap: " << *this << dendl;
 
   for (const auto& grant : grants) {
     if (grant.network.size() &&
@@ -226,6 +250,10 @@ bool MDSAuthCaps::is_capable(std::string_view inode_path,
 
     if (grant.match.match(inode_path, caller_uid, caller_gid, caller_gid_list) &&
 	grant.spec.allows(mask & (MAY_READ|MAY_EXECUTE), mask & MAY_WRITE)) {
+      if (grant.match.root_squash && ((caller_uid == 0) || (caller_gid == 0)) &&
+          (mask & MAY_WRITE)) {
+	    continue;
+      }
       // we have a match; narrow down GIDs to those specifically allowed here
       vector<uint64_t> gids;
       if (std::find(grant.match.gids.begin(), grant.match.gids.end(), caller_gid) !=
@@ -249,6 +277,12 @@ bool MDSAuthCaps::is_capable(std::string_view inode_path,
 
       if (mask & MAY_SNAPSHOT) {
         if (!grant.spec.allow_snapshot()) {
+          continue;
+        }
+      }
+
+      if (mask & MAY_FULL) {
+        if (!grant.spec.allow_full()) {
           continue;
         }
       }
@@ -307,7 +341,7 @@ void MDSAuthCaps::set_allow_all()
 				 {}));
 }
 
-bool MDSAuthCaps::parse(CephContext *c, std::string_view str, ostream *err)
+bool MDSAuthCaps::parse(string_view str, ostream *err)
 {
   // Special case for legacy caps
   if (str == "allow") {
@@ -322,7 +356,6 @@ bool MDSAuthCaps::parse(CephContext *c, std::string_view str, ostream *err)
   MDSCapParser<decltype(iter)> g;
 
   bool r = qi::phrase_parse(iter, end, g, ascii::space, *this);
-  cct = c;  // set after parser self-assignment
   if (r && iter == end) {
     for (auto& grant : grants) {
       std::sort(grant.match.gids.begin(), grant.match.gids.end());
@@ -333,14 +366,149 @@ bool MDSAuthCaps::parse(CephContext *c, std::string_view str, ostream *err)
     // Make sure no grants are kept after parsing failed!
     grants.clear();
 
-    if (err)
-      *err << "mds capability parse failed, stopped at '"
-	   << std::string(iter, end)
-           << "' of '" << str << "'";
+    if (err) {
+      if (string(iter, end).find("allow") != string::npos) {
+       *err << "Permission flags in MDS capability string must be '*' or "
+	    << "'all' or must start with 'r'";
+      } else {
+       *err << "mds capability parse failed, stopped at '"
+            << string(iter, end) << "' of '" << str << "'";
+      }
+    }
     return false; 
   }
 }
 
+/* Check if the "cap grant" is already present in this cap object. If it is,
+ * return false. If not, add it and return true.
+ *
+ * ng = new grant, new mds cap grant.
+ */
+bool MDSAuthCaps::merge_one_cap_grant(MDSCapGrant ng)
+{
+  // check if "ng" is already present in this cap object.
+  for (auto& g : grants) {
+    if (g.match.fs_name == ng.match.fs_name && g.match.path == ng.match.path) {
+      if (g.spec.get_caps() == ng.spec.get_caps() &&
+	  g.match.root_squash == ng.match.root_squash) {
+	// Since all components of MDS caps (fsname, path, perm/spec and
+	// root_squash) matched, it means cap same as "ng" is present in MDS
+	// cap grant list. No need to look further in MDS cap grant list.
+	// No update is required. Maintain idempotency.
+	return false;
+       }
+
+      // fsname and path match but perm/spec is different. update the cap
+      // with new perm/spec.
+      if (g.spec.get_caps() != ng.spec.get_caps()) {
+	g.spec.set_caps(ng.spec.get_caps());
+      }
+
+      // fsname and path match but value of root_squash is different. update
+      // its value.
+      if (g.match.root_squash != ng.match.root_squash) {
+	// "fs authorize" command is not allowed to deduct caps. so, we can add
+	// but not remove root_squash from MDS auth caps.
+	if (g.match.root_squash == false) {
+	  g.match.root_squash = ng.match.root_squash;
+	}
+      }
+
+      // Since fsname and path matched and either perm/spec or root_squash
+      // or both has been updated, cap from "ng" has been incorporated
+      // into this cap grant list. Time to return.
+      return true;
+    }
+  }
+
+  // Since a cap grant like "ng" is absent in this cap object's grant list,
+  // add "ng" to the cap grant list.
+  grants.push_back(MDSCapGrant(
+    MDSCapSpec(ng.spec.get_caps()),
+    MDSCapMatch(ng.match.fs_name, ng.match.path, ng.match.root_squash),
+    {}));
+
+  return true;
+}
+
+/* User can pass one or MDS caps that it wishes to add to entity's keyring.
+ * Merge all of these caps one by one. Return value indicates whether or not
+ * AuthMonitor must update the entity's keyring.
+ *
+ * If all caps do not merge (that is, underlying helper method returns false
+ * after attempting merge), no update is required. Return false so that
+ * AuthMonitor doesn't run the update procedure for caps.
+ *
+ * If even one cap is merged (that is, underlying method returns true even
+ * once), an update to the entity's keyring is required. Return true so that
+ * AuthMonitor runs the update procedure.
+ */
+bool MDSAuthCaps::merge(MDSAuthCaps newcaps)
+{
+  bool were_caps_merged = false;
+
+  for (auto& ng : newcaps.grants) {
+      were_caps_merged |= merge_one_cap_grant(ng);
+  }
+
+  return were_caps_merged;
+}
+
+string MDSCapMatch::to_string()
+{
+  string str = "";
+
+  if (!fs_name.empty())   { str += " fsname=" + fs_name; }
+  if (!path.empty())   { str += " path=" + path; }
+  if (root_squash)   { str += " root_squash"; }
+  if (uid != MDS_AUTH_UID_ANY) { str += " uid=" + std::to_string(uid); }
+  if (!gids.empty()) {
+    str += " gids=";
+    for (size_t i = 0; i < gids.size(); ++i) {
+      str += std::to_string(gids[i]);
+      if (i < gids.size() - 1) {
+	str += ",";
+      }
+    }
+  }
+
+  return str;
+}
+
+string MDSCapSpec::to_string()
+{
+  string str = "";
+
+  if (allow_all()) {
+    str += "*";
+  } else {
+    if (allow_read()) { str +="r"; }
+    if (allow_write()) { str +="w"; }
+    if (allow_full()) { str +="f"; }
+    if (allow_set_vxattr()) { str +="p"; }
+    if (allow_snapshot()) { str +="s"; }
+  }
+
+  return str;
+}
+
+string MDSCapGrant::to_string()
+{
+  return "allow " + spec.to_string() + match.to_string();
+}
+
+string MDSAuthCaps::to_string()
+{
+  string str = "";
+
+  for (size_t i = 0; i < grants.size(); ++i) {
+    str += grants[i].to_string();
+    if (i < grants.size() - 1)
+      str += ", ";
+  }
+
+  return str;
+}
 
 bool MDSAuthCaps::allow_all() const
 {
@@ -356,14 +524,17 @@ bool MDSAuthCaps::allow_all() const
 
 ostream &operator<<(ostream &out, const MDSCapMatch &match)
 {
+  if (!match.fs_name.empty()) {
+    out << " fsname=" << match.fs_name;
+  }
   if (match.path.length()) {
-    out << "path=\"/" << match.path << "\"";
-    if (match.uid != MDSCapMatch::MDS_AUTH_UID_ANY) {
-      out << " ";
-    }
+    out << " path=\"/" << match.path << "\"";
+  }
+  if (match.root_squash) {
+    out << " root_squash";
   }
   if (match.uid != MDSCapMatch::MDS_AUTH_UID_ANY) {
-    out << "uid=" << match.uid;
+    out << " uid=" << match.uid;
     if (!match.gids.empty()) {
       out << " gids=";
       bool first = true;
@@ -391,6 +562,9 @@ ostream &operator<<(ostream &out, const MDSCapSpec &spec)
     if (spec.allow_write()) {
       out << "w";
     }
+    if (spec.allow_full()) {
+      out << "f";
+    }
     if (spec.allow_set_vxattr()) {
       out << "p";
     }
@@ -407,9 +581,7 @@ ostream &operator<<(ostream &out, const MDSCapGrant &grant)
 {
   out << "allow ";
   out << grant.spec;
-  if (!grant.match.is_match_all()) {
-    out << " " << grant.match;
-  }
+  out << grant.match;
   if (grant.network.size()) {
     out << " network " << grant.network;
   }
@@ -431,3 +603,9 @@ ostream &operator<<(ostream &out, const MDSAuthCaps &cap)
   return out;
 }
 
+ostream &operator<<(ostream &out, const MDSCapAuth &auth)
+{
+  out << "MDSCapAuth(" << auth.match << "readable="
+      << auth.readable << ", writeable=" << auth.writeable << ")";
+  return out;
+}

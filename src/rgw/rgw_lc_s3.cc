@@ -12,7 +12,9 @@
 #include "rgw_lc_s3.h"
 
 
-#define dout_subsys ceph_subsys_rgw
+#define dout_subsys ceph_subsys_rgw_lifecycle
+
+using namespace std;
 
 static bool check_date(const string& _date)
 {
@@ -62,11 +64,15 @@ void LCExpiration_S3::decode_xml(XMLObj *obj)
 
 void LCNoncurExpiration_S3::decode_xml(XMLObj *obj)
 {
+  RGWXMLDecoder::decode_xml("NewerNoncurrentVersions", newer_noncurrent, obj);
   RGWXMLDecoder::decode_xml("NoncurrentDays", days, obj, true);
 }
 
 void LCNoncurExpiration_S3::dump_xml(Formatter *f) const
 {
+  if(has_newer()) {
+    encode_xml("NewerNoncurrentVersions", newer_noncurrent, f);
+  }
   encode_xml("NoncurrentDays", days, f);
 }
 
@@ -110,50 +116,70 @@ void RGWLifecycleConfiguration_S3::decode_xml(XMLObj *obj)
 
 void LCFilter_S3::dump_xml(Formatter *f) const
 {
-  if (has_prefix()) {
-    encode_xml("Prefix", prefix, f);
-  }
   bool multi = has_multi_condition();
   if (multi) {
     f->open_array_section("And");
+  }
+  if (has_prefix()) {
+    encode_xml("Prefix", prefix, f);
   }
   if (has_tags()) {
     const auto& tagset_s3 = static_cast<const RGWObjTagSet_S3 &>(obj_tags);
     tagset_s3.dump_xml(f);
   }
+  if (has_flags()) {
+    if (have_flag(LCFlagType::ArchiveZone)) {
+      encode_xml("ArchiveZone", "", f);
+    }
+  }
+  if (has_size_gt()) {
+    encode_xml("ObjectSizeGreaterThan", size_gt, f);
+  }
+  if (has_size_lt()) {
+    encode_xml("ObjectSizeLessThan", size_lt, f);
+  }
   if (multi) {
-    f->close_section();
+    f->close_section(); // And
   }
 }
 
 void LCFilter_S3::decode_xml(XMLObj *obj)
 {
-  XMLObj *o = obj->find_first("And");
-  bool single_cond = false;
-  int num_conditions = 0;
-  // If there is an AND condition, every tag is a child of and
-  // else we only support single conditions and return false if we see multiple
-
+  /*
+   * The prior logic here looked for an And element, but did not
+   * structurally parse the Filter clause (and incorrectly rejected
+   * the base case where a Prefix and one Tag were supplied).  It
+   * could not reject generally malformed Filter syntax.
+   *
+   * Empty filters are allowed:
+   * https://docs.aws.amazon.com/AmazonS3/latest/dev/intro-lifecycle-rules.html
+   */
+  XMLObj* o = obj->find_first("And");
   if (o == nullptr){
     o = obj;
-    single_cond = true;
   }
 
   RGWXMLDecoder::decode_xml("Prefix", prefix, o);
-  if (!prefix.empty())
-    num_conditions++;
+
+  /* parse optional ArchiveZone flag (extension) */
+  if (o->find_first("ArchiveZone")) {
+    flags |= make_flag(LCFlagType::ArchiveZone);
+  }
+
+  RGWXMLDecoder::decode_xml("ObjectSizeGreaterThan", size_gt, o, false);
+  RGWXMLDecoder::decode_xml("ObjectSizeLessThan", size_lt, o, false);
+  if (has_size_gt() && has_size_lt() &&
+      (size_lt <= size_gt)) {
+    throw RGWXMLDecoder::err("Filter maximum object size must be larger than the minimum object size");
+  }
+
+  obj_tags.clear(); // why is this needed?
   auto tags_iter = o->find("Tag");
-  obj_tags.clear();
-  while (auto tag_xml =tags_iter.get_next()){
+  while (auto tag_xml = tags_iter.get_next()){
     std::string _key,_val;
     RGWXMLDecoder::decode_xml("Key", _key, tag_xml);
     RGWXMLDecoder::decode_xml("Value", _val, tag_xml);
     obj_tags.emplace_tag(std::move(_key), std::move(_val));
-    num_conditions++;
-  }
-
-  if (single_cond && num_conditions > 1) {
-    throw RGWXMLDecoder::err("Bad filter: badly formed multiple conditions");
   }
 }
 
@@ -209,6 +235,13 @@ void LCRule_S3::decode_xml(XMLObj *obj)
 
   RGWXMLDecoder::decode_xml("ID", id, obj);
 
+  if (!RGWXMLDecoder::decode_xml("Status", status, obj)) {
+    throw RGWXMLDecoder::err("missing Status in Rule");
+  }
+  if (status.compare("Enabled") != 0 && status.compare("Disabled") != 0) {
+    throw RGWXMLDecoder::err("bad Status in Rule");
+  }
+
   LCFilter_S3 filter_s3;
   if (!RGWXMLDecoder::decode_xml("Filter", filter_s3, obj)) {
     // Ideally the following code should be deprecated and we should return
@@ -224,13 +257,6 @@ void LCRule_S3::decode_xml(XMLObj *obj)
     }
   }
   filter = (LCFilter)filter_s3;
-
-  if (!RGWXMLDecoder::decode_xml("Status", status, obj)) {
-    throw RGWXMLDecoder::err("missing Status in Filter");
-  }
-  if (status.compare("Enabled") != 0 && status.compare("Disabled") != 0) {
-    throw RGWXMLDecoder::err("bad Status in Filter");
-  }
 
   LCExpiration_S3 s3_expiration;
   LCNoncurExpiration_S3 s3_noncur_expiration;
@@ -317,7 +343,7 @@ void LCRule_S3::dump_xml(Formatter *f) const {
   }
 }
 
-int RGWLifecycleConfiguration_S3::rebuild(RGWRados *store, RGWLifecycleConfiguration& dest)
+int RGWLifecycleConfiguration_S3::rebuild(RGWLifecycleConfiguration& dest)
 {
   int ret = 0;
   multimap<string, LCRule>::iterator iter;

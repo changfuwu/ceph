@@ -24,8 +24,7 @@
 #define CRUSH_MAGIC 0x00010000ul   /* for detecting algorithm revisions */
 
 #define CRUSH_MAX_DEPTH 10  /* max crush hierarchy depth */
-#define CRUSH_MAX_RULESET (1<<8)  /* max crush ruleset number */
-#define CRUSH_MAX_RULES CRUSH_MAX_RULESET  /* should be the same as max rulesets */
+#define CRUSH_MAX_RULES (1<<8)  /* max crush rule id */
 
 #define CRUSH_MAX_DEVICE_WEIGHT (100u * 0x10000u)
 #define CRUSH_MAX_BUCKET_WEIGHT (65535u * 0x10000u)
@@ -66,7 +65,13 @@ enum crush_opcodes {
 	CRUSH_RULE_SET_CHOOSE_LOCAL_TRIES = 10,
 	CRUSH_RULE_SET_CHOOSE_LOCAL_FALLBACK_TRIES = 11,
 	CRUSH_RULE_SET_CHOOSELEAF_VARY_R = 12,
-	CRUSH_RULE_SET_CHOOSELEAF_STABLE = 13
+	CRUSH_RULE_SET_CHOOSELEAF_STABLE = 13,
+
+	CRUSH_RULE_SET_MSR_DESCENTS = 14,
+	CRUSH_RULE_SET_MSR_COLLISION_TRIES = 15,
+
+	/* choose variant without FIRSTN|INDEP */
+	CRUSH_RULE_CHOOSE_MSR = 16
 };
 
 /*
@@ -76,28 +81,24 @@ enum crush_opcodes {
 #define CRUSH_CHOOSE_N            0
 #define CRUSH_CHOOSE_N_MINUS(x)   (-(x))
 
-/*
- * The rule mask is used to describe what the rule is intended for.
- * Given a ruleset and size of output set, we search through the
- * rule list for a matching rule_mask.
- */
-struct crush_rule_mask {
-	__u8 ruleset;
-	__u8 type;
-	__u8 min_size;
-	__u8 max_size;
-};
-
 struct crush_rule {
 	__u32 len;
-	struct crush_rule_mask mask;
+	__u8 __unused_was_rule_mask_ruleset;
+	__u8 type;
+	__u8 deprecated_min_size;
+	__u8 deprecated_max_size;
 	struct crush_rule_step steps[0];
 };
 
 #define crush_rule_size(len) (sizeof(struct crush_rule) + \
 			      (len)*sizeof(struct crush_rule_step))
 
-
+enum crush_rule_type {
+	CRUSH_RULE_TYPE_REPLICATED = 1,
+	CRUSH_RULE_TYPE_ERASURE = 3,
+	CRUSH_RULE_TYPE_MSR_FIRSTN = 4,
+	CRUSH_RULE_TYPE_MSR_INDEP = 5
+};
 
 /*
  * A bucket is a named container of other items (either devices or
@@ -335,7 +336,7 @@ struct crush_bucket_straw {
  * __h.alg__ == ::CRUSH_BUCKET_STRAW2.
  *
  * The weight of __h.items[i]__ is __item_weights[i]__ for i in
- * [0,__h.size__[.
+ * [0,__h.size__].
  */
 struct crush_bucket_straw2 {
         struct crush_bucket h; /*!< generic bucket information */
@@ -419,6 +420,12 @@ struct crush_map {
          *  It should always be set to 1 except for backward compatibility.
          */
 	__u8 chooseleaf_stable;
+
+	/*! Sets total descents for MSR rules */
+	__u32 msr_descents;
+
+	/*! Sets local collision retries for MSR rules */
+	__u32 msr_collision_tries;
 
         /*! @cond INTERNAL */
 	/* This value is calculated after decode or construction by
@@ -540,7 +547,7 @@ struct crush_work_bucket {
 	__u32 perm_x; /* @x for which *perm is defined */
 	__u32 perm_n; /* num elements of *perm that are permuted/defined */
 	__u32 *perm;  /* Permutation of the bucket's items */
-};
+} __attribute__ ((packed));
 
 struct crush_work {
 	struct crush_work_bucket **work; /* Per-bucket working store */

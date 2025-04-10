@@ -1,24 +1,29 @@
 import { Component, OnInit } from '@angular/core';
-import { FormControl, FormGroup, ValidatorFn } from '@angular/forms';
+import { UntypedFormControl, UntypedFormGroup, ValidatorFn } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
-import * as _ from 'lodash';
+import _ from 'lodash';
 
-import { ConfigurationService } from '../../../../shared/api/configuration.service';
-import { ConfigFormModel } from '../../../../shared/components/config-option/config-option.model';
-import { ConfigOptionTypes } from '../../../../shared/components/config-option/config-option.types';
-import { NotificationType } from '../../../../shared/enum/notification-type.enum';
-import { CdFormGroup } from '../../../../shared/forms/cd-form-group';
-import { NotificationService } from '../../../../shared/services/notification.service';
+import { ConfigurationService } from '~/app/shared/api/configuration.service';
+import { ConfigFormModel } from '~/app/shared/components/config-option/config-option.model';
+import { ConfigOptionTypes } from '~/app/shared/components/config-option/config-option.types';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { NotificationType } from '~/app/shared/enum/notification-type.enum';
+import { CdForm } from '~/app/shared/forms/cd-form';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { NotificationService } from '~/app/shared/services/notification.service';
 import { ConfigFormCreateRequestModel } from './configuration-form-create-request.model';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
+import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+
+const RGW = 'rgw';
 
 @Component({
   selector: 'cd-configuration-form',
   templateUrl: './configuration-form.component.html',
   styleUrls: ['./configuration-form.component.scss']
 })
-export class ConfigurationFormComponent implements OnInit {
+export class ConfigurationFormComponent extends CdForm implements OnInit {
   configForm: CdFormGroup;
   response: ConfigFormModel;
   type: string;
@@ -28,30 +33,33 @@ export class ConfigurationFormComponent implements OnInit {
   maxValue: number;
   patternHelpText: string;
   availSections = ['global', 'mon', 'mgr', 'osd', 'mds', 'client'];
+  forceUpdate: boolean;
 
   constructor(
+    public actionLabels: ActionLabelsI18n,
     private route: ActivatedRoute,
     private router: Router,
     private configService: ConfigurationService,
     private notificationService: NotificationService,
-    private i18n: I18n
+    private modalService: ModalCdsService
   ) {
+    super();
     this.createForm();
   }
 
   createForm() {
     const formControls = {
-      name: new FormControl({ value: null }),
-      desc: new FormControl({ value: null }),
-      long_desc: new FormControl({ value: null }),
-      values: new FormGroup({}),
-      default: new FormControl({ value: null }),
-      daemon_default: new FormControl({ value: null }),
-      services: new FormControl([])
+      name: new UntypedFormControl({ value: null }),
+      desc: new UntypedFormControl({ value: null }),
+      long_desc: new UntypedFormControl({ value: null }),
+      values: new UntypedFormGroup({}),
+      default: new UntypedFormControl({ value: null }),
+      daemon_default: new UntypedFormControl({ value: null }),
+      services: new UntypedFormControl([])
     };
 
     this.availSections.forEach((section) => {
-      formControls.values.addControl(section, new FormControl(null));
+      formControls.values.addControl(section, new UntypedFormControl(null));
     });
 
     this.configForm = new CdFormGroup(formControls);
@@ -62,6 +70,7 @@ export class ConfigurationFormComponent implements OnInit {
       const configName = params.name;
       this.configService.get(configName).subscribe((resp: ConfigFormModel) => {
         this.setResponse(resp);
+        this.loadingReady();
       });
     });
   }
@@ -92,7 +101,6 @@ export class ConfigurationFormComponent implements OnInit {
   setResponse(response: ConfigFormModel) {
     this.response = response;
     const validators = this.getValidators(response);
-
     this.configForm.get('name').setValue(response.name);
     this.configForm.get('desc').setValue(response.desc);
     this.configForm.get('long_desc').setValue(response.long_desc);
@@ -115,7 +123,7 @@ export class ConfigurationFormComponent implements OnInit {
         this.configForm.get('values').get(value.section).setValue(sectionValue);
       });
     }
-
+    this.forceUpdate = !this.response.can_update_at_runtime && response.name.includes(RGW);
     this.availSections.forEach((section) => {
       this.configForm.get('values').get(section).setValidators(validators);
     });
@@ -131,7 +139,7 @@ export class ConfigurationFormComponent implements OnInit {
 
     this.availSections.forEach((section) => {
       const sectionValue = this.configForm.getValue(section);
-      if (sectionValue !== null && sectionValue !== '') {
+      if (sectionValue !== null) {
         values.push({ section: section, value: sectionValue });
       }
     });
@@ -140,10 +148,26 @@ export class ConfigurationFormComponent implements OnInit {
       const request = new ConfigFormCreateRequestModel();
       request.name = this.configForm.getValue('name');
       request.value = values;
+      if (this.forceUpdate) {
+        request.force_update = this.forceUpdate;
+      }
       return request;
     }
 
     return null;
+  }
+
+  openCriticalConfirmModal() {
+    this.modalService.show(DeleteConfirmationModalComponent, {
+      buttonText: $localize`Force Edit`,
+      actionDescription: $localize`force edit`,
+      itemDescription: $localize`configuration`,
+      infoMessage: 'Updating this configuration might require restarting the client',
+      submitAction: () => {
+        this.modalService.dismissAll();
+        this.submit();
+      }
+    });
   }
 
   submit() {
@@ -154,7 +178,7 @@ export class ConfigurationFormComponent implements OnInit {
         () => {
           this.notificationService.show(
             NotificationType.success,
-            this.i18n('Updated config option {{name}}', { name: request.name })
+            $localize`Updated config option ${request.name}`
           );
           this.router.navigate(['/configuration']);
         },

@@ -1,6 +1,8 @@
 #include <errno.h>
 #include <time.h>
 
+#include <iostream> // for std::cout
+
 #include <boost/container/small_vector.hpp>
 
 #include "gtest/gtest.h"
@@ -11,6 +13,7 @@
 #include "common/ceph_context.h"
 #include "global/global_context.h"
 
+using namespace std;
 
 class CryptoEnvironment: public ::testing::Environment {
 public:

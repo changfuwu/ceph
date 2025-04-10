@@ -3,6 +3,7 @@
 #ifndef CEPH_COMMON_PREFORKER_H
 #define CEPH_COMMON_PREFORKER_H
 
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -41,6 +42,17 @@ public:
     if (r < 0) {
       int e = errno;
       oss << "[" << getpid() << "]: unable to create socketpair: " << cpp_strerror(e);
+      err = oss.str();
+      return (errno = e, -1);
+    }
+
+    struct sigaction sa;
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGHUP, &sa, nullptr) != 0) {
+      int e = errno;
+      oss << "[" << getpid() << "]: unable to ignore SIGHUP: " << cpp_strerror(e);
       err = oss.str();
       return (errno = e, -1);
     }
@@ -114,7 +126,7 @@ public:
     }
     return r;
   }
-  void exit(int r) {
+  [[noreturn]] void exit(int r) {
     if (is_child())
         signal_exit(r);
     ::exit(r);

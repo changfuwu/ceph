@@ -5,6 +5,7 @@
 #include "librbd/BlockGuard.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/object_map/RefreshRequest.h"
 #include "librbd/object_map/ResizeRequest.h"
 #include "librbd/object_map/SnapshotCreateRequest.h"
@@ -15,7 +16,6 @@
 #include "librbd/Utils.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 
 #include "include/rados/librados.hpp"
 
@@ -23,6 +23,9 @@
 #include "cls/rbd/cls_rbd_types.h"
 #include "include/stringify.h"
 #include "osdc/Striper.h"
+
+#include <iomanip>
+#include <shared_mutex> // for std::shared_lock
 #include <sstream>
 
 #define dout_subsys ceph_subsys_rbd
@@ -107,32 +110,6 @@ bool ObjectMap<I>::object_may_exist(uint64_t object_no) const
 }
 
 template <typename I>
-bool ObjectMap<I>::object_may_not_exist(uint64_t object_no) const
-{
-  ceph_assert(ceph_mutex_is_locked(m_image_ctx.image_lock));
-
-  // Fall back to default logic if object map is disabled or invalid
-  if (!m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP,
-                                 m_image_ctx.image_lock)) {
-    return true;
-  }
-
-  bool flags_set;
-  int r = m_image_ctx.test_flags(m_image_ctx.snap_id,
-                                 RBD_FLAG_OBJECT_MAP_INVALID,
-                                 m_image_ctx.image_lock, &flags_set);
-  if (r < 0 || flags_set) {
-    return true;
-  }
-
-  uint8_t state = (*this)[object_no];
-  bool nonexistent = (state != OBJECT_EXISTS && state != OBJECT_EXISTS_CLEAN);
-  ldout(m_image_ctx.cct, 20) << "object_no=" << object_no << " r="
-                             << nonexistent << dendl;
-  return nonexistent;
-}
-
-template <typename I>
 bool ObjectMap<I>::update_required(const ceph::BitVector<2>::Iterator& it,
                                    uint8_t new_state) {
   ceph_assert(ceph_mutex_is_locked(m_lock));
@@ -163,8 +140,14 @@ void ObjectMap<I>::close(Context *on_finish) {
     return;
   }
 
-  auto req = object_map::UnlockRequest<I>::create(m_image_ctx, ctx);
-  req->send();
+  ctx = new LambdaContext([this, ctx](int r) {
+      auto req = object_map::UnlockRequest<I>::create(m_image_ctx, ctx);
+      req->send();
+    });
+
+  // ensure the block guard for aio updates is empty before unlocking
+  // the object map
+  m_async_op_tracker.wait_for_ops(ctx);
 }
 
 template <typename I>
@@ -228,7 +211,7 @@ void ObjectMap<I>::aio_save(Context *on_finish) {
 
   librados::ObjectWriteOperation op;
   if (m_snap_id == CEPH_NOSNAP) {
-    rados::cls::lock::assert_locked(&op, RBD_LOCK_NAME, LOCK_EXCLUSIVE, "", "");
+    rados::cls::lock::assert_locked(&op, RBD_LOCK_NAME, ClsLockType::EXCLUSIVE, "", "");
   }
   cls_client::object_map_save(&op, m_object_map);
 
@@ -276,6 +259,7 @@ void ObjectMap<I>::detained_aio_update(UpdateOperation &&op) {
     lderr(cct) << "failed to detain object map update: " << cpp_strerror(r)
                << dendl;
     m_image_ctx.op_work_queue->queue(op.on_finish, r);
+    m_async_op_tracker.finish_op();
     return;
   } else if (r > 0) {
     ldout(cct, 20) << "detaining object map update due to in-flight update: "
@@ -315,6 +299,7 @@ void ObjectMap<I>::handle_detained_aio_update(BlockGuardCell *cell, int r,
   }
 
   on_finish->complete(r);
+  m_async_op_tracker.finish_op();
 }
 
 template <typename I>

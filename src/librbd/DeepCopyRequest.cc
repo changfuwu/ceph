@@ -12,6 +12,8 @@
 #include "librbd/deep_copy/SnapshotCopyRequest.h"
 #include "librbd/internal.h"
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::DeepCopyRequest: " \
@@ -32,7 +34,8 @@ DeepCopyRequest<I>::DeepCopyRequest(I *src_image_ctx, I *dst_image_ctx,
                                     librados::snap_t dst_snap_id_start,
                                     bool flatten,
                                     const ObjectNumber &object_number,
-                                    ContextWQ *work_queue, SnapSeqs *snap_seqs,
+                                    asio::ContextWQ *work_queue,
+                                    SnapSeqs *snap_seqs,
                                     deep_copy::Handler *handler,
                                     Context *on_finish)
   : RefCountedObject(dst_image_ctx->cct), m_src_image_ctx(src_image_ctx),

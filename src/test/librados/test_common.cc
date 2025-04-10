@@ -2,9 +2,12 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "common/Formatter.h"
+#include "include/ceph_assert.h"
 #include "include/stringify.h"
 #include "json_spirit/json_spirit.h"
 #include "test_common.h"
+
+using namespace std;
 
 namespace {
 

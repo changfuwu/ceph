@@ -1,6 +1,8 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include <iostream> // for std::cout
+
 #include "include/types.h"
 #include "common/Thread.h"
 #include "common/debug.h"
@@ -8,8 +10,11 @@
 #include "common/config.h"
 #include "common/ceph_argparse.h"
 #include "global/global_init.h"
+#include "log/Log.h"
 
 #define dout_context g_ceph_context
+
+using namespace std;
 
 struct T : public Thread {
   int num;
@@ -48,8 +53,7 @@ int main(int argc, const char **argv)
 
   cout << threads << " threads, " << num << " lines per thread" << std::endl;
 
-  vector<const char*> args;
-  argv_to_vec(argc, argv, args);
+  auto args = argv_to_vec(argc, argv);
 
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_OSD,
 			 CODE_ENVIRONMENT_UTILITY,

@@ -4,10 +4,12 @@
 #pragma once
 
 #include "crimson/net/Connection.h"
+#include "crimson/osd/osdmap_gate.h"
 #include "crimson/osd/osd_operation.h"
+#include "crimson/osd/pg_map.h"
+#include "crimson/osd/osd_operations/client_request.h"
 #include "crimson/common/type_helpers.h"
-
-class MOSDRepOp;
+#include "messages/MOSDRepOp.h"
 
 namespace ceph {
   class Formatter;
@@ -15,44 +17,92 @@ namespace ceph {
 
 namespace crimson::osd {
 
+class ShardServices;
+
 class OSD;
 class PG;
 
-class RepRequest final : public OperationT<RepRequest> {
+class RepRequest final : public PhasedOperationT<RepRequest> {
 public:
-  class ConnectionPipeline {
-    OrderedPipelinePhase await_map = {
-      "RepRequest::ConnectionPipeline::await_map"
-    };
-    OrderedPipelinePhase get_pg = {
-      "RepRequest::ConnectionPipeline::get_pg"
-    };
-    friend RepRequest;
-  };
-  class PGPipeline {
-    OrderedPipelinePhase await_map = {
-      "RepRequest::PGPipeline::await_map"
-    };
-    OrderedPipelinePhase process = {
-      "RepRequest::PGPipeline::process"
-    };
-    friend RepRequest;
-  };
   static constexpr OperationTypeCode type = OperationTypeCode::replicated_request;
-  RepRequest(OSD&, crimson::net::ConnectionRef&&, Ref<MOSDRepOp>&&);
+  RepRequest(crimson::net::ConnectionRef&&, Ref<MOSDRepOp>&&);
 
   void print(std::ostream &) const final;
   void dump_detail(ceph::Formatter* f) const final;
-  seastar::future<> start();
+
+  static constexpr bool can_create() { return false; }
+  spg_t get_pgid() const {
+    return req->get_spg();
+  }
+  PipelineHandle &get_handle() { return handle; }
+  epoch_t get_epoch() const { return req->get_min_epoch(); }
+  epoch_t get_epoch_sent_at() const {
+    return req->get_map_epoch();
+  }
+
+  ConnectionPipeline &get_connection_pipeline();
+
+  PerShardPipeline &get_pershard_pipeline(ShardServices &);
+
+  crimson::net::Connection &get_local_connection() {
+    assert(l_conn);
+    assert(!r_conn);
+    return *l_conn;
+  };
+
+  crimson::net::Connection &get_foreign_connection() {
+    assert(r_conn);
+    assert(!l_conn);
+    return *r_conn;
+  };
+
+  crimson::net::ConnectionFFRef prepare_remote_submission() {
+    assert(l_conn);
+    assert(!r_conn);
+    auto ret = seastar::make_foreign(std::move(l_conn));
+    l_conn.reset();
+    return ret;
+  }
+
+  void finish_remote_submission(crimson::net::ConnectionFFRef conn) {
+    assert(conn);
+    assert(!l_conn);
+    assert(!r_conn);
+    r_conn = make_local_shared_foreign(std::move(conn));
+  }
+
+  interruptible_future<> with_pg_interruptible(
+    Ref<PG> pg);
+
+  seastar::future<> with_pg(
+    ShardServices &shard_services, Ref<PG> pg);
+
+  std::tuple<
+    StartEvent,
+    ConnectionPipeline::AwaitActive::BlockingEvent,
+    ConnectionPipeline::AwaitMap::BlockingEvent,
+    ConnectionPipeline::GetPGMapping::BlockingEvent,
+    PerShardPipeline::CreateOrWaitPG::BlockingEvent,
+    PGRepopPipeline::Process::BlockingEvent,
+    PGRepopPipeline::WaitCommit::BlockingEvent,
+    PGRepopPipeline::SendReply::BlockingEvent,
+    PG_OSDMapGate::OSDMapBlocker::BlockingEvent,
+    PGMap::PGCreationBlockingEvent,
+    OSD_OSDMapGate::OSDMapBlocker::BlockingEvent
+  > tracking_events;
 
 private:
-  ConnectionPipeline &cp();
-  PGPipeline &pp(PG &pg);
+  PGRepopPipeline &repop_pipeline(PG &pg);
 
-  OSD &osd;
-  crimson::net::ConnectionRef conn;
+  crimson::net::ConnectionRef l_conn;
+  crimson::net::ConnectionXcoreRef r_conn;
+
+  PipelineHandle handle;
   Ref<MOSDRepOp> req;
-  OrderedPipelinePhase::Handle handle;
 };
 
 }
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::osd::RepRequest> : fmt::ostream_formatter {};
+#endif

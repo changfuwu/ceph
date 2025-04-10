@@ -6,12 +6,12 @@
 #include "OpenImageRequest.h"
 #include "common/debug.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "librbd/internal.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/image/CreateRequest.h"
 #include "librbd/image/CloneRequest.h"
 #include "tools/rbd_mirror/PoolMetaCache.h"
@@ -20,6 +20,8 @@
 #include "tools/rbd_mirror/image_replayer/Utils.h"
 #include "tools/rbd_mirror/image_sync/Utils.h"
 #include <boost/algorithm/string/predicate.hpp>
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
@@ -89,7 +91,7 @@ void CreateImageRequest<I>::create_image() {
 
   auto req = librbd::image::CreateRequest<I>::create(
     config, m_local_io_ctx, m_local_image_name, m_local_image_id,
-    m_remote_image_ctx->size, image_options, false, m_mirror_image_mode,
+    m_remote_image_ctx->size, image_options, 0U, m_mirror_image_mode,
     m_global_image_id, m_remote_mirror_uuid, m_remote_image_ctx->op_work_queue,
     ctx);
   req->send();
@@ -404,8 +406,7 @@ template <typename I>
 void CreateImageRequest<I>::populate_image_options(
     librbd::ImageOptions* image_options) {
   image_options->set(RBD_IMAGE_OPTION_FEATURES,
-                     (m_remote_image_ctx->features &
-                        ~RBD_FEATURES_IMPLICIT_ENABLE));
+                     m_remote_image_ctx->features);
   image_options->set(RBD_IMAGE_OPTION_ORDER, m_remote_image_ctx->order);
   image_options->set(RBD_IMAGE_OPTION_STRIPE_UNIT,
                      m_remote_image_ctx->stripe_unit);

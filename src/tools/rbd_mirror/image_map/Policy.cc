@@ -1,11 +1,15 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include "Policy.h"
+
 #include "common/debug.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/errno.h"
 
 #include "librbd/Utils.h"
-#include "Policy.h"
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
@@ -380,6 +384,7 @@ bool Policy::can_shuffle_image(const std::string &global_image_id) {
 bool Policy::set_state(ImageState* image_state, StateTransition::State state,
                        bool ignore_current_state) {
   if (!ignore_current_state && image_state->state == state) {
+    image_state->next_state = boost::none;
     return false;
   } else if (StateTransition::is_idle(image_state->state)) {
     image_state->state = state;

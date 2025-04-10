@@ -2,31 +2,31 @@ import { Component, OnInit } from '@angular/core';
 import {
   AbstractControl,
   AsyncValidatorFn,
-  FormControl,
+  UntypedFormControl,
   ValidationErrors,
   ValidatorFn
 } from '@angular/forms';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
-import { BsModalRef } from 'ngx-bootstrap/modal';
+import { BaseModal, ModalService } from 'carbon-components-angular';
 import { Subject } from 'rxjs';
 
-import { PoolService } from '../../../shared/api/pool.service';
-import { RbdService } from '../../../shared/api/rbd.service';
-import { NotificationType } from '../../../shared/enum/notification-type.enum';
-import { CdFormGroup } from '../../../shared/forms/cd-form-group';
-import { FinishedTask } from '../../../shared/models/finished-task';
-import { Permission } from '../../../shared/models/permissions';
-import { AuthStorageService } from '../../../shared/services/auth-storage.service';
-import { NotificationService } from '../../../shared/services/notification.service';
-import { Pool } from '../../pool/pool';
+import { Pool } from '~/app/ceph/pool/pool';
+import { PoolService } from '~/app/shared/api/pool.service';
+import { RbdService } from '~/app/shared/api/rbd.service';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { NotificationType } from '~/app/shared/enum/notification-type.enum';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { FinishedTask } from '~/app/shared/models/finished-task';
+import { Permission } from '~/app/shared/models/permissions';
+import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
+import { NotificationService } from '~/app/shared/services/notification.service';
 
 @Component({
   selector: 'cd-rbd-namespace-form-modal',
   templateUrl: './rbd-namespace-form-modal.component.html',
   styleUrls: ['./rbd-namespace-form-modal.component.scss']
 })
-export class RbdNamespaceFormModalComponent implements OnInit {
+export class RbdNamespaceFormModalComponent extends BaseModal implements OnInit {
   poolPermission: Permission;
   pools: Array<Pool> = null;
   pool: string;
@@ -36,16 +36,17 @@ export class RbdNamespaceFormModalComponent implements OnInit {
 
   editing = false;
 
-  public onSubmit: Subject<void>;
+  public onSubmit: Subject<void> = new Subject();
 
   constructor(
-    public modalRef: BsModalRef,
+    public actionLabels: ActionLabelsI18n,
     private authStorageService: AuthStorageService,
     private notificationService: NotificationService,
     private poolService: PoolService,
     private rbdService: RbdService,
-    private i18n: I18n
+    protected modalService: ModalService
   ) {
+    super();
     this.poolPermission = this.authStorageService.getPermissions().pool;
     this.createForm();
   }
@@ -53,8 +54,8 @@ export class RbdNamespaceFormModalComponent implements OnInit {
   createForm() {
     this.namespaceForm = new CdFormGroup(
       {
-        pool: new FormControl(''),
-        namespace: new FormControl('')
+        pool: new UntypedFormControl(''),
+        namespace: new UntypedFormControl('')
       },
       this.validator(),
       this.asyncValidator()
@@ -98,8 +99,6 @@ export class RbdNamespaceFormModalComponent implements OnInit {
   }
 
   ngOnInit() {
-    this.onSubmit = new Subject();
-
     if (this.poolPermission.read) {
       this.poolService.list(['pool_name', 'type', 'application_metadata']).then((resp) => {
         const pools: Pool[] = [];
@@ -130,14 +129,11 @@ export class RbdNamespaceFormModalComponent implements OnInit {
       .createNamespace(pool, namespace)
       .toPromise()
       .then(() => {
+        this.modalService.destroy();
         this.notificationService.show(
           NotificationType.success,
-          this.i18n(`Created namespace '{{pool}}/{{namespace}}'`, {
-            pool: pool,
-            namespace: namespace
-          })
+          $localize`Created namespace '${pool}/${namespace}'`
         );
-        this.modalRef.hide();
         this.onSubmit.next();
       })
       .catch(() => {

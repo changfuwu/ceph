@@ -29,8 +29,8 @@ private:
   static const uint8_t MASK = static_cast<uint8_t>((1 << _bit_count) - 1);
 
   // must be power of 2
-  BOOST_STATIC_ASSERT((_bit_count != 0) && !(_bit_count & (_bit_count - 1)));
-  BOOST_STATIC_ASSERT(_bit_count <= BITS_PER_BYTE);
+  static_assert((_bit_count != 0) && !(_bit_count & (_bit_count - 1)));
+  static_assert(_bit_count <= BITS_PER_BYTE);
 
   template <typename DataIterator>
   class ReferenceImpl {
@@ -83,7 +83,7 @@ public:
   };
 
 public:
-  template <typename BitVectorT, typename DataIterator>
+  template <typename BitVectorT, typename DataIteratorT, typename ReferenceT>
   class IteratorImpl {
   private:
     friend class BitVector;
@@ -94,7 +94,7 @@ public:
     // cached derived values
     uint64_t m_index = 0;
     uint64_t m_shift = 0;
-    DataIterator m_data_iterator;
+    DataIteratorT m_data_iterator;
 
     IteratorImpl(BitVectorT *bit_vector, uint64_t offset)
       : m_bit_vector(bit_vector),
@@ -129,7 +129,7 @@ public:
 
     inline IteratorImpl operator++(int) {
       IteratorImpl iterator_impl(*this);
-      ++iterator_impl;
+      ++*this;
       return iterator_impl;
     }
     inline IteratorImpl operator+(uint64_t offset) {
@@ -145,17 +145,15 @@ public:
       return (m_offset != rhs.m_offset || m_bit_vector != rhs.m_bit_vector);
     }
 
-    inline ConstReference operator*() const {
-      return ConstReference(m_data_iterator, m_shift);
-    }
-    inline Reference operator*() {
-      return Reference(m_data_iterator, m_shift);
+    inline ReferenceT operator*() const {
+      return ReferenceT(m_data_iterator, m_shift);
     }
   };
 
   typedef IteratorImpl<const BitVector,
-                       bufferlist::const_iterator> ConstIterator;
-  typedef IteratorImpl<BitVector, bufferlist::iterator> Iterator;
+                       bufferlist::const_iterator,
+                       ConstReference> ConstIterator;
+  typedef IteratorImpl<BitVector, bufferlist::iterator, Reference> Iterator;
 
   static const uint32_t BLOCK_SIZE;
   static const uint8_t BIT_COUNT = _bit_count;
@@ -223,23 +221,18 @@ public:
 
   static void generate_test_instances(std::list<BitVector *> &o);
 private:
-  struct NoInitAllocator : public std::allocator<__u32> {
-    NoInitAllocator() {}
-    NoInitAllocator(const std::allocator<__u32>& alloc)
-      : std::allocator<__u32>(alloc) {
-    }
-
-    template <class U, class... Args>
-    void construct(U* p, Args&&... args) const {
-    }
-  };
-
   bufferlist m_data;
   uint64_t m_size;
   bool m_crc_enabled;
 
   mutable __u32 m_header_crc;
-  mutable std::vector<__u32, NoInitAllocator> m_data_crcs;
+
+  // inhibit value-initialization when used in std::vector
+  struct u32_struct {
+    u32_struct() {}
+    __u32 val;
+  };
+  mutable std::vector<u32_struct> m_data_crcs;
 
   void resize(uint64_t elements, bool zero);
 
@@ -351,7 +344,7 @@ void BitVector<_b>::encode_data(bufferlist& bl, uint64_t data_byte_offset,
 
     bufferlist bit;
     bit.substr_of(m_data, data_byte_offset, len);
-    m_data_crcs[data_byte_offset / BLOCK_SIZE] = bit.crc32c(0);
+    m_data_crcs[data_byte_offset / BLOCK_SIZE].val = bit.crc32c(0);
 
     bl.claim_append(bit);
     data_byte_offset += BLOCK_SIZE;
@@ -385,7 +378,7 @@ void BitVector<_b>::decode_data(bufferlist::const_iterator& it,
     bufferlist bit;
     bit.append(ptr);
     if (m_crc_enabled &&
-	m_data_crcs[data_byte_offset / BLOCK_SIZE] != bit.crc32c(0)) {
+	m_data_crcs[data_byte_offset / BLOCK_SIZE].val != bit.crc32c(0)) {
       throw buffer::malformed_input("invalid data block CRC");
     }
     data.append(bit);
@@ -499,7 +492,7 @@ void BitVector<_b>::encode_data_crcs(bufferlist& bl, uint64_t offset,
   compute_index(offset + length - 1, &index, &shift);
   uint64_t end_crc_index = index / BLOCK_SIZE;
   while (crc_index <= end_crc_index) {
-    __u32 crc = m_data_crcs[crc_index++];
+    __u32 crc = m_data_crcs[crc_index++].val;
     ceph::encode(crc, bl);
   }
 }
@@ -520,7 +513,7 @@ void BitVector<_b>::decode_data_crcs(bufferlist::const_iterator& it,
   while (remaining > 0) {
     __u32 crc;
     ceph::decode(crc, it);
-    m_data_crcs[crc_index++] = crc;
+    m_data_crcs[crc_index++].val = crc;
     --remaining;
   }
 }

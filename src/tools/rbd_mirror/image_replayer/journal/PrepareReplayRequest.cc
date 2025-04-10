@@ -12,6 +12,8 @@
 #include "tools/rbd_mirror/ProgressContext.h"
 #include "tools/rbd_mirror/image_replayer/journal/StateBuilder.h"
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
 #undef dout_prefix
@@ -67,17 +69,6 @@ void PrepareReplayRequest<I>::send() {
   dout(10) << "local tag=" << m_local_tag_tid << ", "
            << "local tag data=" << m_local_tag_data << dendl;
   image_locker.unlock();
-
-  if (m_local_tag_data.mirror_uuid != m_state_builder->remote_mirror_uuid &&
-      m_remote_promotion_state != librbd::mirror::PROMOTION_STATE_PRIMARY) {
-    // if the local mirror is not linked to the (now) non-primary image,
-    // stop the replay. Otherwise, we ignore that the remote is non-primary
-    // so that we can replay the demotion
-    dout(5) << "remote image is not primary -- skipping image replay"
-            << dendl;
-    finish(-EREMOTEIO);
-    return;
-  }
 
   if (*m_resync_requested) {
     finish(0);
@@ -171,7 +162,7 @@ void PrepareReplayRequest<I>::handle_get_remote_tag_class(int r) {
   }
 
   librbd::journal::ImageClientMeta *client_meta =
-    boost::get<librbd::journal::ImageClientMeta>(&client_data.client_meta);
+    std::get_if<librbd::journal::ImageClientMeta>(&client_data.client_meta);
   if (client_meta == nullptr) {
     derr << "unknown remote client registration" << dendl;
     finish(-EINVAL);

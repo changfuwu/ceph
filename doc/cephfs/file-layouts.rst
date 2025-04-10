@@ -6,6 +6,9 @@ File layouts
 The layout of a file controls how its contents are mapped to Ceph RADOS objects.  You can
 read and write a file's layout using *virtual extended attributes* or xattrs.
 
+Clients must use the ``p`` flag when writing a file's layout. See :ref:`Layout
+and Quota restriction (the 'p' flag) <cephfs-layout-and-quota-restriction>`.
+
 The name of the layout xattrs depends on whether a file is a regular file or a directory.  Regular
 files' layout xattrs are called ``ceph.file.layout``, whereas directories' layout xattrs are called
 ``ceph.dir.layout``.  Where subsequent examples refer to ``ceph.file.layout``, substitute ``dir`` as appropriate
@@ -20,20 +23,38 @@ Layout fields
 -------------
 
 pool
-    String, giving ID or name.  Which RADOS pool a file's data objects will be stored in.
+    This is a string and contains either an ID or a name. Strings may contain
+    only characters in the set ``[a-zA-Z0-9\_-.]``. This determines the RADOS
+    pool that stores a file's data objects.
+
+pool_id
+    This is a string of digits. This is the pool ID that was assigned by Ceph
+    at the time of the creation of the RADOS pool.
+
+pool_name
+    This is a string. This is the name of the RADOS pool as defined by the user
+    when the pool was created. 
 
 pool_namespace
-    String.  Within the data pool, which RADOS namespace the objects will
-    be written to.  Empty by default (i.e. default namespace).
+    This is a string containing only characters in the set ``[a-zA-Z0-9\_-.]``.
+    This determines which RADOS namespace within the data pool that the objects
+    will be written to.
+    Empty by default (i.e. default namespace).
 
 stripe_unit
-    Integer in bytes.  The size (in bytes) of a block of data used in the RAID 0 distribution of a file. All stripe units for a file have equal size. The last stripe unit is typically incomplete–i.e. it represents the data at the end of the file as well as unused “space” beyond it up to the end of the fixed stripe unit size.
+    This is an integer. The size (in bytes) of a block of data used in the
+    distribution of a file. All stripe units for a file have equal size. The
+    last stripe unit is typically only partly full of data: it holds file data
+    through EOF as well as padding that fills the balance of the fixed stripe
+    unit size. 
 
 stripe_count
-    Integer.  The number of consecutive stripe units that constitute a RAID 0 “stripe” of file data.
+    Integer. The number of consecutive stripe units that constitute a RAID 0
+    “stripe” of file data.
 
 object_size
-    Integer in bytes.  File data is chunked into RADOS objects of this size.
+    Integer. The size of the object in bytes. File data is chunked into RADOS
+    objects of this size.
 
 .. tip::
 
@@ -59,6 +80,12 @@ Read individual layout fields:
 
 .. code-block:: bash
 
+    $ getfattr -n ceph.file.layout.pool_name file
+    # file: file
+    ceph.file.layout.pool_name="cephfs_data"
+    $ getfattr -n ceph.file.layout.pool_id file
+    # file: file
+    ceph.file.layout.pool_id="5"
     $ getfattr -n ceph.file.layout.pool file
     # file: file
     ceph.file.layout.pool="cephfs_data"
@@ -91,6 +118,23 @@ next ancestor directory with an explicit layout will be used.
     # file: dir
     ceph.dir.layout="stripe_unit=4194304 stripe_count=2 object_size=4194304 pool=cephfs_data"
 
+Getting the layout in json format. If there's no specific layout set for the
+particular inode, the system traverses the directory path backwards and finds
+the closest ancestor directory with a layout and returns it in json format.
+A file layout also can be retrieved in json format using ``ceph.file.layout.json`` vxattr.
+
+A virtual field named ``inheritance`` is added to the json output to show the status of layout.
+The ``inheritance`` field can have the following values:
+
+``@default`` implies the system default layout
+``@set`` implies that a specific layout has been set for that particular inode
+``@inherited`` implies that the returned layout has been inherited from an ancestor
+
+.. code-block:: bash
+
+   $ getfattr -n ceph.dir.layout.json --only-values /mnt/mycephs/accounts
+   {"stripe_unit": 4194304, "stripe_count": 1, "object_size": 4194304, "pool_name": "cephfs.a.data", "pool_id": 3, "pool_namespace": "", "inheritance": "@default"}
+
 
 Writing layouts with ``setfattr``
 ---------------------------------
@@ -109,6 +153,8 @@ Layout fields are modified using ``setfattr``:
     $ setfattr -n ceph.file.layout.object_size -v 10485760 file2
     $ setfattr -n ceph.file.layout.pool -v 1 file2  # Setting pool by ID
     $ setfattr -n ceph.file.layout.pool -v cephfs_data file2  # Setting pool by name
+    $ setfattr -n ceph.file.layout.pool_id -v 1 file2  # Setting pool by ID
+    $ setfattr -n ceph.file.layout.pool_name -v cephfs_data file2  # Setting pool by name
 
 .. note::
 
@@ -125,6 +171,15 @@ Layout fields are modified using ``setfattr``:
     $ echo "hello world" > file1
     $ setfattr -n ceph.file.layout.stripe_count -v 4 file1
     setfattr: file1: Directory not empty
+
+File and Directory layouts can also be set using the json format.
+The ``inheritance`` field is ignored when setting the layout.
+Also, if both, ``pool_name`` and ``pool_id`` fields are specified, then the
+``pool_name`` is given preference for better disambiguation.
+
+.. code-block:: bash
+
+   $ setfattr -n ceph.file.layout.json -v '{"stripe_unit": 4194304, "stripe_count": 1, "object_size": 4194304, "pool_name": "cephfs.a.data", "pool_id": 3, "pool_namespace": "", "inheritance": "@default"}' file1
     
 Clearing layouts
 ----------------
@@ -202,9 +257,11 @@ directories do not have layouts set:
     # file: dir/childdir/grandchild
     ceph.file.layout="stripe_unit=4194304 stripe_count=4 object_size=4194304 pool=cephfs_data"
 
+
+.. _adding-data-pool-to-file-system:
     
-Adding a data pool to the MDS
------------------------------
+Adding a data pool to the File System 
+-------------------------------------
 
 Before you can use a pool with CephFS you have to add it to the Metadata Servers.
 

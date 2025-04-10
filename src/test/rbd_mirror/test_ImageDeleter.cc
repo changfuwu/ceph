@@ -73,8 +73,7 @@ public:
 
     m_local_image_id = librbd::util::generate_image_id(m_local_io_ctx);
     librbd::ImageOptions image_opts;
-    image_opts.set(RBD_IMAGE_OPTION_FEATURES,
-                   (RBD_FEATURES_ALL & ~RBD_FEATURES_IMPLICIT_ENABLE));
+    image_opts.set(RBD_IMAGE_OPTION_FEATURES, RBD_FEATURES_ALL);
     EXPECT_EQ(0, librbd::create(m_local_io_ctx, m_image_name, m_local_image_id,
                                 1 << 20, image_opts, GLOBAL_IMAGE_ID,
                                 m_remote_mirror_uuid, true));
@@ -170,12 +169,13 @@ public:
       ictx->set_journal_policy(new librbd::journal::DisabledPolicy());
     }
 
+    librbd::NoOpProgressContext prog_ctx;
     EXPECT_EQ(0, ictx->operations->snap_create(
-                   cls::rbd::UserSnapshotNamespace(), snap_name.c_str()));
+                   cls::rbd::UserSnapshotNamespace(), snap_name, 0, prog_ctx));
 
     if (protect) {
       EXPECT_EQ(0, ictx->operations->snap_protect(
-                     cls::rbd::UserSnapshotNamespace(), snap_name.c_str()));
+                     cls::rbd::UserSnapshotNamespace(), snap_name));
     }
 
     EXPECT_EQ(0, ictx->state->close());
@@ -190,8 +190,9 @@ public:
       ictx->set_journal_policy(new librbd::journal::DisabledPolicy());
     }
 
+    librbd::NoOpProgressContext prog_ctx;
     EXPECT_EQ(0, ictx->operations->snap_create(
-                   cls::rbd::UserSnapshotNamespace(), "snap1"));
+                   cls::rbd::UserSnapshotNamespace(), "snap1", 0, prog_ctx));
     EXPECT_EQ(0, ictx->operations->snap_protect(
                    cls::rbd::UserSnapshotNamespace(), "snap1"));
     EXPECT_EQ(0, librbd::api::Image<>::snap_set(
@@ -201,7 +202,7 @@ public:
     librbd::ImageOptions clone_opts;
     clone_opts.set(RBD_IMAGE_OPTION_FEATURES, ictx->features);
     EXPECT_EQ(0, librbd::clone(m_local_io_ctx, m_local_image_id.c_str(),
-                               nullptr, "snap1", m_local_io_ctx,
+                               nullptr, CEPH_NOSNAP, "snap1", m_local_io_ctx,
                                clone_id.c_str(), "clone1", clone_opts,
                                GLOBAL_CLONE_IMAGE_ID, m_remote_mirror_uuid));
 

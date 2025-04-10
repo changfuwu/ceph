@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <cmath>
 #include <string>
+#include <array>
 
 #include "include/types.h"
 #include "include/health.h"
@@ -52,10 +53,13 @@
 #include "messages/MMonCommand.h"
 #include "mon/MonitorDBStore.h"
 #include "mgr/MgrClient.h"
+#include <boost/smart_ptr/atomic_shared_ptr.hpp>
+#include <boost/smart_ptr/shared_ptr.hpp>
 
 #include "mon/MonOpRequest.h"
 #include "common/WorkQueue.h"
 
+using namespace TOPNSPC::common;
 
 #define CEPH_MON_PROTOCOL     13 /* cluster internal */
 
@@ -97,7 +101,6 @@ enum {
   l_mon_last,
 };
 
-class QuorumService;
 class PaxosService;
 
 class AdminSocketHook;
@@ -215,9 +218,22 @@ public:
 
   std::vector<DaemonHealthMetric> get_health_metrics();
 
+  int quorum_age() const {
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+      ceph::mono_clock::now() - quorum_since);
+    return age.count();
+  }
+
+  bool is_mon_down() const {
+    int max = monmap->size();
+    int actual = get_quorum().size();
+    auto now = ceph::real_clock::now();
+    return actual < max && now > monmap->created.to_real_time();
+  }
+
   // -- elector --
 private:
-  Paxos *paxos;
+  std::unique_ptr<Paxos> paxos;
   Elector elector;
   friend class Elector;
 
@@ -247,12 +263,57 @@ private:
 
   std::set<std::string> outside_quorum;
 
+  bool stretch_mode_engaged{false};
+  bool degraded_stretch_mode{false};
+  bool recovering_stretch_mode{false};
+  std::string stretch_bucket_divider;
+  std::map<std::string, std::set<std::string>> dead_mon_buckets; // bucket->mon ranks, locations with no live mons
+  std::set<std::string> up_mon_buckets; // locations with a live mon
+  void do_stretch_mode_election_work();
+
+  bool session_stretch_allowed(MonSession *s, MonOpRequestRef& op);
+  void disconnect_disallowed_stretch_sessions();
+  void set_elector_disallowed_leaders(bool allow_election);
+
+  std::map<std::string,std::string> crush_loc;
+  bool need_set_crush_loc{false};
+public:
+  bool is_stretch_mode() { return stretch_mode_engaged; }
+  bool is_degraded_stretch_mode() { return degraded_stretch_mode; }
+  bool is_recovering_stretch_mode() { return recovering_stretch_mode; }
+
+  /**
+   * This set of functions maintains the in-memory stretch state
+   * and sets up transitions of the map states by calling in to
+   * MonmapMonitor and OSDMonitor.
+   *
+   * The [maybe_]go_* functions are called on the leader to
+   * decide if transitions should happen; the trigger_* functions
+   * set up the map transitions; and the set_* functions actually
+   * change the memory state -- but these are only called
+   * via OSDMonitor::update_from_paxos, to guarantee consistent
+   * updates across the entire cluster.
+   */
+  void try_engage_stretch_mode();
+  void try_disable_stretch_mode();
+  void maybe_go_degraded_stretch_mode();
+  void trigger_degraded_stretch_mode(const std::set<std::string>& dead_mons,
+				     const std::set<int>& dead_buckets);
+  void set_degraded_stretch_mode();
+  void go_recovery_stretch_mode();
+  void set_recovery_stretch_mode();
+  void trigger_healthy_stretch_mode();
+  void set_healthy_stretch_mode();
+  void enable_stretch_mode();
+  void set_mon_crush_location(const std::string& loc);
+
+  
+private:
+
   /**
    * @defgroup Monitor_h_scrub
    * @{
    */
-  version_t scrub_version;            ///< paxos version we are scrubbing
-  std::map<int,ScrubResult> scrub_result;  ///< results so far
 
   /**
    * trigger a cross-mon scrub
@@ -269,7 +330,7 @@ private:
   void scrub_timeout();
   void scrub_finish();
   void scrub_reset();
-  void scrub_update_interval(int secs);
+  void scrub_update_interval(ceph::timespan interval);
 
   Context *scrub_event;       ///< periodic event to trigger scrub (leader)
   Context *scrub_timeout_event;  ///< scrub round timeout (leader)
@@ -281,11 +342,27 @@ private:
   struct ScrubState {
     std::pair<std::string,std::string> last_key; ///< last scrubbed key
     bool finished;
+    const utime_t start;
 
-    ScrubState() : finished(false) { }
+    ScrubState() : finished(false),
+                   start(ceph_clock_now()) { }
     virtual ~ScrubState() { }
   };
-  std::shared_ptr<ScrubState> scrub_state; ///< keeps track of current scrub
+
+  struct ScrubContext {
+    ScrubState scrub_state;       ///< keeps track of current scrub
+    version_t scrub_version;      ///< paxos version we are scrubbing
+    std::map<int,ScrubResult> scrub_result;  ///< result so far
+    ScrubContext() {
+      scrub_version = 0;
+      scrub_result.clear();
+    }
+    ~ScrubContext() {
+      scrub_version = 0;
+      scrub_result.clear();
+     }
+  };
+  boost::atomic_shared_ptr<ScrubContext> scrub_ctx; ///< keeps track of scrub_context
 
   /**
    * @defgroup Monitor_h_sync Synchronization
@@ -555,7 +632,7 @@ public:
   epoch_t get_epoch();
   int get_leader() const { return leader; }
   std::string get_leader_name() {
-    return quorum.empty() ? std::string() : monmap->get_name(*quorum.begin());
+    return quorum.empty() ? std::string() : monmap->get_name(leader);
   }
   const std::set<int>& get_quorum() const { return quorum; }
   std::list<std::string> get_quorum_names() {
@@ -610,7 +687,7 @@ public:
   /**
    * Vector holding the Services serviced by this Monitor.
    */
-  std::vector<std::unique_ptr<PaxosService>> paxos_service;
+  std::array<std::unique_ptr<PaxosService>, PAXOS_NUM> paxos_service;
 
   class MDSMonitor *mdsmon() {
     return (class MDSMonitor *)paxos_service[PAXOS_MDSMAP].get();
@@ -648,14 +725,21 @@ public:
     return (class ConfigMonitor*) paxos_service[PAXOS_CONFIG].get();
   }
 
+  class KVMonitor *kvmon() {
+    return (class KVMonitor*) paxos_service[PAXOS_KV].get();
+  }
+
+  class NVMeofGwMon *nvmegwmon() {
+      return (class NVMeofGwMon*) paxos_service[PAXOS_NVMEGW].get();
+  }
+
+
   friend class Paxos;
   friend class OSDMonitor;
   friend class MDSMonitor;
   friend class MonmapMonitor;
   friend class LogMonitor;
-  friend class ConfigKeyService;
-
-  QuorumService *config_key_service;
+  friend class KVMonitor;
 
   // -- sessions --
   MonSessionMap session_map;
@@ -692,11 +776,10 @@ public:
   void handle_command(MonOpRequestRef op);
   void handle_route(MonOpRequestRef op);
 
-  void handle_mon_metadata(MonOpRequestRef op);
   int get_mon_metadata(int mon, ceph::Formatter *f, std::ostream& err);
   int print_nodes(ceph::Formatter *f, std::ostream& err);
 
-  // Accumulate metadata across calls to update_mon_metadata
+  // track metadata reported by win_election()
   std::map<int, Metadata> mon_metadata;
   std::map<int, Metadata> pending_metadata;
 
@@ -735,6 +818,8 @@ public:
     const health_check_map_t& previous,
     MonitorDBStore::TransactionRef t);
 
+  void update_pending_metadata();
+
 protected:
 
   class HealthCheckLogStatus {
@@ -754,7 +839,8 @@ protected:
 
 public:
 
-  void get_cluster_status(std::stringstream &ss, ceph::Formatter *f);
+  void get_cluster_status(std::stringstream &ss, ceph::Formatter *f,
+			  MonSession *session);
 
   void reply_command(MonOpRequestRef op, int rc, const std::string &rs, version_t version);
   void reply_command(MonOpRequestRef op, int rc, const std::string &rs, ceph::buffer::list& rdata, version_t version);
@@ -809,17 +895,21 @@ public:
   void waitlist_or_zap_client(MonOpRequestRef op);
 
   void send_mon_message(Message *m, int rank);
+  /** can_change_external_state if we can do things like
+   *  call elections as a result of the new map.
+   */
+  void notify_new_monmap(bool can_change_external_state=false, bool remove_rank_elector=true);
 
 public:
   struct C_Command : public C_MonOp {
-    Monitor *mon;
+    Monitor &mon;
     int rc;
     std::string rs;
     ceph::buffer::list rdata;
     version_t version;
-    C_Command(Monitor *_mm, MonOpRequestRef _op, int r, std::string s, version_t v) :
+    C_Command(Monitor &_mm, MonOpRequestRef _op, int r, std::string s, version_t v) :
       C_MonOp(_op), mon(_mm), rc(r), rs(s), version(v){}
-    C_Command(Monitor *_mm, MonOpRequestRef _op, int r, std::string s, ceph::buffer::list rd, version_t v) :
+    C_Command(Monitor &_mm, MonOpRequestRef _op, int r, std::string s, ceph::buffer::list rd, version_t v) :
       C_MonOp(_op), mon(_mm), rc(r), rs(s), rdata(rd), version(v){}
 
     void _finish(int r) override {
@@ -839,15 +929,21 @@ public:
             ss << "session dropped for command ";
           }
         }
-        ss << "cmd='" << m->cmd << "': finished";
+        cmdmap_t cmdmap;
+        std::ostringstream ds;
+        std::string prefix;
+        cmdmap_from_json(m->cmd, &cmdmap, ds);
+        cmd_getval(cmdmap, "prefix", prefix);
+        if (prefix != "config set" && prefix != "config-key set")
+          ss << "cmd='" << m->cmd << "': finished";
 
-        mon->audit_clog->info() << ss.str();
-	mon->reply_command(op, rc, rs, rdata, version);
+        mon.audit_clog->info() << ss.str();
+        mon.reply_command(op, rc, rs, rdata, version);
       }
       else if (r == -ECANCELED)
         return;
       else if (r == -EAGAIN)
-	mon->dispatch_op(op);
+        mon.dispatch_op(op);
       else
 	ceph_abort_msg("bad C_Command return value");
     }
@@ -883,7 +979,7 @@ public:
   MonCap mon_caps;
   bool get_authorizer(int dest_type, AuthAuthorizer **authorizer);
 public: // for AuthMonitor msgr1:
-  int ms_handle_authentication(Connection *con) override;
+  bool ms_handle_fast_authentication(Connection *con) override;
 private:
   void ms_handle_accept(Connection *con) override;
   bool ms_handle_reset(Connection *con) override;
@@ -932,10 +1028,12 @@ private:
   void extract_save_mon_key(KeyRing& keyring);
 
   void collect_metadata(Metadata *m);
-  void update_mon_metadata(int from, Metadata&& m);
   int load_metadata();
   void count_metadata(const std::string& field, ceph::Formatter *f);
   void count_metadata(const std::string& field, std::map<std::string,int> *out);
+  // get_all_versions() gathers version information from daemons for health check
+  void get_all_versions(std::map<std::string, std::list<std::string>> &versions);
+  void get_versions(std::map<std::string, std::list<std::string>> &versions);
 
   // features
   static CompatSet get_initial_supported_features();
@@ -956,7 +1054,7 @@ private:
   static int check_features(MonitorDBStore *store);
 
   // config observer
-  const char** get_tracked_conf_keys() const override;
+  std::vector<std::string> get_tracked_keys() const noexcept override;
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set<std::string> &changed) override;
 
@@ -1023,6 +1121,18 @@ public:
   }
 
   bool is_keyring_required();
+
+public:
+  ceph::coarse_mono_time get_starttime() const {
+    return starttime;
+  }
+  std::chrono::milliseconds get_uptime() const {
+    auto now = ceph::coarse_mono_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now-starttime);
+  }
+
+private:
+  ceph::coarse_mono_time const starttime = coarse_mono_clock::now();
 };
 
 #define CEPH_MON_FEATURE_INCOMPAT_BASE CompatSet::Feature (1, "initial feature set (~v.18)")
@@ -1038,6 +1148,10 @@ public:
 #define CEPH_MON_FEATURE_INCOMPAT_NAUTILUS CompatSet::Feature(11, "nautilus ondisk layout")
 #define CEPH_MON_FEATURE_INCOMPAT_OCTOPUS CompatSet::Feature(12, "octopus ondisk layout")
 #define CEPH_MON_FEATURE_INCOMPAT_PACIFIC CompatSet::Feature(13, "pacific ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_QUINCY CompatSet::Feature(14, "quincy ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_REEF CompatSet::Feature(15, "reef ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_SQUID CompatSet::Feature(16, "squid ondisk layout")
+#define CEPH_MON_FEATURE_INCOMPAT_TENTACLE CompatSet::Feature(17, "tentacle ondisk layout")
 // make sure you add your feature to Monitor::get_supported_features
 
 

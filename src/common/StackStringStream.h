@@ -18,10 +18,9 @@
 #include <boost/container/small_vector.hpp>
 
 #include <algorithm>
-#include <iostream>
 #include <memory>
 #include <ostream>
-#include <sstream>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -54,7 +53,7 @@ public:
   }
 
 protected:
-  std::streamsize xsputn(const char *s, std::streamsize n)
+  std::streamsize xsputn(const char *s, std::streamsize n) final
   {
     std::streamsize capacity = epptr() - pptr();
     std::streamsize left = n;
@@ -72,11 +71,13 @@ protected:
     return n;
   }
 
-  int overflow(int c)
+  int overflow(int c) final
   {
     if (traits_type::not_eof(c)) {
       char str = traits_type::to_char_type(c);
       vec.push_back(str);
+      setp(vec.data(), vec.data() + vec.size());
+      pbump(vec.size());
       return c;
     } else {
       return traits_type::eof();
@@ -107,6 +108,9 @@ public:
 
   std::string_view strv() const {
     return ssb.strv();
+  }
+  std::string str() const {
+    return std::string(ssb.strv());
   }
 
 private:

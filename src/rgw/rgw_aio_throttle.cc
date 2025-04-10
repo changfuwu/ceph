@@ -13,10 +13,7 @@
  *
  */
 
-#include "include/rados/librados.hpp"
-
 #include "rgw_aio_throttle.h"
-#include "rgw_rados.h"
 
 namespace rgw {
 
@@ -30,12 +27,12 @@ bool Throttle::waiter_ready() const
   }
 }
 
-AioResultList BlockingAioThrottle::get(const RGWSI_RADOS::Obj& obj,
+AioResultList BlockingAioThrottle::get(rgw_raw_obj obj,
                                        OpFunc&& f,
                                        uint64_t cost, uint64_t id)
 {
   auto p = std::make_unique<Pending>();
-  p->obj = obj;
+  p->obj = std::move(obj);
   p->id = id;
   p->cost = cost;
 
@@ -60,6 +57,7 @@ AioResultList BlockingAioThrottle::get(const RGWSI_RADOS::Obj& obj,
     std::move(f)(this, *static_cast<AioResult*>(p.get()));
     lock.lock();
   }
+  // coverity[leaked_storage:SUPPRESS]
   p.release();
   return std::move(completed);
 }
@@ -110,25 +108,23 @@ AioResultList BlockingAioThrottle::drain()
   return std::move(completed);
 }
 
-#ifdef HAVE_BOOST_CONTEXT
-
 template <typename CompletionToken>
 auto YieldingAioThrottle::async_wait(CompletionToken&& token)
 {
-  using boost::asio::async_completion;
   using Signature = void(boost::system::error_code);
-  async_completion<CompletionToken, Signature> init(token);
-  completion = Completion::create(context.get_executor(),
-                                  std::move(init.completion_handler));
-  return init.result.get();
+  return boost::asio::async_initiate<CompletionToken, Signature>(
+      [this] (auto handler) {
+        completion = Completion::create(yield.get_executor(),
+                                        std::move(handler));
+      }, token);
 }
 
-AioResultList YieldingAioThrottle::get(const RGWSI_RADOS::Obj& obj,
+AioResultList YieldingAioThrottle::get(rgw_raw_obj obj,
                                        OpFunc&& f,
                                        uint64_t cost, uint64_t id)
 {
   auto p = std::make_unique<Pending>();
-  p->obj = obj;
+  p->obj = std::move(obj);
   p->id = id;
   p->cost = cost;
 
@@ -151,6 +147,7 @@ AioResultList YieldingAioThrottle::get(const RGWSI_RADOS::Obj& obj,
     pending.push_back(*p);
     std::move(f)(this, *static_cast<AioResult*>(p.get()));
   }
+  // coverity[leaked_storage:SUPPRESS]
   p.release();
   return std::move(completed);
 }
@@ -202,6 +199,4 @@ AioResultList YieldingAioThrottle::drain()
   }
   return std::move(completed);
 }
-#endif // HAVE_BOOST_CONTEXT
-
 } // namespace rgw

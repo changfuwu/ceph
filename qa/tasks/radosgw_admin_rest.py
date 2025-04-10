@@ -28,13 +28,13 @@ def rgwadmin_rest(connection, cmd, params=None, headers=None, raw=False):
     perform a rest command
     """
     log.info('radosgw-admin-rest: %s %s' % (cmd, params))
-    put_cmds = ['create', 'link', 'add']
+    put_cmds = ['create', 'link', 'add', 'set']
     post_cmds = ['unlink', 'modify']
     delete_cmds = ['trim', 'rm', 'process']
-    get_cmds = ['check', 'info', 'show', 'list']
+    get_cmds = ['check', 'info', 'show', 'list', 'get', '']
 
     bucket_sub_resources = ['object', 'policy', 'index']
-    user_sub_resources = ['subuser', 'key', 'caps']
+    user_sub_resources = ['subuser', 'key', 'caps', 'quota']
     zone_sub_resources = ['pool', 'log', 'garbage']
 
     def get_cmd_method_and_handler(cmd):
@@ -67,6 +67,10 @@ def rgwadmin_rest(connection, cmd, params=None, headers=None, raw=False):
                 return 'user', cmd[0]
         elif cmd[0] == 'usage':
             return 'usage', ''
+        elif cmd[0] == 'info':
+            return 'info', ''
+        elif cmd[0] == 'ratelimit':
+            return 'ratelimit', ''
         elif cmd[0] == 'zone' or cmd[0] in zone_sub_resources:
             if cmd[0] == 'zone':
                 return 'zone', ''
@@ -113,6 +117,167 @@ def rgwadmin_rest(connection, cmd, params=None, headers=None, raw=False):
         log.info(' json result: %s' % result.json())
         return result.status_code, result.json()
 
+def test_cap_user_info_without_keys_get_user_info_privileged_users(ctx, client, op, op_args, uid, display_name, access_key, secret_key, user_type):
+    user_caps = 'user-info-without-keys=read'
+
+    (err, out) = rgwadmin(ctx, client, [
+            'user', 'create',
+            '--uid', uid,
+            '--display-name', display_name,
+            '--access-key', access_key,
+            '--secret', secret_key,
+            '--caps', user_caps,
+            user_type
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+    endpoint = ctx.rgw.role_endpoints.get(client)
+
+    privileged_user_conn = boto.s3.connection.S3Connection(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        is_secure=True if endpoint.cert else False,
+        port=endpoint.port,
+        host=endpoint.hostname,
+        calling_format=boto.s3.connection.OrdinaryCallingFormat(),
+        )
+
+    (ret, out) = rgwadmin_rest(privileged_user_conn, op, op_args)
+    # show that even though the cap is set, since the user is privileged the user can still see keys
+    assert len(out['keys']) == 1
+    assert out['swift_keys'] == []
+
+    (err, out) = rgwadmin(ctx, client, [
+            'user', 'rm',
+            '--uid', uid,
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+def test_cap_user_info_without_keys_get_user_info(ctx, client, admin_conn, admin_user, op, op_args):
+    true_admin_uid = 'a_user'
+    true_admin_display_name = 'True Admin User'
+    true_admin_access_key = 'true_admin_akey'
+    true_admin_secret_key = 'true_admin_skey'
+
+    system_uid = 'system_user'
+    system_display_name = 'System User'
+    system_access_key = 'system_akey'
+    system_secret_key = 'system_skey'
+
+    test_cap_user_info_without_keys_get_user_info_privileged_users(ctx, client, op, op_args, system_uid, system_display_name, system_access_key, system_secret_key, '--system')
+    test_cap_user_info_without_keys_get_user_info_privileged_users(ctx, client, op, op_args, true_admin_uid, true_admin_display_name, true_admin_access_key, true_admin_secret_key, '--admin')
+
+    # TESTCASE 'info-existing','user','info','existing user','returns no keys with user-info-without-keys cap set to read'
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'add',
+            '--uid', admin_user,
+            '--caps', 'user-info-without-keys=read'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+    (ret, out) = rgwadmin_rest(admin_conn, op, op_args)
+    assert 'keys' not in out
+    assert 'swift_keys' not in out
+
+    # TESTCASE 'info-existing','user','info','existing user','returns no keys with user-info-without-keys cap set to read'
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'add',
+            '--uid', admin_user,
+            '--caps', 'user-info-without-keys=*'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+    (ret, out) = rgwadmin_rest(admin_conn, op, op_args)
+    assert 'keys' not in out
+    assert 'swift_keys' not in out
+
+    # TESTCASE 'info-existing','user','info','existing user','returns keys with user-info-without-keys cap set to read but cap users is set to read'
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'add',
+            '--uid', admin_user,
+            '--caps', 'users=read, write'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+    (ret, out) = rgwadmin_rest(admin_conn, op, op_args)
+    assert 'keys' in out
+    assert 'swift_keys' in out
+
+    # TESTCASE 'info-existing','user','info','existing user','returns 403 with user-info-without-keys cap set to write'
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'rm',
+            '--uid', admin_user,
+            '--caps', 'users=read, write; user-info-without-keys=*'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'add',
+            '--uid', admin_user,
+            '--caps', 'user-info-without-keys=write'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+    (ret, out) = rgwadmin_rest(admin_conn, op, op_args)
+    assert ret == 403
+
+    # remove cap user-info-without-keys permenantly for future testing
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'rm',
+            '--uid', admin_user,
+            '--caps', 'user-info-without-keys=write'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+    # reset cap users permenantly for future testing
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'add',
+            '--uid', admin_user,
+            '--caps', 'users=read, write'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+def test_cap_user_info_without_keys(ctx, client, admin_conn, admin_user, user1):
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'rm',
+            '--uid', admin_user,
+            '--caps', 'users=read, write'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
+
+    op = ['user', 'info']
+    op_args = {'uid' : user1}
+    test_cap_user_info_without_keys_get_user_info(ctx, client, admin_conn, admin_user, op, op_args)
+
+    # add caps that were removed earlier in the function back in
+    (err, out) = rgwadmin(ctx, client, [
+            'caps', 'add',
+            '--uid', admin_user,
+            '--caps', 'users=read, write'
+            ])
+    logging.error(out)
+    logging.error(err)
+    assert not err
 
 def task(ctx, config):
     """
@@ -137,10 +302,11 @@ def task(ctx, config):
     admin_display_name = 'Ms. Admin User'
     admin_access_key = 'MH1WC2XQ1S8UISFDZC8W'
     admin_secret_key = 'dQyrTPA0s248YeN5bBv4ukvKU0kh54LWWywkrpoG'
-    admin_caps = 'users=read, write; usage=read, write; buckets=read, write; zone=read, write'
+    admin_caps = 'users=read, write; usage=read, write; buckets=read, write; zone=read, write; info=read;ratelimit=read, write'
 
     user1 = 'foo'
     user2 = 'fud'
+    ratelimit_user = 'ratelimit_user'
     subuser1 = 'foo:foo1'
     subuser2 = 'foo:foo2'
     display_name1 = 'Foo'
@@ -285,6 +451,9 @@ def task(ctx, config):
     assert out['temp_url_keys'] == []
     assert out['type'] == 'rgw'
     assert out['mfa_ids'] == []
+
+    # TESTCASES for cap user-info-without-keys
+    test_cap_user_info_without_keys(ctx, client, admin_conn, admin_user, user1)
 
     # TESTCASE 'suspend-ok','user','suspend','active user','succeeds'
     (ret, out) = rgwadmin_rest(admin_conn, ['user', 'modify'], {'uid' : user1, 'suspended' : True})
@@ -463,6 +632,11 @@ def task(ctx, config):
     assert out['id'] == bucket_id
     assert out['usage']['rgw.main']['num_objects'] == 1
     assert out['usage']['rgw.main']['size_kb'] > 0
+
+    # TESTCASE 'bucket-stats6', 'bucket', 'stats', 'non-existent bucket', 'fails, 'bucket not found error'
+    (ret, out) = rgwadmin_rest(admin_conn, ['bucket', 'info'], {'bucket' : 'doesnotexist'})
+    assert ret == 404
+    assert out['Code'] == 'NoSuchBucket'
 
     # reclaim it
     key.delete()
@@ -714,3 +888,92 @@ def task(ctx, config):
     (ret, out) = rgwadmin_rest(admin_conn, ['user', 'info'], {'uid' :  user1})
     assert ret == 404
 
+    # TESTCASE 'info' 'display info' 'succeeds'
+    (ret, out) = rgwadmin_rest(admin_conn, ['info', ''])
+    assert ret == 200
+    info = out['info']
+    backends = info['storage_backends']
+    name = backends[0]['name']
+    fsid = backends[0]['cluster_id']
+    # name is always "rados" at time of writing, but zipper would allow
+    # other backends, at some point
+    assert len(name) > 0
+    # fsid is a uuid, but I'm not going to try to parse it
+    assert len(fsid) > 0
+    
+    # TESTCASE 'ratelimit' 'user' 'info' 'succeeds'
+    (ret, out) = rgwadmin_rest(admin_conn,
+        ['user', 'create'],
+        {'uid' : ratelimit_user,
+         'display-name' :  display_name1,
+         'email' : email,
+         'access-key' : access_key,
+         'secret-key' : secret_key,
+         'max-buckets' : '1000'
+        })
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'ratelimit-scope' : 'user', 'uid' : ratelimit_user})
+    assert ret == 200
+
+    # TESTCASE 'ratelimit' 'user' 'info'  'not existing user' 'fails'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'ratelimit-scope' : 'user', 'uid' : ratelimit_user + 'string'})
+    assert ret == 404
+
+    # TESTCASE 'ratelimit' 'user' 'info'  'uid not specified' 'fails'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'ratelimit-scope' : 'user'})
+    assert ret == 400
+
+    # TESTCASE 'ratelimit' 'bucket' 'info' 'succeeds'
+    ratelimit_bucket = 'ratelimitbucket'
+    connection.create_bucket(ratelimit_bucket)
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'ratelimit-scope' : 'bucket', 'bucket' : ratelimit_bucket})
+    assert ret == 200
+
+    # TESTCASE 'ratelimit' 'bucket' 'info'  'not existing bucket' 'fails'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'ratelimit-scope' : 'bucket', 'bucket' : ratelimit_bucket + 'string'})
+    assert ret == 404
+
+    # TESTCASE 'ratelimit' 'bucket' 'info' 'bucket not specified' 'fails'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'ratelimit-scope' : 'bucket'})
+    assert ret == 400
+
+    # TESTCASE 'ratelimit' 'global' 'info' 'succeeds'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'global' : 'true'})
+    assert ret == 200
+
+    # TESTCASE 'ratelimit' 'user' 'modify'  'not existing user' 'fails'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'modify'], {'ratelimit-scope' : 'user', 'uid' : ratelimit_user + 'string', 'enabled' : 'true'})
+    assert ret == 404
+
+    # TESTCASE 'ratelimit' 'user' 'modify'  'uid not specified' 'fails'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'modify'], {'ratelimit-scope' : 'user'})
+    assert ret == 400
+    
+    # TESTCASE 'ratelimit' 'bucket' 'modify'  'not existing bucket' 'fails'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'modify'], {'ratelimit-scope' : 'bucket', 'bucket' : ratelimit_bucket + 'string', 'enabled' : 'true'})
+    assert ret == 404
+
+    # TESTCASE 'ratelimit' 'bucket' 'modify' 'bucket not specified' 'fails'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'modify'], {'ratelimit-scope' : 'bucket', 'enabled' : 'true'})
+    assert ret == 400
+
+    # TESTCASE 'ratelimit' 'user' 'modifiy' 'enabled' 'max-read-bytes = 2' 'succeeds'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'modify'], {'ratelimit-scope' : 'user', 'uid' : ratelimit_user, 'enabled' : 'true', 'max-read-bytes' : '2'})
+    assert ret == 200
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'ratelimit-scope' : 'user', 'uid' : ratelimit_user})
+    assert ret == 200
+    user_ratelimit = out['user_ratelimit']
+    assert user_ratelimit['enabled'] == True
+    assert user_ratelimit['max_read_bytes'] ==  2
+
+    # TESTCASE 'ratelimit' 'bucket' 'modifiy' 'enabled' 'max-write-bytes = 2' 'succeeds'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'modify'], {'ratelimit-scope' : 'bucket', 'bucket' : ratelimit_bucket, 'enabled' : 'true', 'max-write-bytes' : '2'})
+    assert ret == 200
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'info'], {'ratelimit-scope' : 'bucket', 'bucket' : ratelimit_bucket})
+    assert ret == 200
+    bucket_ratelimit = out['bucket_ratelimit']
+    assert bucket_ratelimit['enabled'] == True
+    assert bucket_ratelimit['max_write_bytes'] == 2
+
+    # TESTCASE 'ratelimit' 'global' 'modify' 'anonymous' 'enabled' 'succeeds'
+    (ret, out) = rgwadmin_rest(admin_conn, ['ratelimit', 'modify'], {'ratelimit-scope' : 'bucket', 'global': 'true', 'enabled' : 'true'})
+    assert ret == 200

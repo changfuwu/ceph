@@ -11,7 +11,7 @@ Synopsis
 
 | **mount.fuse.ceph** [-h] [-o OPTIONS [*OPTIONS* ...]]
                       device [*device* ...]
-                      mountpoint [*mountpoint* ...]
+                      mountpoint [*mount point* ...]
 
 Description
 ===========
@@ -61,7 +61,7 @@ Availability
 ============
 
 **mount.fuse.ceph** is part of Ceph, a massively scalable, open-source, distributed storage system. Please
-refer to the Ceph documentation at http://ceph.com/docs for more
+refer to the Ceph documentation at https://docs.ceph.com for more
 information.
 
 See also

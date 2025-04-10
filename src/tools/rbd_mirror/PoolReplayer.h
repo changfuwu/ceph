@@ -5,10 +5,10 @@
 #define CEPH_RBD_MIRROR_POOL_REPLAYER_H
 
 #include "common/Cond.h"
-#include "common/WorkQueue.h"
 #include "common/ceph_mutex.h"
 #include "include/rados/librados.hpp"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 
 #include "tools/rbd_mirror/LeaderWatcher.h"
 #include "tools/rbd_mirror/NamespaceReplayer.h"
@@ -55,7 +55,7 @@ public:
   PoolReplayer(const PoolReplayer&) = delete;
   PoolReplayer& operator=(const PoolReplayer&) = delete;
 
-  bool is_blacklisted() const;
+  bool is_blocklisted() const;
   bool is_leader() const;
   bool is_running() const;
 
@@ -107,7 +107,7 @@ private:
                  bool strip_cluster_overrides);
 
   void update_namespace_replayers();
-  int list_mirroring_namespaces(std::set<std::string> *namespaces);
+  int list_mirroring_namespaces(std::map<std::string, std::string> *namespaces);
 
   void namespace_replayer_acquire_leader(const std::string &name,
                                          Context *on_finish);
@@ -205,7 +205,7 @@ private:
   std::string m_site_name;
   bool m_stopping = false;
   bool m_manual_stop = false;
-  bool m_blacklisted = false;
+  bool m_blocklisted = false;
 
   RadosRef m_local_rados;
   RadosRef m_remote_rados;
@@ -219,7 +219,6 @@ private:
   std::unique_ptr<remote_pool_poller::Listener> m_remote_pool_poller_listener;
   std::unique_ptr<RemotePoolPoller<ImageCtxT>> m_remote_pool_poller;
 
-  std::unique_ptr<NamespaceReplayer<ImageCtxT>> m_default_namespace_replayer;
   std::map<std::string, NamespaceReplayer<ImageCtxT> *> m_namespace_replayers;
 
   std::string m_asok_hook_name;

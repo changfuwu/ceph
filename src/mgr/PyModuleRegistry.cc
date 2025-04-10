@@ -11,9 +11,14 @@
  * Foundation.  See file COPYING.
  */
 
+#include "PyModuleRegistry.h"
+
+#include <filesystem>
+#include <boost/scope_exit.hpp>
 
 #include "include/stringify.h"
 #include "common/errno.h"
+#include "common/split.h"
 
 #include "BaseMgrModule.h"
 #include "PyOSDMap.h"
@@ -24,13 +29,13 @@
 
 #include "ActivePyModules.h"
 
-#include "PyModuleRegistry.h"
-
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mgr
 
 #undef dout_prefix
 #define dout_prefix *_dout << "mgr[py] "
+
+namespace fs = std::filesystem;
 
 std::set<std::string> obsolete_modules = {
   "orchestrator_cli",
@@ -41,25 +46,51 @@ void PyModuleRegistry::init()
   std::lock_guard locker(lock);
 
   // Set up global python interpreter
-#if PY_MAJOR_VERSION >= 3
 #define WCHAR(s) L ## #s
-  Py_SetProgramName(const_cast<wchar_t*>(WCHAR(MGR_PYTHON_EXECUTABLE)));
-#undef WCHAR
-#else
-  Py_SetProgramName(const_cast<char*>(MGR_PYTHON_EXECUTABLE));
+  PyConfig py_config;
+  // do not enable isolated mode, otherwise we would not be able to have access
+  // to the site packages. since we cannot import any module before initializing
+  // the interpreter, we would not be able to use "site" module for retrieving
+  // the path to site packager. we import "site" module for retrieving
+  // sitepackages in Python < 3.8 though, this does not apply to the
+  // initialization with PyConfig.
+  PyConfig_InitPythonConfig(&py_config);
+  BOOST_SCOPE_EXIT_ALL(&py_config) {
+    PyConfig_Clear(&py_config);
+  };
+#if PY_VERSION_HEX >= 0x030b0000
+  py_config.safe_path = 0;
 #endif
+  py_config.parse_argv = 0;
+  py_config.configure_c_stdio = 0;
+  py_config.install_signal_handlers = 0;
+  py_config.pathconfig_warnings = 0;
+
+  PyStatus status;
+  status = PyConfig_SetString(&py_config, &py_config.program_name, WCHAR(MGR_PYTHON_EXECUTABLE));
+  ceph_assertf(!PyStatus_Exception(status), "PyConfig_SetString: %s:%s", status.func, status.err_msg);
+  // Some python modules do not cope with an unpopulated argv, so lets
+  // fake one.  This step also picks up site-packages into sys.path.
+  const wchar_t* argv[] = {L"ceph-mgr"};
+  status = PyConfig_SetArgv(&py_config, 1, (wchar_t *const *)argv);
+  ceph_assertf(!PyStatus_Exception(status), "PyConfig_SetArgv: %s:%s", status.func, status.err_msg);
   // Add more modules
   if (g_conf().get_val<bool>("daemonize")) {
     PyImport_AppendInittab("ceph_logger", PyModule::init_ceph_logger);
   }
   PyImport_AppendInittab("ceph_module", PyModule::init_ceph_module);
-  Py_InitializeEx(0);
-
-  // Let CPython know that we will be calling it back from other
-  // threads in future.
-  if (! PyEval_ThreadsInitialized()) {
-    PyEval_InitThreads();
+  // Configure sys.path to include mgr_module_path
+  auto pythonpath_env = g_conf().get_val<std::string>("mgr_module_path");
+  if (const char* pythonpath = getenv("PYTHONPATH")) {
+    pythonpath_env += ":";
+    pythonpath_env += pythonpath;
   }
+  status = PyConfig_SetBytesString(&py_config, &py_config.pythonpath_env, pythonpath_env.data());
+  ceph_assertf(!PyStatus_Exception(status), "PyConfig_SetBytesString: %s:%s", status.func, status.err_msg);
+  dout(10) << "set PYTHONPATH to " << std::quoted(pythonpath_env) << dendl;
+  status = Py_InitializeFromConfig(&py_config);
+  ceph_assertf(!PyStatus_Exception(status), "Py_InitializeFromConfig: %s:%s", status.func, status.err_msg);
+#undef WCHAR
 
   // Drop the GIL and remember the main thread state (current
   // thread state becomes NULL)
@@ -69,7 +100,7 @@ void PyModuleRegistry::init()
   std::list<std::string> failed_modules;
 
   const std::string module_path = g_conf().get_val<std::string>("mgr_module_path");
-  std::set<std::string> module_names = probe_modules(module_path);
+  auto module_names = probe_modules(module_path);
   // Load python code
   for (const auto& module_name : module_names) {
     dout(1) << "Loading python module '" << module_name << "'" << dendl;
@@ -120,7 +151,8 @@ bool PyModuleRegistry::handle_mgr_map(const MgrMap &mgr_map_)
     return false;
   } else {
     bool modules_changed = mgr_map_.modules != mgr_map.modules ||
-      mgr_map_.always_on_modules != mgr_map.always_on_modules;
+      mgr_map_.always_on_modules != mgr_map.always_on_modules ||
+      mgr_map_.force_disabled_modules != mgr_map.force_disabled_modules;
     mgr_map = mgr_map_;
 
     if (standby_modules != nullptr) {
@@ -177,8 +209,9 @@ void PyModuleRegistry::standby_start(MonClient &mc, Finisher &f)
 void PyModuleRegistry::active_start(
             DaemonStateIndex &ds, ClusterState &cs,
             const std::map<std::string, std::string> &kv_store,
+	    bool mon_provides_kv_sub,
             MonClient &mc, LogChannelRef clog_, LogChannelRef audit_clog_,
-            Objecter &objecter_, Client &client_, Finisher &f,
+            Objecter &objecter_, Finisher &f,
             DaemonServer &server)
 {
   std::lock_guard locker(lock);
@@ -196,95 +229,123 @@ void PyModuleRegistry::active_start(
     standby_modules.reset();
   }
 
-  active_modules.reset(new ActivePyModules(
-              module_config, kv_store, ds, cs, mc,
-              clog_, audit_clog_, objecter_, client_, f, server,
-              *this));
+  active_modules.reset(
+    new ActivePyModules(
+      module_config,
+      kv_store, mon_provides_kv_sub,
+      ds, cs, mc,
+      clog_, audit_clog_, objecter_, f, server,
+      *this));
 
   for (const auto &i : modules) {
     // Anything we're skipping because of !can_run will be flagged
     // to the user separately via get_health_checks
     if (!(i.second->is_enabled() && i.second->is_loaded())) {
+      dout(8) << __func__ << " Not starting module '" << i.first << "', it is "
+	      << "not enabled and loaded"  << dendl;
       continue;
     }
 
-    dout(4) << "Starting " << i.first << dendl;
+    // These are always-on modules but user force-disabled them.
+    if (mgr_map.force_disabled_modules.find(i.first) !=
+	mgr_map.force_disabled_modules.end()) {
+      dout(8) << __func__ << " Not starting module '" << i.first << "', it is "
+	      << "force-disabled" << dendl;
+      continue;
+    }
+
+    dout(4) << "Starting module '" << i.first << "'" << dendl;
     active_modules->start_one(i.second);
   }
 }
 
-void PyModuleRegistry::active_shutdown()
+std::string PyModuleRegistry::get_site_packages()
 {
-  std::lock_guard locker(lock);
+  std::stringstream site_packages;
 
-  if (active_modules != nullptr) {
-    active_modules->shutdown();
-    active_modules.reset();
-  }
-}
+  // CPython doesn't auto-add site-packages dirs to sys.path for us,
+  // but it does provide a module that we can ask for them.
+  auto site_module = PyImport_ImportModule("site");
+  ceph_assert(site_module);
 
-void PyModuleRegistry::shutdown()
-{
-  std::lock_guard locker(lock);
+  auto site_packages_fn = PyObject_GetAttrString(site_module, "getsitepackages");
+  if (site_packages_fn != nullptr) {
+    auto site_packages_list = PyObject_CallObject(site_packages_fn, nullptr);
+    ceph_assert(site_packages_list);
 
-  if (standby_modules != nullptr) {
-    standby_modules->shutdown();
-    standby_modules.reset();
-  }
-
-  // Ideally, now, we'd be able to do this for all modules:
-  //
-  //    Py_EndInterpreter(pMyThreadState);
-  //    PyThreadState_Swap(pMainThreadState);
-  //
-  // Unfortunately, if the module has any other *python* threads active
-  // at this point, Py_EndInterpreter() will abort with:
-  //
-  //    Fatal Python error: Py_EndInterpreter: not the last thread
-  //
-  // This can happen when using CherryPy in a module, becuase CherryPy
-  // runs an extra thread as a timeout monitor, which spends most of its
-  // life inside a time.sleep(60).  Unless you are very, very lucky with
-  // the timing calling this destructor, that thread will still be stuck
-  // in a sleep, and Py_EndInterpreter() will abort.
-  //
-  // This could of course also happen with a poorly written module which
-  // made no attempt to clean up any additional threads it created.
-  //
-  // The safest thing to do is just not call Py_EndInterpreter(), and
-  // let Py_Finalize() kill everything after all modules are shut down.
-
-  modules.clear();
-
-  PyEval_RestoreThread(pMainThreadState);
-  Py_Finalize();
-}
-
-std::set<std::string> PyModuleRegistry::probe_modules(const std::string &path) const
-{
-  DIR *dir = opendir(path.c_str());
-  if (!dir) {
-    return {};
-  }
-
-  std::set<std::string> modules_out;
-  struct dirent *entry = NULL;
-  while ((entry = readdir(dir)) != NULL) {
-    string n(entry->d_name);
-    string fn = path + "/" + n;
-    struct stat st;
-    int r = ::stat(fn.c_str(), &st);
-    if (r == 0 && S_ISDIR(st.st_mode)) {
-      string initfn = fn + "/module.py";
-      r = ::stat(initfn.c_str(), &st);
-      if (r == 0) {
-	modules_out.insert(n);
+    auto n = PyList_Size(site_packages_list);
+    for (Py_ssize_t i = 0; i < n; ++i) {
+      if (i != 0) {
+        site_packages << ":";
       }
+      site_packages << PyUnicode_AsUTF8(PyList_GetItem(site_packages_list, i));
+    }
+
+    Py_DECREF(site_packages_list);
+    Py_DECREF(site_packages_fn);
+  } else {
+    // Fall back to generating our own site-packages paths by imitating
+    // what the standard site.py does.  This is annoying but it lets us
+    // run inside virtualenvs :-/
+
+    auto site_packages_fn = PyObject_GetAttrString(site_module, "addsitepackages");
+    ceph_assert(site_packages_fn);
+
+    auto known_paths = PySet_New(nullptr);
+    auto pArgs = PyTuple_Pack(1, known_paths);
+    PyObject_CallObject(site_packages_fn, pArgs);
+    Py_DECREF(pArgs);
+    Py_DECREF(known_paths);
+    Py_DECREF(site_packages_fn);
+
+    auto sys_module = PyImport_ImportModule("sys");
+    ceph_assert(sys_module);
+    auto sys_path = PyObject_GetAttrString(sys_module, "path");
+    ceph_assert(sys_path);
+
+    dout(1) << "sys.path:" << dendl;
+    auto n = PyList_Size(sys_path);
+    bool first = true;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+      dout(1) << "  " << PyUnicode_AsUTF8(PyList_GetItem(sys_path, i)) << dendl;
+      if (first) {
+        first = false;
+      } else {
+        site_packages << ":";
+      }
+      site_packages << PyUnicode_AsUTF8(PyList_GetItem(sys_path, i));
+    }
+
+    Py_DECREF(sys_path);
+    Py_DECREF(sys_module);
+  }
+
+  Py_DECREF(site_module);
+
+  return site_packages.str();
+}
+
+std::vector<std::string> PyModuleRegistry::probe_modules(const std::string &path) const
+{
+  const auto opt = g_conf().get_val<std::string>("mgr_disabled_modules");
+  const auto disabled_modules = ceph::split(opt);
+
+  std::vector<std::string> modules;
+  for (const auto& entry: fs::directory_iterator(path)) {
+    if (!fs::is_directory(entry)) {
+      continue;
+    }
+    const std::string name = entry.path().filename();
+    if (std::count(disabled_modules.begin(), disabled_modules.end(), name)) {
+      dout(10) << "ignoring disabled module " << name << dendl;
+      continue;
+    }
+    auto module_path = entry.path() / "module.py";
+    if (fs::exists(module_path)) {
+      modules.push_back(name);
     }
   }
-  closedir(dir);
-
-  return modules_out;
+  return modules;
 }
 
 int PyModuleRegistry::handle_command(
@@ -375,6 +436,9 @@ void PyModuleRegistry::get_health_checks(health_check_map_t *checks)
       if (obsolete_modules.count(name)) {
 	continue;
       }
+      if (active_modules->is_pending(name)) {
+	continue;
+      }
       if (!active_modules->module_exists(name)) {
         if (failed_modules.find(name) == failed_modules.end() &&
             dependency_modules.find(name) == dependency_modules.end()) {
@@ -426,7 +490,10 @@ void PyModuleRegistry::handle_config(const std::string &k, const std::string &v)
   std::lock_guard l(module_config.lock);
 
   if (!v.empty()) {
-    dout(10) << "Loaded module_config entry " << k << ":" << v << dendl;
+    // removing value to hide sensitive data going into mgr logs
+    // leaving this for debugging purposes
+    // dout(10) << "Loaded module_config entry " << k << ":" << v << dendl;
+    dout(10) << "Loaded module_config entry " << k << ":" << dendl;
     module_config.config[k] = v;
   } else {
     module_config.config.erase(k);
@@ -440,83 +507,3 @@ void PyModuleRegistry::handle_config_notify()
     active_modules->config_notify();
   }
 }
-
-void PyModuleRegistry::upgrade_config(
-    MonClient *monc,
-    const std::map<std::string, std::string> &old_config)
-{
-  // Only bother doing anything if we didn't already have
-  // some new-style config.
-  if (module_config.config.empty()) {
-    dout(1) << "Upgrading module configuration for Mimic" << dendl;
-    // Upgrade luminous->mimic: migrate config-key configuration
-    // into main configuration store
-    for (auto &i : old_config) {
-      auto last_slash = i.first.rfind('/');
-      const std::string module_name = i.first.substr(4, i.first.substr(4).find('/'));
-      const std::string key = i.first.substr(last_slash + 1);
-
-      const auto &value = i.second;
-
-      // Heuristic to skip things that look more like stores
-      // than configs.
-      bool is_config = true;
-      for (const auto &c : value) {
-        if (c == '\n' || c == '\r' || c < 0x20) {
-          is_config = false;
-          break;
-        }
-      }
-
-      if (value.size() > 256) {
-        is_config = false;
-      }
-
-      if (!is_config) {
-        dout(1) << "Not migrating config module:key "
-                << module_name << " : " << key << dendl;
-        continue;
-      }
-
-      // Check that the named module exists
-      auto module_iter = modules.find(module_name);
-      if (module_iter == modules.end()) {
-        dout(1) << "KV store contains data for unknown module '"
-                << module_name << "'" << dendl;
-        continue;
-      }
-      PyModuleRef module = module_iter->second;
-
-      // Parse option name out of key
-      std::string option_name;
-      auto slash_loc = key.find("/");
-      if (slash_loc != std::string::npos) {
-        if (key.size() > slash_loc + 1) {
-          // Localized option
-          option_name = key.substr(slash_loc + 1);
-        } else {
-          // Trailing slash: garbage.
-          derr << "Invalid mgr store key: '" << key << "'" << dendl;
-          continue;
-        }
-      } else {
-        option_name = key;
-      }
-
-      // Consult module schema to see if this is really
-      // a configuration value
-      if (!option_name.empty() && module->is_option(option_name)) {
-        module_config.set_config(monc, module_name, key, i.second);
-        dout(4) << "Rewrote configuration module:key "
-                << module_name << ":" << key << dendl;
-      } else {
-        dout(4) << "Leaving store module:key " << module_name
-                << ":" << key << " in store, not config" << dendl;
-      }
-    }
-  } else {
-    dout(10) << "Module configuration contains "
-             << module_config.config.size() << " keys" << dendl;
-  }
-}
-

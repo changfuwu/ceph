@@ -1,6 +1,6 @@
 overrides:
   ceph:
-    log-whitelist:
+    log-ignorelist:
     - but it is still running
     - objects unfound and apparently lost
     conf:
@@ -21,6 +21,9 @@ overrides:
 tasks:
 - thrashosds:
     timeout: 1200
+    min_in: 2
     chance_pgnum_grow: 1
     chance_pgnum_shrink: 1
     chance_pgpnum_fix: 1
+    chance_bluestore_reshard: 1
+    bluestore_new_sharding: random

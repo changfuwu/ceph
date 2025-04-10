@@ -17,15 +17,20 @@
 #include <string.h>
 #include <string>
 
+#include "include/Context.h"
 #include "auth/Crypto.h"
 #include "client/Client.h"
+#include "client/Inode.h"
 #include "librados/RadosClient.h"
+#include "common/async/context_pool.h"
 #include "common/ceph_argparse.h"
 #include "common/common_init.h"
 #include "common/config.h"
 #include "common/version.h"
 #include "mon/MonClient.h"
 #include "include/str_list.h"
+#include "include/stringify.h"
+#include "include/object.h"
 #include "messages/MMonMap.h"
 #include "msg/Messenger.h"
 #include "include/ceph_assert.h"
@@ -35,11 +40,36 @@
 
 #define DEFAULT_UMASK 002
 
+using namespace std;
+
 static mode_t umask_cb(void *);
+namespace {
+// Set things up this way so we don't start up threads until mount and
+// kill them off when the last mount goes away, but are tolerant to
+// multiple mounts of overlapping duration.
+std::shared_ptr<ceph::async::io_context_pool> get_icp(CephContext* cct)
+{
+  static std::mutex m;
+  static std::weak_ptr<ceph::async::io_context_pool> icwp;
+
+
+  std::unique_lock l(m);
+
+  auto icp = icwp.lock();
+  if (icp)
+    return icp;
+
+  icp = std::make_shared<ceph::async::io_context_pool>();
+  icwp = icp;
+  icp->start(cct->_conf.get_val<std::uint64_t>("client_asio_thread_count"));
+  return icp;
+}
+}
 
 struct ceph_mount_info
 {
   mode_t umask = DEFAULT_UMASK;
+  std::shared_ptr<ceph::async::io_context_pool> icp;
 public:
   explicit ceph_mount_info(CephContext *cct_)
     : default_perms(),
@@ -78,13 +108,13 @@ public:
   {
     int ret;
 
-    if (cct->_conf->log_early &&
-	!cct->_log->is_started()) {
+    if (!cct->_log->is_started()) {
       cct->_log->start();
     }
+    icp = get_icp(cct);
 
     {
-      MonClient mc_bootstrap(cct);
+      MonClient mc_bootstrap(cct, icp->get_io_context());
       ret = mc_bootstrap.get_monmap_and_config();
       if (ret < 0)
 	return ret;
@@ -93,7 +123,7 @@ public:
     common_init_finish(cct);
 
     //monmap
-    monclient = new MonClient(cct);
+    monclient = new MonClient(cct, icp->get_io_context());
     ret = -CEPHFS_ERROR_MON_MAP_BUILD; //defined in libcephfs.h;
     if (monclient->build_initial_monmap() < 0)
       goto fail;
@@ -103,7 +133,7 @@ public:
 
     //at last the client
     ret = -CEPHFS_ERROR_NEW_CLIENT; //defined in libcephfs.h;
-    client = new StandaloneClient(messenger, monclient);
+    client = new StandaloneClient(messenger, monclient, icp->get_io_context());
     if (!client)
       goto fail;
 
@@ -116,7 +146,7 @@ public:
       goto fail;
 
     {
-      client_callback_args args = {};
+      ceph_client_callback_args args = {};
       args.handle = this;
       args.umask_cb = umask_cb;
       client->ll_register_callbacks(&args);
@@ -210,6 +240,7 @@ public:
       delete client;
       client = nullptr;
     }
+    icp.reset();
   }
 
   bool is_initialized() const
@@ -247,10 +278,8 @@ public:
 
   int conf_parse_argv(int argc, const char **argv)
   {
-    int ret;
-    vector<const char*> args;
-    argv_to_vec(argc, argv, args);
-    ret = cct->_conf.parse_argv(args);
+    auto args = argv_to_vec(argc, argv);
+    int ret = cct->_conf.parse_argv(args);
     if (ret)
 	return ret;
     cct->_conf.apply_changes(nullptr);
@@ -293,7 +322,15 @@ public:
 
   int chdir(const char *to, const UserPerm& perms)
   {
-    return client->chdir(to, cwd, perms);
+    int rc = client->chdir(to, perms);
+    if (rc == 0) {
+      /* Current API requires "cwd" to be refreshed after every chdir so that
+       * getcwd on an unlinked cwd will still return the old path. Note:
+       * Client::getcwd now returns an error but leaves the "cwd" string
+       * unmodified for this purpose. */
+      client->getcwd(cwd, perms);
+    }
+    return rc;
   }
 
   CephContext *get_ceph_context() const {
@@ -479,6 +516,64 @@ extern "C" int ceph_conf_get(struct ceph_mount_info *cmount, const char *option,
   return cmount->conf_get(option, buf, len);
 }
 
+extern "C" int ceph_set_mount_timeout(struct ceph_mount_info *cmount, uint32_t timeout) {
+  if (cmount->is_mounted()) {
+    return -EINVAL;
+  }
+
+  auto timeout_str = stringify(timeout);
+  return ceph_conf_set(cmount, "client_mount_timeout", timeout_str.c_str());
+}
+
+class CommandCContext : public Context {
+public:
+  CommandCContext(libcephfs_c_completion_t c, void* ud) : c(c), ud(ud) {}
+
+  void finish(int rc) {
+    c(rc, outbl.c_str(), outbl.length(), outs.c_str(), outs.size(), ud);
+  }
+
+  libcephfs_c_completion_t c;
+  void* ud;
+  bufferlist outbl;
+  std::string outs;
+};
+
+extern "C" int ceph_mds_command2(struct ceph_mount_info *cmount,
+    const char *mds_spec,
+    const char **cmd,
+    size_t cmdlen,
+    const char *inbuf, size_t inbuflen,
+    int one_shot,
+    libcephfs_c_completion_t c,
+    void* ud)
+{
+  bufferlist inbl;
+  std::vector<string> cmdv;
+
+  if (!cmount->is_initialized()) {
+    return -ENOTCONN;
+  }
+
+  // Construct inputs
+  for (size_t i = 0; i < cmdlen; ++i) {
+    cmdv.push_back(cmd[i]);
+  }
+  inbl.append(inbuf, inbuflen);
+
+  // Issue remote command
+  auto* ctx = new CommandCContext(c, ud);
+  int r = cmount->get_client()->mds_command(mds_spec, cmdv, inbl, &ctx->outbl, &ctx->outs, ctx, one_shot);
+
+  if (r != 0) {
+    delete ctx;
+    return r;
+  }
+
+  return 0;
+}
+
+
 extern "C" int ceph_mds_command(struct ceph_mount_info *cmount,
     const char *mds_spec,
     const char **cmd,
@@ -609,6 +704,14 @@ extern "C" int ceph_opendir(struct ceph_mount_info *cmount,
   return cmount->get_client()->opendir(name, (dir_result_t **)dirpp, cmount->default_perms);
 }
 
+extern "C" int ceph_fdopendir(struct ceph_mount_info *cmount, int dirfd,
+                              struct ceph_dir_result **dirpp)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->fdopendir(dirfd, (dir_result_t **)dirpp, cmount->default_perms);
+}
+
 extern "C" int ceph_closedir(struct ceph_mount_info *cmount, struct ceph_dir_result *dirp)
 {
   if (!cmount->is_mounted())
@@ -642,6 +745,223 @@ extern "C" int ceph_readdirplus_r(struct ceph_mount_info *cmount, struct ceph_di
   if (flags & ~CEPH_REQ_FLAG_MASK)
     return -EINVAL;
   return cmount->get_client()->readdirplus_r(reinterpret_cast<dir_result_t*>(dirp), de, stx, want, flags, out);
+}
+
+extern "C" int ceph_file_blockdiff_init(struct ceph_mount_info* cmount,
+					const char* root_path,
+					const char* rel_path,
+					const char* snap1,
+					const char* snap2,
+					struct ceph_file_blockdiff_info* out_info)
+{
+  if (!cmount->is_mounted()) {
+    return -ENOTCONN;
+  }
+  if (!out_info || !root_path || !rel_path ||
+      !snap1 || !*snap1 || !snap2 || !*snap2) {
+    return -EINVAL;
+  }
+
+  char snapdir[PATH_MAX];
+  cmount->conf_get("client_snapdir", snapdir, sizeof(snapdir) - 1);
+
+  char path1[PATH_MAX];
+  char path2[PATH_MAX];
+  // construct snapshot paths for the files
+  int n = snprintf(path1, PATH_MAX, "%s/%s/%s/%s",
+		   root_path, snapdir, snap1, rel_path);
+  if (n < 0 || n == PATH_MAX) {
+    errno = ENAMETOOLONG;
+    return -errno;
+  }
+  n = snprintf(path2, PATH_MAX, "%s/%s/%s/%s",
+	       root_path, snapdir, snap2, rel_path);
+  if (n < 0 || n == PATH_MAX) {
+    return -ENAMETOOLONG;
+  }
+
+  int r = cmount->get_client()->file_blockdiff_init_state(path1, path2,
+							  cmount->default_perms,
+							  (struct scan_state_t **)&(out_info->blockp));
+  if (r < 0) {
+    return r;
+  }
+
+  out_info->cmount = cmount;
+  return 0;
+}
+
+extern "C" int ceph_file_blockdiff(struct ceph_file_blockdiff_info* info,
+				   struct ceph_file_blockdiff_changedblocks* blocks)
+{
+  if (!info->cmount->is_mounted()) {
+    return -ENOTCONN;
+  }
+
+  std::vector<std::pair<uint64_t,uint64_t>> _blocks;
+  struct scan_state_t *state = reinterpret_cast<scan_state_t *>(info->blockp);
+
+  int r = info->cmount->get_client()->file_blockdiff(state, info->cmount->default_perms, &_blocks);
+  if (r < 0) {
+    return r;
+  }
+
+  blocks->b = NULL;
+  blocks->num_blocks = _blocks.size();
+  if (blocks->num_blocks) {
+    struct cblock *b = (struct cblock *)calloc(blocks->num_blocks, sizeof(struct cblock));
+    if (!b) {
+      return -ENOMEM;
+    }
+
+    struct cblock *_b = b;
+    for (auto &_block : _blocks) {
+      _b->offset = _block.first;
+      _b->len = _block.second;
+      ++_b;
+    }
+
+    blocks->b = b;
+  }
+
+  return r;
+}
+
+extern "C" void ceph_free_file_blockdiff_buffer(struct ceph_file_blockdiff_changedblocks* blocks)
+{
+  if (blocks->b) {
+    free(blocks->b);
+  }
+  blocks->num_blocks = 0;
+  blocks->b = NULL;
+}
+
+extern "C" int ceph_file_blockdiff_finish(struct ceph_file_blockdiff_info* info)
+{
+  if (!info->cmount->is_mounted()) {
+    return -ENOTCONN;
+  }
+
+  struct scan_state_t *state = reinterpret_cast<scan_state_t *>(info->blockp);
+  return info->cmount->get_client()->file_blockdiff_finish(state);
+}
+
+extern "C" int ceph_open_snapdiff(struct ceph_mount_info* cmount,
+                                  const char* root_path,
+                                  const char* rel_path,
+                                  const char* snap1,
+                                  const char* snap2,
+                                  struct ceph_snapdiff_info* out)
+{
+  if (!cmount->is_mounted()) {
+    /* we set errno to signal errors. */
+    errno = ENOTCONN;
+    return -errno;
+  }
+  if (!out || !root_path || !rel_path ||
+      !snap1 || !*snap1 || !snap2 || !*snap2) {
+    errno = EINVAL;
+    return -errno;
+  }
+  out->cmount = cmount;
+  out->dir1 = out->dir_aux = nullptr;
+
+  char full_path1[PATH_MAX];
+  char snapdir[PATH_MAX];
+  cmount->conf_get("client_snapdir", snapdir, sizeof(snapdir) - 1);
+  int n = snprintf(full_path1, PATH_MAX,
+    "%s/%s/%s/%s", root_path, snapdir, snap1, rel_path);
+  if (n < 0 || n == PATH_MAX) {
+    errno = ENAMETOOLONG;
+    return -errno;
+  }
+  char full_path2[PATH_MAX];
+  n = snprintf(full_path2, PATH_MAX,
+    "%s/%s/%s/%s", root_path, snapdir, snap2, rel_path);
+  if (n < 0 || n == PATH_MAX) {
+    errno = ENAMETOOLONG;
+    return -errno;
+  }
+
+  int r = ceph_opendir(cmount, full_path1, &(out->dir1));
+  if (r != 0) {
+    //it's OK to have one of the snap paths absent - attempting another one
+    r = ceph_opendir(cmount, full_path2, &(out->dir1));
+    if (r != 0) {
+      // both snaps are absent, giving up
+      errno = ENOENT;
+      return -errno;
+    }
+    std::swap(snap1, snap2); // will use snap1 to learn snap_other below
+  } else {
+    // trying to open second snapshot to learn snapid and
+    // get the entry loaded into the client cache if any.
+    r = ceph_opendir(cmount, full_path2, &(out->dir_aux));
+    //paranoic, rely on this value below
+    out->dir_aux = r == 0 ? out->dir_aux : nullptr;
+  }
+  if (!out->dir_aux) {
+    // now trying to learn the second snapshot's id by using snapshot's root
+    n = snprintf(full_path2, PATH_MAX,
+        "%s/%s/%s", root_path, snapdir, snap2);
+    ceph_assert(n > 0 && n < PATH_MAX); //we've already checked above
+                                        //that longer string fits.
+                                        // Hence unlikely to assert
+    r = ceph_opendir(cmount, full_path2, &(out->dir_aux));
+    if (r != 0) {
+      goto close_err;
+    }
+  }
+  return 0;
+
+close_err:
+  ceph_close_snapdiff(out);
+  return r;
+}
+
+extern "C" int ceph_readdir_snapdiff(struct ceph_snapdiff_info* snapdiff,
+                                     struct ceph_snapdiff_entry_t* out)
+{
+  if (!snapdiff->cmount->is_mounted()) {
+    /* also sets errno to signal errors. */
+    errno = ENOTCONN;
+    return -errno;
+  }
+  dir_result_t* d1 = reinterpret_cast<dir_result_t*>(snapdiff->dir1);
+  dir_result_t* d2 = reinterpret_cast<dir_result_t*>(snapdiff->dir_aux);
+  if (!d1 || !d2 || !d1->inode || !d2->inode) {
+    errno = EINVAL;
+    return -errno;
+  }
+  snapid_t snapid;
+  int r = snapdiff->cmount->get_client()->readdir_snapdiff(
+    d1,
+    d2->inode->snapid,
+    &(out->dir_entry),
+    &snapid);
+  if (r >= 0) {
+    // converting snapid_t to uint64_t to avoid snapid_t exposure
+    out->snapid = snapid;
+  }
+  return r;
+}
+
+extern "C" int ceph_close_snapdiff(struct ceph_snapdiff_info* snapdiff)
+{
+  if (!snapdiff->cmount || !snapdiff->cmount->is_mounted()) {
+    /* also sets errno to signal errors. */
+    errno = ENOTCONN;
+    return -errno;
+  }
+  if (snapdiff->dir_aux) {
+    ceph_closedir(snapdiff->cmount, snapdiff->dir_aux);
+  }
+  if (snapdiff->dir1) {
+    ceph_closedir(snapdiff->cmount, snapdiff->dir1);
+  }
+  snapdiff->cmount = nullptr;
+  snapdiff->dir1 = snapdiff->dir_aux = nullptr;
+  return 0;
 }
 
 extern "C" int ceph_getdents(struct ceph_mount_info *cmount, struct ceph_dir_result *dirp,
@@ -681,6 +1001,13 @@ extern "C" void ceph_seekdir(struct ceph_mount_info *cmount, struct ceph_dir_res
   cmount->get_client()->seekdir(reinterpret_cast<dir_result_t*>(dirp), offset);
 }
 
+extern "C" int ceph_may_delete(struct ceph_mount_info *cmount, const char *path)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->may_delete(path, cmount->default_perms);
+}
+
 extern "C" int ceph_link (struct ceph_mount_info *cmount, const char *existing,
 			  const char *newname)
 {
@@ -694,6 +1021,13 @@ extern "C" int ceph_unlink(struct ceph_mount_info *cmount, const char *path)
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->unlink(path, cmount->default_perms);
+}
+
+extern "C" int ceph_unlinkat(struct ceph_mount_info *cmount, int dirfd, const char *relpath, int flags)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->unlinkat(dirfd, relpath, flags, cmount->default_perms);
 }
 
 extern "C" int ceph_rename(struct ceph_mount_info *cmount, const char *from,
@@ -710,6 +1044,35 @@ extern "C" int ceph_mkdir(struct ceph_mount_info *cmount, const char *path, mode
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->mkdir(path, mode, cmount->default_perms);
+}
+
+extern "C" int ceph_mkdirat(struct ceph_mount_info *cmount, int dirfd, const char *relpath,
+                            mode_t mode)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->mkdirat(dirfd, relpath, mode, cmount->default_perms);
+}
+
+extern "C" int ceph_mksnap(struct ceph_mount_info *cmount, const char *path, const char *name,
+                           mode_t mode, struct snap_metadata *snap_metadata, size_t nr_snap_metadata)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  size_t i = 0;
+  std::map<std::string, std::string> metadata;
+  while (i < nr_snap_metadata) {
+    metadata.emplace(snap_metadata[i].key, snap_metadata[i].value);
+    ++i;
+  }
+  return cmount->get_client()->mksnap(path, name, cmount->default_perms, mode, metadata);
+}
+
+extern "C" int ceph_rmsnap(struct ceph_mount_info *cmount, const char *path, const char *name)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->rmsnap(path, name, cmount->default_perms, true);
 }
 
 extern "C" int ceph_mkdirs(struct ceph_mount_info *cmount, const char *path, mode_t mode)
@@ -735,12 +1098,28 @@ extern "C" int ceph_readlink(struct ceph_mount_info *cmount, const char *path,
   return cmount->get_client()->readlink(path, buf, size, cmount->default_perms);
 }
 
+extern "C" int ceph_readlinkat(struct ceph_mount_info *cmount, int dirfd,
+                               const char *relpath, char *buf, int64_t size)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->readlinkat(dirfd, relpath, buf, size, cmount->default_perms);
+}
+
 extern "C" int ceph_symlink(struct ceph_mount_info *cmount, const char *existing,
 			    const char *newname)
 {
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->symlink(existing, newname, cmount->default_perms);
+}
+
+extern "C" int ceph_symlinkat(struct ceph_mount_info *cmount, const char *existing, int dirfd,
+                            const char *newname)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->symlinkat(existing, dirfd, newname, cmount->default_perms);
 }
 
 extern "C" int ceph_fstatx(struct ceph_mount_info *cmount, int fd, struct ceph_statx *stx,
@@ -752,6 +1131,21 @@ extern "C" int ceph_fstatx(struct ceph_mount_info *cmount, int fd, struct ceph_s
     return -EINVAL;
   return cmount->get_client()->fstatx(fd, stx, cmount->default_perms,
                                       want, flags);
+}
+
+extern "C" int ceph_statxat(struct ceph_mount_info *cmount, int dirfd, const char *relpath,
+                            struct ceph_statx *stx, unsigned int want, unsigned int flags)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+#ifdef CEPH_AT_EMPTY_PATH
+  if (flags & ~CEPH_AT_EMPTY_PATH)
+#else
+  if (flags & ~CEPH_REQ_FLAG_MASK)
+#endif
+    return -EINVAL;
+  return cmount->get_client()->statxat(dirfd, relpath, stx, cmount->default_perms,
+                                       want, flags);
 }
 
 extern "C" int ceph_statx(struct ceph_mount_info *cmount, const char *path,
@@ -899,12 +1293,26 @@ extern "C" int ceph_chmod(struct ceph_mount_info *cmount, const char *path, mode
     return -ENOTCONN;
   return cmount->get_client()->chmod(path, mode, cmount->default_perms);
 }
+extern "C" int ceph_lchmod(struct ceph_mount_info *cmount, const char *path, mode_t mode)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->lchmod(path, mode, cmount->default_perms);
+}
 extern "C" int ceph_fchmod(struct ceph_mount_info *cmount, int fd, mode_t mode)
 {
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->fchmod(fd, mode, cmount->default_perms);
 }
+
+extern "C" int ceph_chmodat(struct ceph_mount_info *cmount, int dirfd, const char *relpath,
+                            mode_t mode, int flags) {
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->chmodat(dirfd, relpath, mode, flags, cmount->default_perms);
+}
+
 extern "C" int ceph_chown(struct ceph_mount_info *cmount, const char *path,
 			  int uid, int gid)
 {
@@ -927,6 +1335,12 @@ extern "C" int ceph_lchown(struct ceph_mount_info *cmount, const char *path,
   return cmount->get_client()->lchown(path, uid, gid, cmount->default_perms);
 }
 
+extern "C" int ceph_chownat(struct ceph_mount_info *cmount, int dirfd, const char *relpath,
+                            uid_t uid, gid_t gid, int flags) {
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->chownat(dirfd, relpath, uid, gid, flags, cmount->default_perms);
+}
 
 extern "C" int ceph_utime(struct ceph_mount_info *cmount, const char *path,
 			  struct utimbuf *buf)
@@ -976,6 +1390,13 @@ extern "C" int ceph_futimens(struct ceph_mount_info *cmount, int fd,
   return cmount->get_client()->futimens(fd, times, cmount->default_perms);
 }
 
+extern "C" int ceph_utimensat(struct ceph_mount_info *cmount, int dirfd, const char *relpath,
+                              struct timespec times[2], int flags) {
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->utimensat(dirfd, relpath, times, flags, cmount->default_perms);
+}
+
 extern "C" int ceph_flock(struct ceph_mount_info *cmount, int fd, int operation,
 			  uint64_t owner)
 {
@@ -1007,6 +1428,14 @@ extern "C" int ceph_open(struct ceph_mount_info *cmount, const char *path,
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->open(path, flags, cmount->default_perms, mode);
+}
+
+extern "C" int ceph_openat(struct ceph_mount_info *cmount, int dirfd, const char *relpath,
+                           int flags, mode_t mode)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->openat(dirfd, relpath, flags, cmount->default_perms, mode);
 }
 
 extern "C" int ceph_open_layout(struct ceph_mount_info *cmount, const char *path, int flags,
@@ -1582,6 +2011,14 @@ extern "C" struct Inode *ceph_ll_get_inode(class ceph_mount_info *cmount,
 }
 
 
+extern "C" int ceph_ll_lookup_vino(
+    struct ceph_mount_info *cmount,
+    vinodeno_t vino,
+    Inode **inode)
+{
+  return (cmount->get_client())->ll_lookup_vino(vino, cmount->default_perms, inode);
+}
+
 /**
  * Populates the client cache with the requested inode, and its
  * parent dentry.
@@ -1740,6 +2177,33 @@ extern "C" int64_t ceph_ll_writev(class ceph_mount_info *cmount,
 				  int iovcnt, int64_t off)
 {
   return (cmount->get_client()->ll_writev(fh, iov, iovcnt, off));
+}
+
+class LL_Onfinish : public Context {
+public:
+  LL_Onfinish(struct ceph_ll_io_info *io_info)
+    : io_info(io_info) {}
+  bufferlist bl;
+private:
+  struct ceph_ll_io_info *io_info;
+  void finish(int r) override {
+    if (!io_info->write && r > 0) {
+      copy_bufferlist_to_iovec(io_info->iov, io_info->iovcnt, &bl, r);
+    }
+    io_info->result = r;
+    io_info->callback(io_info);
+  }
+};
+
+extern "C" int64_t ceph_ll_nonblocking_readv_writev(class ceph_mount_info *cmount,
+						    struct ceph_ll_io_info *io_info)
+{
+  LL_Onfinish *onfinish = new LL_Onfinish(io_info);
+
+  return (cmount->get_client()->ll_preadv_pwritev(
+			io_info->fh, io_info->iov, io_info->iovcnt,
+			io_info->off, io_info->write, onfinish, &onfinish->bl,
+			io_info->fsync, io_info->syncdataonly));
 }
 
 extern "C" int ceph_ll_close(class ceph_mount_info *cmount, Fh* fh)
@@ -2006,4 +2470,73 @@ extern "C" int ceph_start_reclaim(class ceph_mount_info *cmount,
 extern "C" void ceph_finish_reclaim(class ceph_mount_info *cmount)
 {
   cmount->get_client()->finish_reclaim();
+}
+
+// This is deprecated, use ceph_ll_register_callbacks2 instead.
+extern "C" void ceph_ll_register_callbacks(class ceph_mount_info *cmount,
+					   struct ceph_client_callback_args *args)
+{
+  cmount->get_client()->ll_register_callbacks(args);
+}
+
+extern "C" int ceph_ll_register_callbacks2(class ceph_mount_info *cmount,
+					    struct ceph_client_callback_args *args)
+{
+  return cmount->get_client()->ll_register_callbacks2(args);
+}
+
+
+extern "C" int ceph_get_snap_info(struct ceph_mount_info *cmount,
+                                  const char *path, struct snap_info *snap_info) {
+  Client::SnapInfo info;
+  int r = cmount->get_client()->get_snap_info(path, cmount->default_perms, &info);
+  if (r < 0) {
+    return r;
+  }
+
+  size_t i = 0;
+  auto nr_metadata = info.metadata.size();
+
+  snap_info->id = info.id.val;
+  snap_info->nr_snap_metadata = nr_metadata;
+  if (nr_metadata) {
+    snap_info->snap_metadata = (struct snap_metadata *)calloc(nr_metadata, sizeof(struct snap_metadata));
+    if (!snap_info->snap_metadata) {
+      return -ENOMEM;
+    }
+
+    // fill with key, value pairs
+    for (auto &[key, value] : info.metadata) {
+      // len(key) + '\0' + len(value) + '\0'
+      char *kvp = (char *)malloc(key.size() + value.size() + 2);
+      if (!kvp) {
+        break;
+      }
+      char *_key = kvp;
+      char *_value = kvp + key.size() + 1;
+
+      memcpy(_key, key.c_str(), key.size());
+      _key[key.size()] = '\0';
+      memcpy(_value, value.c_str(), value.size());
+      _value[value.size()] = '\0';
+
+      snap_info->snap_metadata[i].key = _key;
+      snap_info->snap_metadata[i].value = _value;
+      ++i;
+    }
+  }
+
+  if (nr_metadata && i != nr_metadata) {
+    ceph_free_snap_info_buffer(snap_info);
+    return -ENOMEM;
+  }
+
+  return 0;
+}
+
+extern "C" void ceph_free_snap_info_buffer(struct snap_info *snap_info) {
+  for (size_t i = 0; i < snap_info->nr_snap_metadata; ++i) {
+    free((void *)snap_info->snap_metadata[i].key); // malloc'd memory is key+value composite
+  }
+  free(snap_info->snap_metadata);
 }

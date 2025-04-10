@@ -3,20 +3,16 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { ReactiveFormsModule } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { BsModalRef, BsModalService } from 'ngx-bootstrap/modal';
 import { ToastrModule } from 'ngx-toastr';
 import { of } from 'rxjs';
 
-import {
-  configureTestBed,
-  FormHelper,
-  i18nProviders
-} from '../../../../../testing/unit-test-helper';
-import { RbdMirroringService } from '../../../../shared/api/rbd-mirroring.service';
-import { NotificationService } from '../../../../shared/services/notification.service';
-import { SharedModule } from '../../../../shared/shared.module';
+import { RbdMirroringService } from '~/app/shared/api/rbd-mirroring.service';
+import { NotificationService } from '~/app/shared/services/notification.service';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed, FormHelper } from '~/testing/unit-test-helper';
 import { PoolEditPeerModalComponent } from './pool-edit-peer-modal.component';
 import { PoolEditPeerResponseModel } from './pool-edit-peer-response.model';
+import { InputModule, ModalModule } from 'carbon-components-angular';
 
 describe('PoolEditPeerModalComponent', () => {
   let component: PoolEditPeerModalComponent;
@@ -32,9 +28,11 @@ describe('PoolEditPeerModalComponent', () => {
       ReactiveFormsModule,
       RouterTestingModule,
       SharedModule,
-      ToastrModule.forRoot()
+      ToastrModule.forRoot(),
+      ModalModule,
+      InputModule
     ],
-    providers: [BsModalRef, BsModalService, i18nProviders]
+    providers: [{ provide: 'poolName', useValue: 'somePool' }]
   });
 
   beforeEach(() => {
@@ -43,10 +41,10 @@ describe('PoolEditPeerModalComponent', () => {
     component.mode = 'add';
     component.poolName = 'somePool';
 
-    notificationService = TestBed.get(NotificationService);
+    notificationService = TestBed.inject(NotificationService);
     spyOn(notificationService, 'show').and.stub();
 
-    rbdMirroringService = TestBed.get(RbdMirroringService);
+    rbdMirroringService = TestBed.inject(RbdMirroringService);
 
     formHelper = new FormHelper(component.editPeerForm);
   });
@@ -60,13 +58,13 @@ describe('PoolEditPeerModalComponent', () => {
       component.mode = 'add';
       component.peerUUID = undefined;
       spyOn(rbdMirroringService, 'refresh').and.stub();
-      spyOn(component.modalRef, 'hide').and.callThrough();
+      spyOn(component, 'closeModal').and.callThrough();
       fixture.detectChanges();
     });
 
     afterEach(() => {
       expect(rbdMirroringService.refresh).toHaveBeenCalledTimes(1);
-      expect(component.modalRef.hide).toHaveBeenCalledTimes(1);
+      expect(component.closeModal).toHaveBeenCalledTimes(1);
     });
 
     it('should call addPeer', () => {
@@ -103,14 +101,14 @@ describe('PoolEditPeerModalComponent', () => {
 
       spyOn(rbdMirroringService, 'getPeer').and.callFake(() => of(response));
       spyOn(rbdMirroringService, 'refresh').and.stub();
-      spyOn(component.modalRef, 'hide').and.callThrough();
+      spyOn(component, 'closeModal').and.callThrough();
       fixture.detectChanges();
     });
 
     afterEach(() => {
       expect(rbdMirroringService.getPeer).toHaveBeenCalledWith('somePool', 'somePeer');
       expect(rbdMirroringService.refresh).toHaveBeenCalledTimes(1);
-      expect(component.modalRef.hide).toHaveBeenCalledTimes(1);
+      expect(component.closeModal).toHaveBeenCalledTimes(1);
     });
 
     it('should call updatePeer', () => {

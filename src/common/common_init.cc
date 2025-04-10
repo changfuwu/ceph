@@ -12,20 +12,22 @@
  *
  */
 
-#include "include/compat.h"
 #include "common/common_init.h"
 #include "common/admin_socket.h"
 #include "common/ceph_argparse.h"
 #include "common/ceph_context.h"
 #include "common/config.h"
 #include "common/dout.h"
+#include "common/hostname.h"
 #include "common/strtol.h"
 #include "common/valgrind.h"
 #include "common/zipkin_trace.h"
+#include "include/compat.h"
+#include "log/Log.h"
 
 #define dout_subsys ceph_subsys_
 
-#ifndef WITH_SEASTAR
+#ifndef WITH_CRIMSON
 CephContext *common_preinit(const CephInitParameters &iparams,
 			    enum code_environment_t code_env, int flags)
 {
@@ -66,9 +68,12 @@ CephContext *common_preinit(const CephInitParameters &iparams,
 
   conf.set_val("no_config_file", iparams.no_config_file ? "true" : "false");
 
+  if (conf->host.empty()) {
+    conf.set_val("host", ceph_get_short_hostname());
+  }
   return cct;
 }
-#endif	// #ifndef WITH_SEASTAR
+#endif	// #ifndef WITH_CRIMSON
 
 void complain_about_parse_error(CephContext *cct,
 				const std::string& parse_error)
@@ -79,7 +84,7 @@ void complain_about_parse_error(CephContext *cct,
   lderr(cct) << parse_error << dendl;
 }
 
-#ifndef WITH_SEASTAR
+#ifndef WITH_CRIMSON
 
 /* Please be sure that this can safely be called multiple times by the
  * same application. */
@@ -126,4 +131,4 @@ void common_init_finish(CephContext *cct)
   }
 }
 
-#endif	// #ifndef WITH_SEASTAR
+#endif	// #ifndef WITH_CRIMSON

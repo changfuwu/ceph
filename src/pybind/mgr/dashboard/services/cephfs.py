@@ -1,24 +1,24 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import
-
-from contextlib import contextmanager
-import logging
 
 import datetime
+import logging
 import os
-import six
+from contextlib import contextmanager, suppress
+
 import cephfs
 
 from .. import mgr
-
 
 logger = logging.getLogger('cephfs')
 
 
 class CephFS(object):
     @classmethod
-    def list_filesystems(cls):
+    def list_filesystems(cls, all_info=False):
         fsmap = mgr.get("fs_map")
+
+        if all_info:
+            return fsmap['filesystems']
         return [{'id': fs['id'], 'name': fs['mdsmap']['fs_name']}
                 for fs in fsmap['filesystems']]
 
@@ -47,10 +47,6 @@ class CephFS(object):
         else:
             self.cfs.mount()
         logger.debug("mounted cephfs filesystem")
-
-    def __del__(self):
-        logger.debug("shutting down cephfs filesystem")
-        self.cfs.shutdown()
 
     @contextmanager
     def opendir(self, dirpath):
@@ -92,7 +88,7 @@ class CephFS(object):
             ]
         :rtype: list
         """
-        if isinstance(path, six.string_types):
+        if isinstance(path, str):
             path = path.encode()
         logger.debug("get_dir_list dirpath=%s depth=%s", path,
                      depth)
@@ -263,3 +259,54 @@ class CephFS(object):
         if max_files is not None:
             self.cfs.setxattr(path, 'ceph.quota.max_files',
                               str(max_files).encode(), 0)
+
+    def write_to_file(self, path, buf) -> None:
+        """
+        Write some data to the specified path.
+        :param path: The path of the file to write.
+        :type path: str.
+        :param buf: The str to write to the buf.
+        :type buf: str.
+        """
+        try:
+            fd = self.cfs.open(path, 'w', 644)
+            self.cfs.write(fd, buf.encode('utf-8'), 0)
+        except cephfs.Error as e:
+            logger.debug("EIO: %s", str(e))
+        finally:
+            if fd is not None:
+                self.cfs.close(fd)
+
+    def unlink(self, path) -> None:
+        """
+        Removes a file, link, or symbolic link.
+        :param path: The path of the file or link to unlink.
+        """
+        self.cfs.unlink(path)
+
+    def statfs(self, path) -> dict:
+        """
+        Get the statfs of the specified path by xattr.
+        :param path: The path of the directory/file.
+        :type path: str
+        :return: Returns a dictionary containing 'bytes',
+            'files' and 'subdirs'.
+        :rtype: dict
+        """
+        rbytes = 0
+        rfiles = 0
+        rsubdirs = 0
+        with suppress(cephfs.NoData):
+            rbytes = int(self.cfs.getxattr(path, 'ceph.dir.rbytes'))
+            rfiles = int(self.cfs.getxattr(path, 'ceph.dir.rfiles'))
+            rsubdirs = int(self.cfs.getxattr(path, 'ceph.dir.rsubdirs'))
+        return {'bytes': rbytes, 'files': rfiles, 'subdirs': rsubdirs}
+
+    def rename_path(self, src_path, dst_path) -> None:
+        """
+        Rename a file or directory.
+        :param src: the path to the existing file or directory.
+        :param dst: the new name of the file or directory.
+        """
+        logger.info("Renaming: from %s to %s", src_path, dst_path)
+        self.cfs.rename(src_path, dst_path)

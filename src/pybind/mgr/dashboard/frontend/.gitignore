@@ -24,6 +24,7 @@
 !.vscode/extensions.json
 
 # misc
+/.angular/cache
 /.sass-cache
 /connect.lock
 /coverage
@@ -31,12 +32,11 @@
 npm-debug.log
 testem.log
 /typings
-/src/unit-test-configuration.ts
 
 # e2e
-/e2e/*.js
-/e2e/*.map
-.protractor-fail-fast
+/cypress/screenshots
+/cypress/videos
+/cypress/reports
 
 # System Files
 .DS_Store

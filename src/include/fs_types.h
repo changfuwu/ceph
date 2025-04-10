@@ -3,8 +3,20 @@
 #ifndef CEPH_INCLUDE_FS_TYPES_H
 #define CEPH_INCLUDE_FS_TYPES_H
 
-#include "types.h"
+#include <cstdint>
+#include <iostream>
+
+#include "common/Formatter.h"
+#include "include/buffer.h"
+#include "include/ceph_fs.h" // for struct ceph_file_layout
+#include "include/hash.h" // for rjhash
+
 class JSONObj;
+
+// taken from linux kernel: include/uapi/linux/fcntl.h
+#define CEPHFS_AT_FDCWD        -100    /* Special value used to indicate
+                                          openat should use the current
+                                          working directory. */
 
 // --------------------------------------
 // ino
@@ -26,6 +38,13 @@ struct inodeno_t {
   void decode(ceph::buffer::list::const_iterator& p) {
     using ceph::decode;
     decode(val, p);
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("val", val);
+  }
+  static void generate_test_instances(std::list<inodeno_t*>& ls) {
+    ls.push_back(new inodeno_t(1));
+    ls.push_back(new inodeno_t(123456789));
   }
 } __attribute__ ((__may_alias__));
 WRITE_CLASS_ENCODER(inodeno_t)
@@ -99,6 +118,8 @@ struct file_layout_t {
       pool_id(-1) {
   }
 
+  bool operator==(const file_layout_t&) const = default;
+
   static file_layout_t get_default() {
     return file_layout_t(1<<22, 1, 1<<22);
   }
@@ -119,8 +140,6 @@ struct file_layout_t {
   static void generate_test_instances(std::list<file_layout_t*>& o);
 };
 WRITE_CLASS_ENCODER_FEATURES(file_layout_t)
-
-WRITE_EQ_OPERATORS_5(file_layout_t, stripe_unit, stripe_count, object_size, pool_id, pool_ns);
 
 std::ostream& operator<<(std::ostream& out, const file_layout_t &layout);
 

@@ -40,13 +40,12 @@ class BitmapFreelistManager : public FreelistManager {
 
   void _init_misc();
 
-  void _verify_range(KeyValueDB *kvdb,
-    uint64_t offset, uint64_t length, int val);
   void _xor(
     uint64_t offset, uint64_t length,
     KeyValueDB::Transaction txn);
 
-  int _init_from_label(const bluestore_bdev_label_t& label);
+  int _read_cfg(
+    std::function<int(const std::string&, std::string*)> cfg_reader);
 
   int _expand(uint64_t new_size, KeyValueDB* db);
 
@@ -66,9 +65,8 @@ public:
   int create(uint64_t size, uint64_t granularity,
 	     KeyValueDB::Transaction txn) override;
 
-  int init(const bluestore_bdev_label_t& l,
-    KeyValueDB *kvdb,
-    bool db_in_read_only) override;
+  int init(KeyValueDB *kvdb, bool db_in_read_only,
+    std::function<int(const std::string&, std::string*)> cfg_reader) override;
 
   void shutdown() override;
   void sync(KeyValueDB* kvdb) override;
@@ -95,7 +93,9 @@ public:
     return bytes_per_block;
   }
   void get_meta(uint64_t target_size,
-    std::vector<std::pair<string, string>>*) const override;
+    std::vector<std::pair<std::string, std::string>>*) const override;
+
+  bool validate(uint64_t min_alloc_size) const override;
 };
 
 #endif

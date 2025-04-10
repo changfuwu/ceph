@@ -19,9 +19,22 @@
 #include <limits>
 #include <cmath>
 #include <sstream>
+#include <strings.h>
 #include <string_view>
 
 using std::ostringstream;
+
+bool strict_strtob(const char* str, std::string *err)
+{
+  if (strcasecmp(str, "false") == 0) {
+    return false;
+  } else if (strcasecmp(str, "true") == 0) {
+    return true;
+  } else {
+    int b = strict_strtol(str, 10, err);
+    return (bool)!!b;
+  }
+}
 
 long long strict_strtoll(std::string_view str, int base, std::string *err)
 {
@@ -40,11 +53,6 @@ long long strict_strtoll(std::string_view str, int base, std::string *err)
   }
   *err = "";
   return ret;
-}
-
-long long strict_strtoll(const char *str, int base, std::string *err)
-{
-  return strict_strtoll(std::string_view(str), base, err);
 }
 
 int strict_strtol(std::string_view str, int base, std::string *err)
@@ -94,11 +102,6 @@ double strict_strtod(std::string_view str, std::string *err)
   return ret;
 }
 
-double strict_strtod(const char *str, std::string *err)
-{
-  return strict_strtod(std::string_view(str), err);
-}
-
 float strict_strtof(std::string_view str, std::string *err)
 {
   char *endptr;
@@ -127,11 +130,6 @@ float strict_strtof(std::string_view str, std::string *err)
   return ret;
 }
 
-float strict_strtof(const char *str, std::string *err)
-{
-  return strict_strtof(std::string_view(str), err);
-}
-
 template<typename T>
 T strict_iec_cast(std::string_view str, std::string *err)
 {
@@ -144,47 +142,58 @@ T strict_iec_cast(std::string_view str, std::string *err)
   std::string_view n = str;
   size_t u = str.find_first_not_of("0123456789-+");
   int m = 0;
-  // deal with unit prefix is there is one
+  // deal with unit prefix if there is one
   if (u != std::string_view::npos) {
     n = str.substr(0, u);
     unit = str.substr(u, str.length() - u);
+    // handling cases when prefixes entered as KB, MB, ...
+    // and KiB, MiB, ....
+    if (unit.length() > 1 && unit.back() == 'B') {
+      unit = unit.substr(0, unit.length() - 1);
+    }
     // we accept both old si prefixes as well as the proper iec prefixes
     // i.e. K, M, ... and Ki, Mi, ...
-    if (unit.back() == 'i') {
-      if (unit.front() == 'B') {
-        *err = "strict_iecstrtoll: illegal prefix \"Bi\"";
-        return 0;
-      }
-    }
     if (unit.length() > 2) {
       *err = "strict_iecstrtoll: illegal prefix (length > 2)";
       return 0;
     }
-    switch(unit.front()) {
-      case 'K':
-        m = 10;
-        break;
-      case 'M':
-        m = 20;
-        break;
-      case 'G':
-        m = 30;
-        break;
-      case 'T':
-        m = 40;
-        break;
-      case 'P':
-        m = 50;
-        break;
-      case 'E':
-        m = 60;
-        break;
-      case 'B':
-        break;
-      default:
-        *err = "strict_iecstrtoll: unit prefix not recognized";
-        return 0;
+    if ((unit.back() == 'i') || (unit.length() == 1)) {
+      if (unit.back() == 'i') {
+        if (unit.front() == 'B') {
+          *err = "strict_iecstrtoll: illegal prefix \"Bi\"";
+          return 0;
+        }
+      }
+      switch(unit.front()) {
+        case 'K':
+          m = 10;
+          break;
+        case 'M':
+          m = 20;
+          break;
+        case 'G':
+          m = 30;
+          break;
+        case 'T':
+          m = 40;
+          break;
+        case 'P':
+          m = 50;
+          break;
+        case 'E':
+          m = 60;
+          break;
+        case 'B':
+          break;
+        default:
+          *err = ("strict_iecstrtoll: unit prefix not recognized '" + std::string{unit} + "' ");
+          return 0;
+      }
     }
+    else {
+      *err = ("strict_iecstrtoll: illegal prefix '" + std::string{unit} + "' ");
+      return 0;
+    }   
   }
 
   long long ll = strict_strtoll(n, 10, err);
@@ -221,23 +230,6 @@ uint64_t strict_iecstrtoll(std::string_view str, std::string *err)
 {
   return strict_iec_cast<uint64_t>(str, err);
 }
-
-uint64_t strict_iecstrtoll(const char *str, std::string *err)
-{
-  return strict_iec_cast<uint64_t>(std::string_view(str), err);
-}
-
-template<typename T>
-T strict_iec_cast(const char *str, std::string *err)
-{
-  return strict_iec_cast<T>(std::string_view(str), err);
-}
-
-template int strict_iec_cast<int>(const char *str, std::string *err);
-template long strict_iec_cast<long>(const char *str, std::string *err);
-template long long strict_iec_cast<long long>(const char *str, std::string *err);
-template uint64_t strict_iec_cast<uint64_t>(const char *str, std::string *err);
-template uint32_t strict_iec_cast<uint32_t>(const char *str, std::string *err);
 
 template<typename T>
 T strict_si_cast(std::string_view str, std::string *err)
@@ -296,25 +288,3 @@ template long strict_si_cast<long>(std::string_view str, std::string *err);
 template long long strict_si_cast<long long>(std::string_view str, std::string *err);
 template uint64_t strict_si_cast<uint64_t>(std::string_view str, std::string *err);
 template uint32_t strict_si_cast<uint32_t>(std::string_view str, std::string *err);
-
-uint64_t strict_sistrtoll(std::string_view str, std::string *err)
-{
-  return strict_si_cast<uint64_t>(str, err);
-}
-
-uint64_t strict_sistrtoll(const char *str, std::string *err)
-{
-  return strict_si_cast<uint64_t>(str, err);
-}
-
-template<typename T>
-T strict_si_cast(const char *str, std::string *err)
-{
-  return strict_si_cast<T>(std::string_view(str), err);
-}
-
-template int strict_si_cast<int>(const char *str, std::string *err);
-template long strict_si_cast<long>(const char *str, std::string *err);
-template long long strict_si_cast<long long>(const char *str, std::string *err);
-template uint64_t strict_si_cast<uint64_t>(const char *str, std::string *err);
-template uint32_t strict_si_cast<uint32_t>(const char *str, std::string *err);

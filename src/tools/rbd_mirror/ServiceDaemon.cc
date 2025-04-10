@@ -208,11 +208,6 @@ template <typename I>
 void ServiceDaemon<I>::add_or_update_namespace_attribute(
     int64_t pool_id, const std::string& namespace_name, const std::string& key,
     const AttributeValue& value) {
-  if (namespace_name.empty()) {
-    add_or_update_attribute(pool_id, key, value);
-    return;
-  }
-
   dout(20) << "pool_id=" << pool_id << ", "
            << "namespace=" << namespace_name << ", "
            << "key=" << key << ", "
@@ -261,6 +256,8 @@ void ServiceDaemon<I>::schedule_update_status() {
     return;
   }
 
+  dout(20) << dendl;
+
   m_timer_ctx = new LambdaContext([this](int) {
       m_timer_ctx = nullptr;
       update_status();
@@ -270,7 +267,6 @@ void ServiceDaemon<I>::schedule_update_status() {
 
 template <typename I>
 void ServiceDaemon<I>::update_status() {
-  dout(20) << dendl;
   ceph_assert(ceph_mutex_is_locked(m_threads->timer_lock));
 
   ceph::JSONFormatter f;
@@ -294,18 +290,17 @@ void ServiceDaemon<I>::update_status() {
         boost::apply_visitor(attribute_dump_visitor, attribute.second);
       }
 
-      if (!pool_pair.second.ns_attributes.empty()) {
-        f.open_object_section("namespaces");
-        for (auto& [ns, attributes] : pool_pair.second.ns_attributes) {
-          f.open_object_section(ns.c_str());
-          for (auto& [key, value] : attributes) {
-            AttributeDumpVisitor attribute_dump_visitor(&f, key);
-            boost::apply_visitor(attribute_dump_visitor, value);
-          }
-          f.close_section(); // namespace
+      f.open_object_section("namespaces");
+      for (auto& [ns, attributes] : pool_pair.second.ns_attributes) {
+        f.open_object_section(ns.c_str());
+        for (auto& [key, value] : attributes) {
+          AttributeDumpVisitor attribute_dump_visitor(&f, key);
+          boost::apply_visitor(attribute_dump_visitor, value);
         }
-        f.close_section(); // namespaces
+        f.close_section(); // namespace
       }
+      f.close_section(); // namespaces
+
       f.close_section(); // pool
     }
     f.close_section(); // pools
@@ -313,6 +308,8 @@ void ServiceDaemon<I>::update_status() {
 
   std::stringstream ss;
   f.flush(ss);
+
+  dout(20) << ss.str() << dendl;
 
   int r = m_rados->service_daemon_update_status({{"json", ss.str()}});
   if (r < 0) {

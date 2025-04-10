@@ -3,55 +3,58 @@ import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
 
-import { NgBootstrapFormValidationModule } from 'ng-bootstrap-form-validation';
-import { AlertModule } from 'ngx-bootstrap/alert';
-import { BsDropdownModule } from 'ngx-bootstrap/dropdown';
-import { ModalModule } from 'ngx-bootstrap/modal';
-import { ProgressbarModule } from 'ngx-bootstrap/progressbar';
-import { TabsModule } from 'ngx-bootstrap/tabs';
-import { TooltipModule } from 'ngx-bootstrap/tooltip';
+import { NgbNavModule, NgbProgressbarModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
 
-import { SharedModule } from '../../../shared/shared.module';
-
+import { SharedModule } from '~/app/shared/shared.module';
 import { BootstrapCreateModalComponent } from './bootstrap-create-modal/bootstrap-create-modal.component';
 import { BootstrapImportModalComponent } from './bootstrap-import-modal/bootstrap-import-modal.component';
 import { DaemonListComponent } from './daemon-list/daemon-list.component';
-import { EditSiteNameModalComponent } from './edit-site-name-modal/edit-site-name-modal.component';
 import { ImageListComponent } from './image-list/image-list.component';
 import { MirrorHealthColorPipe } from './mirror-health-color.pipe';
 import { OverviewComponent } from './overview/overview.component';
 import { PoolEditModeModalComponent } from './pool-edit-mode-modal/pool-edit-mode-modal.component';
 import { PoolEditPeerModalComponent } from './pool-edit-peer-modal/pool-edit-peer-modal.component';
 import { PoolListComponent } from './pool-list/pool-list.component';
+import {
+  ButtonModule,
+  CheckboxModule,
+  GridModule,
+  IconModule,
+  IconService,
+  InputModule,
+  ModalModule,
+  SelectModule
+} from 'carbon-components-angular';
+
+// Icons
+import EditIcon from '@carbon/icons/es/edit/32';
+import CheckMarkIcon from '@carbon/icons/es/checkmark/32';
+import ResetIcon from '@carbon/icons/es/reset/32';
+import DocumentAddIcon from '@carbon/icons/es/document--add/16';
+import DocumentImportIcon from '@carbon/icons/es/document--import/16';
 
 @NgModule({
-  entryComponents: [
-    BootstrapCreateModalComponent,
-    BootstrapImportModalComponent,
-    EditSiteNameModalComponent,
-    OverviewComponent,
-    PoolEditModeModalComponent,
-    PoolEditPeerModalComponent
-  ],
   imports: [
     CommonModule,
-    TabsModule.forRoot(),
     SharedModule,
+    NgbNavModule,
     RouterModule,
     FormsModule,
     ReactiveFormsModule,
-    ProgressbarModule.forRoot(),
-    BsDropdownModule.forRoot(),
-    ModalModule.forRoot(),
-    AlertModule.forRoot(),
-    TooltipModule.forRoot(),
-    NgBootstrapFormValidationModule
+    NgbProgressbarModule,
+    NgbTooltipModule,
+    ModalModule,
+    InputModule,
+    CheckboxModule,
+    SelectModule,
+    GridModule,
+    ButtonModule,
+    IconModule
   ],
   declarations: [
     BootstrapCreateModalComponent,
     BootstrapImportModalComponent,
     DaemonListComponent,
-    EditSiteNameModalComponent,
     ImageListComponent,
     OverviewComponent,
     PoolEditModeModalComponent,
@@ -61,4 +64,14 @@ import { PoolListComponent } from './pool-list/pool-list.component';
   ],
   exports: [OverviewComponent]
 })
-export class MirroringModule {}
+export class MirroringModule {
+  constructor(private iconService: IconService) {
+    this.iconService.registerAll([
+      EditIcon,
+      CheckMarkIcon,
+      ResetIcon,
+      DocumentAddIcon,
+      DocumentImportIcon
+    ]);
+  }
+}

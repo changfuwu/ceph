@@ -28,10 +28,13 @@
 #include "os/kv.h"
 #include "include/compat.h"
 #include "include/stringify.h"
+#include "common/debug.h"
 #include "common/errno.h"
 #include "common/safe_io.h"
 #include "common/Formatter.h"
+#include "common/pretty_binary.h"
 
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_kstore
@@ -45,6 +48,7 @@
 
  */
 
+using std::less;
 using std::list;
 using std::make_pair;
 using std::map;
@@ -104,10 +108,10 @@ static void append_escaped(const string &in, string *out)
 {
   char hexbyte[8];
   for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
-    if (*i <= '#') {
+    if ((unsigned char)*i <= '#') {
       snprintf(hexbyte, sizeof(hexbyte), "#%02x", (uint8_t)*i);
       out->append(hexbyte);
-    } else if (*i >= '~') {
+    } else if ((unsigned char)*i >= '~') {
       snprintf(hexbyte, sizeof(hexbyte), "~%02x", (uint8_t)*i);
       out->append(hexbyte);
     } else {
@@ -133,57 +137,6 @@ static int decode_escaped(const char *p, string *out)
     }
   }
   return p - orig_p;
-}
-
-// some things we encode in binary (as le32 or le64); print the
-// resulting key strings nicely
-static string pretty_binary_string(const string& in)
-{
-  char buf[10];
-  string out;
-  out.reserve(in.length() * 3);
-  enum { NONE, HEX, STRING } mode = NONE;
-  unsigned from = 0, i;
-  for (i=0; i < in.length(); ++i) {
-    if ((in[i] < 32 || (unsigned char)in[i] > 126) ||
-	(mode == HEX && in.length() - i >= 4 &&
-	 ((in[i] < 32 || (unsigned char)in[i] > 126) ||
-	  (in[i+1] < 32 || (unsigned char)in[i+1] > 126) ||
-	  (in[i+2] < 32 || (unsigned char)in[i+2] > 126) ||
-	  (in[i+3] < 32 || (unsigned char)in[i+3] > 126)))) {
-      if (mode == STRING) {
-	out.append(in.substr(from, i - from));
-	out.push_back('\'');
-      }
-      if (mode != HEX) {
-	out.append("0x");
-	mode = HEX;
-      }
-      if (in.length() - i >= 4) {
-	// print a whole u32 at once
-	snprintf(buf, sizeof(buf), "%08x",
-		 (uint32_t)(((unsigned char)in[i] << 24) |
-			    ((unsigned char)in[i+1] << 16) |
-			    ((unsigned char)in[i+2] << 8) |
-			    ((unsigned char)in[i+3] << 0)));
-	i += 3;
-      } else {
-	snprintf(buf, sizeof(buf), "%02x", (int)(unsigned char)in[i]);
-      }
-      out.append(buf);
-    } else {
-      if (mode != STRING) {
-	out.push_back('\'');
-	mode = STRING;
-	from = i;
-      }
-    }
-  }
-  if (mode == STRING) {
-    out.append(in.substr(from, i - from));
-    out.push_back('\'');
-  }
-  return out;
 }
 
 static void _key_encode_shard(shard_id_t shard, string *key)
@@ -459,7 +412,7 @@ KStore::OnodeRef KStore::OnodeHashLRU::lookup(const ghobject_t& oid)
 {
   std::lock_guard<std::mutex> l(lock);
   dout(30) << __func__ << dendl;
-  ceph::unordered_map<ghobject_t,OnodeRef>::iterator p = onode_map.find(oid);
+  auto p = onode_map.find(oid);
   if (p == onode_map.end()) {
     dout(30) << __func__ << " " << oid << " miss" << dendl;
     return OnodeRef();
@@ -482,9 +435,8 @@ void KStore::OnodeHashLRU::rename(const ghobject_t& old_oid,
 {
   std::lock_guard<std::mutex> l(lock);
   dout(30) << __func__ << " " << old_oid << " -> " << new_oid << dendl;
-  ceph::unordered_map<ghobject_t,OnodeRef>::iterator po, pn;
-  po = onode_map.find(old_oid);
-  pn = onode_map.find(new_oid);
+  auto po = onode_map.find(old_oid);
+  auto pn = onode_map.find(new_oid);
 
   ceph_assert(po != onode_map.end());
   if (pn != onode_map.end()) {
@@ -516,14 +468,14 @@ bool KStore::OnodeHashLRU::get_next(
     if (lru.empty()) {
       return false;
     }
-    ceph::unordered_map<ghobject_t,OnodeRef>::iterator p = onode_map.begin();
+    auto p = onode_map.begin();
     ceph_assert(p != onode_map.end());
     next->first = p->first;
     next->second = p->second;
     return true;
   }
 
-  ceph::unordered_map<ghobject_t,OnodeRef>::iterator p = onode_map.find(after);
+  auto p = onode_map.find(after);
   ceph_assert(p != onode_map.end()); // for now
   lru_list_t::iterator pi = lru.iterator_to(*p->second);
   ++pi;
@@ -1140,7 +1092,7 @@ int KStore::pool_statfs(uint64_t pool_id, struct store_statfs_t *buf,
 KStore::CollectionRef KStore::_get_collection(coll_t cid)
 {
   std::shared_lock l{coll_lock};
-  ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
+  auto cp = coll_map.find(cid);
   if (cp == coll_map.end())
     return CollectionRef();
   return cp->second;
@@ -1413,7 +1365,7 @@ int KStore::getattr(
 int KStore::getattrs(
   CollectionHandle& ch,
   const ghobject_t& oid,
-  map<string,bufferptr>& aset)
+  map<string,bufferptr,less<>>& aset)
 {
   dout(15) << __func__ << " " << ch->cid << " " << oid << dendl;
   Collection *c = static_cast<Collection*>(ch.get());
@@ -1436,9 +1388,7 @@ int KStore::getattrs(
 int KStore::list_collections(vector<coll_t>& ls)
 {
   std::shared_lock l{coll_lock};
-  for (ceph::unordered_map<coll_t, CollectionRef>::iterator p = coll_map.begin();
-       p != coll_map.end();
-       ++p)
+  for (auto p = coll_map.begin(); p != coll_map.end(); ++p)
     ls.push_back(p->first);
   return 0;
 }
@@ -1546,14 +1496,16 @@ int KStore::_collection_list(
   if (end.hobj.is_max()) {
     pend = temp ? temp_end_key : end_key;
   } else {
-    get_object_key(cct, end, &end_key);
     if (end.hobj.is_temp()) {
       if (temp)
-	pend = end_key;
+        get_object_key(cct, end, &pend);
       else
 	goto out;
     } else {
-      pend = temp ? temp_end_key : end_key;
+      if (temp)
+        pend = temp_end_key;
+      else
+        get_object_key(cct, end, &pend);
     }
   }
   dout(20) << __func__ << " pend " << pretty_binary_string(pend) << dendl;
@@ -1566,14 +1518,27 @@ int KStore::_collection_list(
 		 << " > " << end << dendl;
       if (temp) {
 	if (end.hobj.is_temp()) {
+          if (it->valid() && it->key() < temp_end_key) {
+            int r = get_key_object(it->key(), pnext);
+            ceph_assert(r == 0);
+            set_next = true;
+          }
 	  break;
 	}
 	dout(30) << __func__ << " switch to non-temp namespace" << dendl;
 	temp = false;
 	it->upper_bound(start_key);
-	pend = end_key;
+        if (end.hobj.is_max())
+          pend = end_key;
+        else
+          get_object_key(cct, end, &pend);
 	dout(30) << __func__ << " pend " << pretty_binary_string(pend) << dendl;
 	continue;
+      }
+      if (it->valid() && it->key() < end_key) {
+        int r = get_key_object(it->key(), pnext);
+        ceph_assert(r == 0);
+        set_next = true;
       }
       break;
     }
@@ -1598,93 +1563,6 @@ out:
 }
 
 // omap reads
-
-KStore::OmapIteratorImpl::OmapIteratorImpl(
-  CollectionRef c, OnodeRef o, KeyValueDB::Iterator it)
-  : c(c), o(o), it(it)
-{
-  std::shared_lock l{c->lock};
-  if (o->onode.omap_head) {
-    get_omap_key(o->onode.omap_head, string(), &head);
-    get_omap_tail(o->onode.omap_head, &tail);
-    it->lower_bound(head);
-  }
-}
-
-int KStore::OmapIteratorImpl::seek_to_first()
-{
-  std::shared_lock l{c->lock};
-  if (o->onode.omap_head) {
-    it->lower_bound(head);
-  } else {
-    it = KeyValueDB::Iterator();
-  }
-  return 0;
-}
-
-int KStore::OmapIteratorImpl::upper_bound(const string& after)
-{
-  std::shared_lock l{c->lock};
-  if (o->onode.omap_head) {
-    string key;
-    get_omap_key(o->onode.omap_head, after, &key);
-    it->upper_bound(key);
-  } else {
-    it = KeyValueDB::Iterator();
-  }
-  return 0;
-}
-
-int KStore::OmapIteratorImpl::lower_bound(const string& to)
-{
-  std::shared_lock l{c->lock};
-  if (o->onode.omap_head) {
-    string key;
-    get_omap_key(o->onode.omap_head, to, &key);
-    it->lower_bound(key);
-  } else {
-    it = KeyValueDB::Iterator();
-  }
-  return 0;
-}
-
-bool KStore::OmapIteratorImpl::valid()
-{
-  std::shared_lock l{c->lock};
-  if (o->onode.omap_head && it->valid() && it->raw_key().second <= tail) {
-    return true;
-  } else {
-    return false;
-  }
-}
-
-int KStore::OmapIteratorImpl::next()
-{
-  std::shared_lock l{c->lock};
-  if (o->onode.omap_head) {
-    it->next();
-    return 0;
-  } else {
-    return -1;
-  }
-}
-
-string KStore::OmapIteratorImpl::key()
-{
-  std::shared_lock l{c->lock};
-  ceph_assert(it->valid());
-  string db_key = it->raw_key().second;
-  string user_key;
-  decode_omap_key(db_key, &user_key);
-  return user_key;
-}
-
-bufferlist KStore::OmapIteratorImpl::value()
-{
-  std::shared_lock l{c->lock};
-  ceph_assert(it->valid());
-  return it->value();
-}
 
 int KStore::omap_get(
   CollectionHandle& ch,                ///< [in] Collection containing oid
@@ -1881,24 +1759,71 @@ int KStore::omap_check_keys(
   return r;
 }
 
-ObjectMap::ObjectMapIterator KStore::get_omap_iterator(
-  CollectionHandle& ch,              ///< [in] collection
-  const ghobject_t &oid  ///< [in] object
-  )
+int KStore::omap_iterate(
+  CollectionHandle &ch,   ///< [in] collection
+  const ghobject_t &oid, ///< [in] object
+  ObjectStore::omap_iter_seek_t start_from, ///< [in] where the iterator should point to at the beginning
+  std::function<omap_iter_ret_t(std::string_view, std::string_view)> f)
 {
-
   dout(10) << __func__ << " " << ch->cid << " " << oid << dendl;
   Collection *c = static_cast<Collection*>(ch.get());
-  std::shared_lock l{c->lock};
-  OnodeRef o = c->get_onode(oid, false);
-  if (!o || !o->exists) {
-    dout(10) << __func__ << " " << oid << "doesn't exist" <<dendl;
-    return ObjectMap::ObjectMapIterator();
+  bool more = false;
+  {
+    std::shared_lock l{c->lock};
+
+    OnodeRef o = c->get_onode(oid, false);
+    if (!o || !o->exists) {
+      dout(10) << __func__ << " " << oid << "doesn't exist" <<dendl;
+      return -ENOENT;
+    }
+    o->flush();
+    dout(10) << __func__ << " header = " << o->onode.omap_head <<dendl;
+
+    KeyValueDB::Iterator it = db->get_iterator(PREFIX_OMAP);
+    std::string tail;
+    std::string seek_key;
+    if (o->onode.omap_head) {
+      return 0; // nothing to do
+    }
+
+    // acquire data depedencies for seek & iterate
+    get_omap_key(o->onode.omap_head, start_from.seek_position, &seek_key);
+    get_omap_tail(o->onode.omap_head, &tail);
+
+    // acquire the iterator
+    {
+      it = db->get_iterator(PREFIX_OMAP);
+    }
+
+    // seek the iterator
+    {
+      if (start_from.seek_type == omap_iter_seek_t::LOWER_BOUND) {
+        it->lower_bound(seek_key);
+      } else {
+        it->upper_bound(seek_key);
+      }
+    }
+
+    // iterate!
+    while (it->valid()) {
+      std::string user_key;
+      if (const auto& db_key = it->raw_key().second; db_key >= tail) {
+        break;
+      } else {
+        decode_omap_key(db_key, &user_key);
+      }
+      omap_iter_ret_t ret = f(user_key, it->value_as_sv());
+      if (ret == omap_iter_ret_t::STOP) {
+        more = true;
+        break;
+      } else if (ret == omap_iter_ret_t::NEXT) {
+        it->next();
+      } else {
+        ceph_abort();
+      }
+    }
   }
-  o->flush();
-  dout(10) << __func__ << " header = " << o->onode.omap_head <<dendl;
-  KeyValueDB::Iterator it = db->get_iterator(PREFIX_OMAP);
-  return ObjectMap::ObjectMapIterator(new OmapIteratorImpl(c, o, it));
+  return more;
 }
 
 
@@ -2277,7 +2202,7 @@ void KStore::_txc_add_transaction(TransContext *txc, Transaction *t)
 
     case Transaction::OP_COLL_HINT:
       {
-        uint32_t type = op->hint_type;
+        uint32_t type = op->hint;
         bufferlist hint;
         i.decode_bl(hint);
         auto hiter = hint.cbegin();
@@ -2320,7 +2245,13 @@ void KStore::_txc_add_transaction(TransContext *txc, Transaction *t)
       f.close_section();
       f.flush(*_dout);
       *_dout << dendl;
-      ceph_abort_msg("unexpected error");
+      if (!g_conf().get_val<bool>("objectstore_debug_throw_on_failed_txc")) {
+	ceph_abort_msg("unexpected error");
+      } else {
+	txc->osr->undo_queue(txc);
+	delete txc;
+	throw r;
+      }
     }
 
     // object operations
@@ -2516,7 +2447,7 @@ void KStore::_txc_add_transaction(TransContext *txc, Transaction *t)
       {
         uint64_t expected_object_size = op->expected_object_size;
         uint64_t expected_write_size = op->expected_write_size;
-	uint32_t flags = op->alloc_hint_flags;
+	uint32_t flags = op->hint;
 	r = _setallochint(txc, c, o,
 			  expected_object_size,
 			  expected_write_size,
@@ -2569,7 +2500,13 @@ void KStore::_txc_add_transaction(TransContext *txc, Transaction *t)
 	f.close_section();
 	f.flush(*_dout);
 	*_dout << dendl;
-	ceph_abort_msg("unexpected error");
+	if (!g_conf().get_val<bool>("objectstore_debug_throw_on_failed_txc")) {
+	  ceph_abort_msg("unexpected error");
+	} else {
+	  txc->osr->undo_queue(txc);
+	  delete txc;
+	  throw r;
+	}
       }
     }
   }

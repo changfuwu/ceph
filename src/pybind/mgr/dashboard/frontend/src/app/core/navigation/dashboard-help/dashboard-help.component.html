@@ -1,40 +1,37 @@
-<form #docsForm
-      action="/docs"
-      target="_blank"
-      method="post">
-  <input type="hidden"
-         name="token" />
-</form>
+<cds-overflow-menu [customTrigger]="customTrigger"
+                   [flip]="true">
+  <li>
+    <a [ngClass]="{'cds--overflow-menu-options__btn': true, 'disabled': !docsUrl}"
+       href="{{ docsUrl }}"
+       target="_blank"
+       i18n>Documentation
+      <svg cdsIcon="launch"
+           class="ms-2"
+           size="16"></svg>
+    </a>
+  </li>
+  <li>
+    <a routerLink="/api-docs"
+       target="_blank"
+       class="cds--overflow-menu-options__btn"
+       i18n>API
+      <svg cdsIcon="launch"
+           class="ms-2"
+           size="16"></svg>
+    </a>
+  </li>
+  <cds-overflow-menu-option (click)="openAboutModal()"
+                            i18n>About</cds-overflow-menu-option>
+  <cds-overflow-menu-option (click)="openFeedbackModal()"
+                            i18n>Report an issue...</cds-overflow-menu-option>
+</cds-overflow-menu>
 
-<div class="btn-group"
-     dropdown>
-  <a dropdownToggle
-     class="dropdown-toggle"
-     i18n-title
-     title="Help">
-    <i [ngClass]="[icons.questionCircle]"></i>
-    <span i18n
-          class="d-md-none">Help</span>
-  </a>
-  <ul *dropdownMenu
-      class="dropdown-menu dropdown-menu-right"
-      role="menu">
-    <li>
-      <a i18n
-         class="dropdown-item"
-         [ngClass]="{'disabled': !docsUrl}"
-         href="{{ docsUrl }}"
-         target="_blank">Documentation</a>
-    </li>
-    <li>
-      <a i18n
-         class="dropdown-item"
-         (click)="goToApiDocs()">API</a>
-    </li>
-    <li>
-      <a i18n
-         class="dropdown-item"
-         (click)="openAboutModal()">About</a>
-    </li>
-  </ul>
-</div>
+<ng-template #customTrigger>
+  <svg cdsIcon="help"
+       size="20"
+       i18n-title
+       title="Help"
+       role="button"></svg>
+  <span i18n
+        class="d-md-none">Help</span>
+</ng-template>

@@ -1,3 +1,5 @@
+  $ ceph balancer off
+  $ ceph balancer mode none
   $ ceph osd pool create balancer_opt 128
   pool 'balancer_opt' created
   $ ceph osd pool application enable balancer_opt rados
@@ -10,6 +12,7 @@
   $ ceph config set osd.* target_max_misplaced_ratio .07
   $ ceph balancer eval
   current cluster score [0-9]*\.?[0-9]+.* (re)
+  read_balance_scores \(lower is better\) {'rbd': [0-9]*\.?[0-9]+.*, 'balancer_opt': [0-9]*\.?[0-9]+.*} (re)
 # Turn off active balancer to use manual commands
   $ ceph balancer off
   $ ceph balancer optimize test_plan balancer_opt
@@ -20,6 +23,7 @@
   $ ceph balancer execute test_plan
   $ ceph balancer eval
   current cluster score [0-9]*\.?[0-9]+.* (re)
+  read_balance_scores \(lower is better\) {'rbd': [0-9]*\.?[0-9]+.*, 'balancer_opt': [0-9]*\.?[0-9]+.*} (re)
 # Plan is gone after execution ?
   $ ceph balancer execute test_plan
   Error ENOENT: plan test_plan not found

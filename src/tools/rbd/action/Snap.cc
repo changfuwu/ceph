@@ -11,16 +11,34 @@
 #include "common/TextTable.h"
 #include <iostream>
 #include <boost/program_options.hpp>
-#include <boost/bind.hpp>
+#include <boost/bind/bind.hpp>
 
 namespace rbd {
 namespace action {
 namespace snap {
 
+using namespace boost::placeholders;
+
 static const std::string ALL_NAME("all");
 
 namespace at = argument_types;
 namespace po = boost::program_options;
+
+std::string get_snap_namespace_name(librbd::snap_namespace_type_t type)
+{
+  switch (type) {
+  case RBD_SNAP_NAMESPACE_TYPE_USER:
+    return "user";
+  case RBD_SNAP_NAMESPACE_TYPE_GROUP:
+    return "group";
+  case RBD_SNAP_NAMESPACE_TYPE_TRASH:
+    return "trash";
+  case RBD_SNAP_NAMESPACE_TYPE_MIRROR:
+    return "mirror";
+  default:
+    return "unknown (" + stringify(type) + ")";
+  }
+}
 
 int do_list_snaps(librbd::Image& image, Formatter *f, bool all_snaps, librados::Rados& rados)
 {
@@ -70,7 +88,7 @@ int do_list_snaps(librbd::Image& image, Formatter *f, bool all_snaps, librados::
     struct timespec timestamp;
     bool snap_protected = false;
     image.snap_get_timestamp(s->id, &timestamp);
-    string tt_str = "";
+    std::string tt_str = "";
     if(timestamp.tv_sec != 0) {
       time_t tt = timestamp.tv_sec;
       tt_str = ctime(&tt);
@@ -84,24 +102,8 @@ int do_list_snaps(librbd::Image& image, Formatter *f, bool all_snaps, librados::
       return r;
     }
 
-    std::string snap_namespace_name = "Unknown";
-    switch (snap_namespace) {
-    case RBD_SNAP_NAMESPACE_TYPE_USER:
-      snap_namespace_name = "user";
-      break;
-    case RBD_SNAP_NAMESPACE_TYPE_GROUP:
-      snap_namespace_name = "group";
-      break;
-    case RBD_SNAP_NAMESPACE_TYPE_TRASH:
-      snap_namespace_name = "trash";
-      break;
-    case RBD_SNAP_NAMESPACE_TYPE_MIRROR:
-      snap_namespace_name = "mirror";
-      break;
-    }
-
     int get_trash_res = -ENOENT;
-    std::string trash_original_name;
+    librbd::snap_trash_namespace_t trash_snap;
     int get_group_res = -ENOENT;
     librbd::snap_group_namespace_t group_snap;
     int get_mirror_res = -ENOENT;
@@ -111,8 +113,8 @@ int do_list_snaps(librbd::Image& image, Formatter *f, bool all_snaps, librados::
       get_group_res = image.snap_get_group_namespace(s->id, &group_snap,
                                                      sizeof(group_snap));
     } else if (snap_namespace == RBD_SNAP_NAMESPACE_TYPE_TRASH) {
-      get_trash_res = image.snap_get_trash_namespace(
-        s->id, &trash_original_name);
+      get_trash_res = image.snap_get_trash_namespace2(
+        s->id, &trash_snap, sizeof(trash_snap));
     } else if (snap_namespace == RBD_SNAP_NAMESPACE_TYPE_MIRROR) {
       get_mirror_res = image.snap_get_mirror_namespace(
         s->id, &mirror_snap, sizeof(mirror_snap));
@@ -150,14 +152,17 @@ int do_list_snaps(librbd::Image& image, Formatter *f, bool all_snaps, librados::
       f->dump_string("timestamp", tt_str);
       if (all_snaps) {
         f->open_object_section("namespace");
-        f->dump_string("type", snap_namespace_name);
+        f->dump_string("type", get_snap_namespace_name(snap_namespace));
         if (get_group_res == 0) {
           std::string pool_name = pool_map[group_snap.group_pool];
           f->dump_string("pool", pool_name);
           f->dump_string("group", group_snap.group_name);
           f->dump_string("group snap", group_snap.group_snap_name);
         } else if (get_trash_res == 0) {
-          f->dump_string("original_name", trash_original_name);
+          f->dump_string("original_namespace_type",
+                         get_snap_namespace_name(
+                           trash_snap.original_namespace_type));
+          f->dump_string("original_name", trash_snap.original_name);
         } else if (get_mirror_res == 0) {
           f->dump_string("state", mirror_snap_state);
           f->open_array_section("mirror_peer_uuids");
@@ -184,8 +189,8 @@ int do_list_snaps(librbd::Image& image, Formatter *f, bool all_snaps, librados::
       t << s->id << s->name << stringify(byte_u_t(s->size)) << protected_str << tt_str;
 
       if (all_snaps) {
-        ostringstream oss;
-        oss << snap_namespace_name;
+        std::ostringstream oss;
+        oss << get_snap_namespace_name(snap_namespace);
 
         if (get_group_res == 0) {
           std::string pool_name = pool_map[group_snap.group_pool];
@@ -193,14 +198,16 @@ int do_list_snaps(librbd::Image& image, Formatter *f, bool all_snaps, librados::
                       << group_snap.group_name << "@"
                       << group_snap.group_snap_name << ")";
         } else if (get_trash_res == 0) {
-          oss << " (" << trash_original_name << ")";
+          oss << " ("
+              << get_snap_namespace_name(trash_snap.original_namespace_type)
+              << " " << trash_snap.original_name << ")";
         } else if (get_mirror_res == 0) {
           oss << " (" << mirror_snap_state << " "
                       << "peer_uuids:[" << mirror_snap.mirror_peer_uuids << "]";
           if (mirror_snap.state == RBD_SNAP_MIRROR_STATE_NON_PRIMARY ||
               mirror_snap.state == RBD_SNAP_MIRROR_STATE_NON_PRIMARY_DEMOTED) {
-            oss  << mirror_snap.primary_mirror_uuid << ":"
-                 << mirror_snap.primary_snap_id << " ";
+            oss << " " << mirror_snap.primary_mirror_uuid << ":"
+                << mirror_snap.primary_snap_id << " ";
             if (!mirror_snap.complete) {
               if (info.num_objs > 0) {
                 auto progress = std::min<uint64_t>(
@@ -232,12 +239,18 @@ int do_list_snaps(librbd::Image& image, Formatter *f, bool all_snaps, librados::
   return 0;
 }
 
-int do_add_snap(librbd::Image& image, const char *snapname)
+int do_add_snap(librbd::Image& image, const char *snapname,
+                uint32_t flags, bool no_progress)
 {
-  int r = image.snap_create(snapname);
-  if (r < 0)
+  utils::ProgressContext pc("Creating snap", no_progress);
+  
+  int r = image.snap_create2(snapname, flags, pc);
+  if (r < 0) {
+    pc.fail();
     return r;
+  }
 
+  pc.finish();
   return 0;
 }
 
@@ -283,7 +296,7 @@ int do_purge_snaps(librbd::Image& image, bool no_progress)
   } else if (0 == snaps.size()) {
     return 0;
   } else {
-    list<std::string> protect;
+    std::list<std::string> protect;
     snaps.erase(remove_if(snaps.begin(),
                           snaps.end(),
                           boost::bind(utils::is_not_user_snap_namespace, &image, _1)),
@@ -407,7 +420,7 @@ int execute_list(const po::variables_map &vm,
   bool all_snaps = vm[ALL_NAME].as<bool>();
   r = do_list_snaps(image, formatter.get(), all_snaps, rados);
   if (r < 0) {
-    cerr << "rbd: failed to list snapshots: " << cpp_strerror(r)
+    std::cerr << "rbd: failed to list snapshots: " << cpp_strerror(r)
          << std::endl;
     return r;
   }
@@ -417,6 +430,8 @@ int execute_list(const po::variables_map &vm,
 void get_create_arguments(po::options_description *positional,
                           po::options_description *options) {
   at::add_snap_spec_options(positional, options, at::ARGUMENT_MODIFIER_NONE);
+  at::add_snap_create_options(options);
+  at::add_no_progress_option(options);
 }
 
 int execute_create(const po::variables_map &vm,
@@ -434,6 +449,12 @@ int execute_create(const po::variables_map &vm,
     return r;
   }
 
+  uint32_t flags;
+  r = utils::get_snap_create_flags(vm, &flags);
+  if (r < 0) {
+    return r;
+  }
+
   librados::Rados rados;
   librados::IoCtx io_ctx;
   librbd::Image image;
@@ -443,10 +464,11 @@ int execute_create(const po::variables_map &vm,
     return r;
   }
 
-  r = do_add_snap(image, snap_name.c_str());
+  r = do_add_snap(image, snap_name.c_str(), flags,
+                  vm[at::NO_PROGRESS].as<bool>());
   if (r < 0) {
-    cerr << "rbd: failed to create snapshot: " << cpp_strerror(r)
-         << std::endl;
+    std::cerr << "rbd: failed to create snapshot: " << cpp_strerror(r)
+	      << std::endl;
     return r;
   }
   return 0;
@@ -456,7 +478,7 @@ void get_remove_arguments(po::options_description *positional,
                           po::options_description *options) {
   at::add_snap_spec_options(positional, options, at::ARGUMENT_MODIFIER_NONE);
   at::add_image_id_option(options);
-  at::add_snap_id_option(options);
+  at::add_snap_id_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_no_progress_option(options);
 
   options->add_options()

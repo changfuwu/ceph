@@ -12,9 +12,12 @@
 #include "librbd/Journal.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
+#include "librbd/image/Types.h"
 #include "librbd/image/ValidatePoolRequest.h"
 #include "librbd/journal/CreateRequest.h"
 #include "librbd/journal/RemoveRequest.h"
+#include "librbd/journal/TypeTraits.h"
 #include "librbd/mirror/EnableRequest.h"
 #include "journal/Journaler.h"
 
@@ -37,7 +40,7 @@ int validate_features(CephContext *cct, uint64_t features) {
     lderr(cct) << "librbd does not support requested features." << dendl;
     return -ENOSYS;
   }
-  if ((features & RBD_FEATURE_OPERATIONS) != 0) {
+  if ((features & RBD_FEATURES_INTERNAL) != 0) {
     lderr(cct) << "cannot use internally controlled features" << dendl;
     return -EINVAL;
   }
@@ -69,6 +72,9 @@ int validate_striping(CephContext *cct, uint8_t order, uint64_t stripe_unit,
     return -EINVAL;
   } else if (stripe_unit && ((1ull << order) % stripe_unit || stripe_unit > (1ull << order))) {
     lderr(cct) << "stripe unit is not a factor of the object size" << dendl;
+    return -EINVAL;
+  } else if (stripe_unit != 0 && stripe_unit < 512) {
+    lderr(cct) << "stripe unit must be at least 512 bytes" << dendl;
     return -EINVAL;
   }
   return 0;
@@ -114,13 +120,14 @@ CreateRequest<I>::CreateRequest(const ConfigProxy& config, IoCtx &ioctx,
                                 const std::string &image_name,
                                 const std::string &image_id, uint64_t size,
                                 const ImageOptions &image_options,
-                                bool skip_mirror_enable,
+                                uint32_t create_flags,
                                 cls::rbd::MirrorImageMode mirror_image_mode,
                                 const std::string &non_primary_global_image_id,
                                 const std::string &primary_mirror_uuid,
-                                ContextWQ *op_work_queue, Context *on_finish)
+                                asio::ContextWQ *op_work_queue,
+                                Context *on_finish)
   : m_config(config), m_image_name(image_name), m_image_id(image_id),
-    m_size(size), m_skip_mirror_enable(skip_mirror_enable),
+    m_size(size), m_create_flags(create_flags),
     m_mirror_image_mode(mirror_image_mode),
     m_non_primary_global_image_id(non_primary_global_image_id),
     m_primary_mirror_uuid(primary_mirror_uuid),
@@ -132,7 +139,10 @@ CreateRequest<I>::CreateRequest(const ConfigProxy& config, IoCtx &ioctx,
   m_id_obj = util::id_obj_name(m_image_name);
   m_header_obj = util::header_name(m_image_id);
   m_objmap_name = ObjectMap<>::object_map_name(m_image_id, CEPH_NOSNAP);
-  m_force_non_primary = !non_primary_global_image_id.empty();
+  if (!non_primary_global_image_id.empty() &&
+      (m_create_flags & CREATE_FLAG_MIRROR_ENABLE_MASK) == 0) {
+    m_create_flags |= CREATE_FLAG_FORCE_MIRROR_ENABLE;
+  }
 
   if (image_options.get(RBD_IMAGE_OPTION_FEATURES, &m_features) != 0) {
     m_features = librbd::rbd_features_from_string(
@@ -151,6 +161,7 @@ CreateRequest<I>::CreateRequest(const ConfigProxy& config, IoCtx &ioctx,
   m_features |= features_set;
   m_features &= ~features_clear;
 
+  m_features &= ~RBD_FEATURES_IMPLICIT_ENABLE;
   if ((m_features & RBD_FEATURE_OBJECT_MAP) == RBD_FEATURE_OBJECT_MAP) {
       m_features |= RBD_FEATURE_FAST_DIFF;
   }
@@ -196,14 +207,11 @@ CreateRequest<I>::CreateRequest(const ConfigProxy& config, IoCtx &ioctx,
     m_features |= RBD_FEATURE_DATA_POOL;
   } else {
     m_data_pool.clear();
-    m_features &= ~RBD_FEATURE_DATA_POOL;
   }
 
   if ((m_stripe_unit != 0 && m_stripe_unit != (1ULL << m_order)) ||
       (m_stripe_count != 0 && m_stripe_count != 1)) {
     m_features |= RBD_FEATURE_STRIPINGV2;
-  } else {
-    m_features &= ~RBD_FEATURE_STRIPINGV2;
   }
 
   ldout(m_cct, 10) << "name=" << m_image_name << ", "
@@ -275,8 +283,7 @@ void CreateRequest<I>::validate_data_pool() {
 
   auto ctx = create_context_callback<
     CreateRequest<I>, &CreateRequest<I>::handle_validate_data_pool>(this);
-  auto req = ValidatePoolRequest<I>::create(m_data_io_ctx, m_op_work_queue,
-                                            ctx);
+  auto req = ValidatePoolRequest<I>::create(m_data_io_ctx, ctx);
   req->send();
 }
 
@@ -424,7 +431,7 @@ void CreateRequest<I>::create_image() {
   ldout(m_cct, 15) << dendl;
   ceph_assert(m_data_pool.empty() || m_data_pool_id != -1);
 
-  ostringstream oss;
+  std::ostringstream oss;
   oss << RBD_DATA_PREFIX;
   if (m_data_pool_id != -1) {
     oss << stringify(m_io_ctx.get_id()) << ".";
@@ -602,17 +609,20 @@ void CreateRequest<I>::journal_create() {
   // only link to remote primary mirror uuid if in journal-based
   // mirroring mode
   bool use_primary_mirror_uuid = (
-    m_force_non_primary &&
+    !m_non_primary_global_image_id.empty() &&
     m_mirror_image_mode == cls::rbd::MIRROR_IMAGE_MODE_JOURNAL);
 
   librbd::journal::TagData tag_data;
   tag_data.mirror_uuid = (use_primary_mirror_uuid ? m_primary_mirror_uuid :
                           librbd::Journal<I>::LOCAL_MIRROR_UUID);
 
+  typename journal::TypeTraits<I>::ContextWQ* context_wq;
+  Journal<>::get_work_queue(m_cct, &context_wq);
+
   auto req = librbd::journal::CreateRequest<I>::create(
     m_io_ctx, m_image_id, m_journal_order, m_journal_splay_width,
     m_journal_pool, cls::journal::Tag::TAG_CLASS_NEW, tag_data,
-    librbd::Journal<I>::IMAGE_CLIENT_ID, m_op_work_queue, ctx);
+    librbd::Journal<I>::IMAGE_CLIENT_ID, context_wq, ctx);
   req->send();
 }
 
@@ -634,8 +644,11 @@ void CreateRequest<I>::handle_journal_create(int r) {
 
 template<typename I>
 void CreateRequest<I>::mirror_image_enable() {
-  if (((m_mirror_mode != cls::rbd::MIRROR_MODE_POOL) && !m_force_non_primary) ||
-      m_skip_mirror_enable) {
+  auto mirror_enable_flag = (m_create_flags & CREATE_FLAG_MIRROR_ENABLE_MASK);
+
+  if ((m_mirror_mode != cls::rbd::MIRROR_MODE_POOL &&
+       mirror_enable_flag != CREATE_FLAG_FORCE_MIRROR_ENABLE) ||
+      (mirror_enable_flag == CREATE_FLAG_SKIP_MIRROR_ENABLE)) {
     complete(0);
     return;
   }
@@ -646,7 +659,7 @@ void CreateRequest<I>::mirror_image_enable() {
 
   auto req = mirror::EnableRequest<I>::create(
     m_io_ctx, m_image_id, m_mirror_image_mode,
-    m_non_primary_global_image_id, m_op_work_queue, ctx);
+    m_non_primary_global_image_id, true, m_op_work_queue, ctx);
   req->send();
 }
 
@@ -690,9 +703,12 @@ void CreateRequest<I>::journal_remove() {
   Context *ctx = create_context_callback<klass, &klass::handle_journal_remove>(
     this);
 
+  typename journal::TypeTraits<I>::ContextWQ* context_wq;
+  Journal<>::get_work_queue(m_cct, &context_wq);
+
   librbd::journal::RemoveRequest<I> *req =
     librbd::journal::RemoveRequest<I>::create(
-      m_io_ctx, m_image_id, librbd::Journal<I>::IMAGE_CLIENT_ID, m_op_work_queue,
+      m_io_ctx, m_image_id, librbd::Journal<I>::IMAGE_CLIENT_ID, context_wq,
       ctx);
   req->send();
 }

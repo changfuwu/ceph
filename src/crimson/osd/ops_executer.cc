@@ -15,9 +15,14 @@
 
 #include <seastar/core/thread.hh>
 
+#include "crimson/common/log.h"
 #include "crimson/osd/exceptions.h"
+#include "crimson/osd/pg.h"
 #include "crimson/osd/watch.h"
 #include "osd/ClassHandler.h"
+#include "osd/SnapMapper.h"
+
+SET_SUBSYS(osd);
 
 namespace {
   seastar::logger& logger() {
@@ -27,7 +32,16 @@ namespace {
 
 namespace crimson::osd {
 
-OpsExecuter::call_errorator::future<> OpsExecuter::do_op_call(OSDOp& osd_op)
+// workaround for clang 19
+// when a .cc file includes ops_executer.h but doesn't include the pg.h,
+// it seems that clang++-19 can't retrieve the type hierarchy of PG, so
+// that the destructor of boost::intrusive_ptr<PG> could not find the hidden
+// friend of intrusive_ptr_release.
+// Moving the destructor invocation of intrusive_ptr to this file could
+// solve this issue.
+OpsExecuter::~OpsExecuter() {}
+
+OpsExecuter::call_ierrorator::future<> OpsExecuter::do_op_call(OSDOp& osd_op)
 {
   std::string cname, mname;
   ceph::bufferlist indata;
@@ -78,14 +92,14 @@ OpsExecuter::call_errorator::future<> OpsExecuter::do_op_call(OSDOp& osd_op)
                  cname, mname, num_read, num_write);
   const auto prev_rd = num_read;
   const auto prev_wr = num_write;
-  return seastar::async(
+  return interruptor::async(
     [this, method, indata=std::move(indata)]() mutable {
       ceph::bufferlist outdata;
       auto cls_context = reinterpret_cast<cls_method_context_t>(this);
       const auto ret = method->exec(cls_context, indata, outdata);
       return std::make_pair(ret, std::move(outdata));
     }
-  ).then(
+  ).then_interruptible(
     [this, prev_rd, prev_wr, &osd_op, flags]
     (auto outcome) -> call_errorator::future<> {
       auto& [ret, outdata] = outcome;
@@ -107,8 +121,8 @@ OpsExecuter::call_errorator::future<> OpsExecuter::do_op_call(OSDOp& osd_op)
       // ceph-osd has this implemented in `PrimaryLogPG::execute_ctx`,
       // grep for `ignore_out_data`.
       using crimson::common::local_conf;
-      if (op_info->allows_returnvec() &&
-          op_info->may_write() &&
+      if (op_info.allows_returnvec() &&
+          op_info.may_write() &&
           ret >= 0 &&
           outdata.length() > local_conf()->osd_max_write_op_reply_len) {
         // the justification of this limit it to not inflate the pg log.
@@ -121,7 +135,7 @@ OpsExecuter::call_errorator::future<> OpsExecuter::do_op_call(OSDOp& osd_op)
       }
       // for write calls we never return data expect errors or RETURNVEC.
       // please refer cls/cls_hello.cc to details.
-      if (!op_info->may_write() || op_info->allows_returnvec() || ret < 0) {
+      if (!op_info.may_write() || op_info.allows_returnvec() || ret < 0) {
         osd_op.op.extent.length = outdata.length();
         osd_op.outdata.claim_append(outdata);
       }
@@ -136,7 +150,8 @@ OpsExecuter::call_errorator::future<> OpsExecuter::do_op_call(OSDOp& osd_op)
 }
 
 static watch_info_t create_watch_info(const OSDOp& osd_op,
-                                      const MOSDOp& msg)
+                                      const OpsExecuter::ExecutableMessage& msg,
+                                      entity_addr_t peer_addr)
 {
   using crimson::common::local_conf;
   const uint32_t timeout =
@@ -145,28 +160,34 @@ static watch_info_t create_watch_info(const OSDOp& osd_op,
   return {
     osd_op.op.watch.cookie,
     timeout,
-    msg.get_connection()->get_peer_addr()
+    peer_addr
   };
 }
 
-OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_watch(
+OpsExecuter::watch_ierrorator::future<> OpsExecuter::do_op_watch_subop_watch(
   OSDOp& osd_op,
   ObjectState& os,
   ceph::os::Transaction& txn)
 {
+  logger().debug("{}", __func__);
   struct connect_ctx_t {
     ObjectContext::watch_key_t key;
-    crimson::net::ConnectionRef conn;
+    crimson::net::ConnectionXcoreRef conn;
     watch_info_t info;
 
-    connect_ctx_t(const OSDOp& osd_op, const MOSDOp& msg)
+    connect_ctx_t(
+      const OSDOp& osd_op,
+      const ExecutableMessage& msg,
+      crimson::net::ConnectionXcoreRef conn)
       : key(osd_op.op.watch.cookie, msg.get_reqid().name),
-        conn(msg.get_connection()),
-        info(create_watch_info(osd_op, msg)) {
+        conn(conn),
+        info(create_watch_info(osd_op, msg, conn->get_peer_addr())) {
     }
   };
-  return with_effect_on_obc(connect_ctx_t{ osd_op, get_message() },
-    [&] (auto& ctx) {
+
+  return with_effect_on_obc(
+    connect_ctx_t{ osd_op, get_message(), conn },
+    [&](auto& ctx) {
       const auto& entity = ctx.key.second;
       auto [it, emplaced] =
         os.oi.watchers.try_emplace(ctx.key, std::move(ctx.info));
@@ -178,20 +199,23 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_watch(
       }
       return seastar::now();
     },
-    [] (auto&& ctx, ObjectContextRef obc) {
+    [](auto&& ctx, ObjectContextRef obc, Ref<PG> pg) {
+      assert(pg);
       auto [it, emplaced] = obc->watchers.try_emplace(ctx.key, nullptr);
       if (emplaced) {
         const auto& [cookie, entity] = ctx.key;
-        it->second = crimson::osd::Watch::create(obc, ctx.info, entity);
+        it->second = crimson::osd::Watch::create(
+          obc, ctx.info, entity, std::move(pg));
         logger().info("op_effect: added new watcher: {}", ctx.key);
       } else {
         logger().info("op_effect: found existing watcher: {}", ctx.key);
       }
       return it->second->connect(std::move(ctx.conn), true /* will_ping */);
-    });
+    }
+  );
 }
 
-OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_reconnect(
+OpsExecuter::watch_ierrorator::future<> OpsExecuter::do_op_watch_subop_reconnect(
   OSDOp& osd_op,
   ObjectState& os,
   ceph::os::Transaction& txn)
@@ -206,7 +230,7 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_reconnect(
   }
 }
 
-OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_unwatch(
+OpsExecuter::watch_ierrorator::future<> OpsExecuter::do_op_watch_subop_unwatch(
   OSDOp& osd_op,
   ObjectState& os,
   ceph::os::Transaction& txn)
@@ -215,9 +239,7 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_unwatch(
 
   struct disconnect_ctx_t {
     ObjectContext::watch_key_t key;
-    bool send_disconnect{ false };
-
-    disconnect_ctx_t(const OSDOp& osd_op, const MOSDOp& msg)
+    disconnect_ctx_t(const OSDOp& osd_op, const ExecutableMessage& msg)
       : key(osd_op.op.watch.cookie, msg.get_reqid().name) {
     }
   };
@@ -232,12 +254,12 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_unwatch(
       }
       return seastar::now();
     },
-    [] (auto&& ctx, ObjectContextRef obc) {
+    [] (auto&& ctx, ObjectContextRef obc, Ref<PG>) {
       if (auto nh = obc->watchers.extract(ctx.key); !nh.empty()) {
         return seastar::do_with(std::move(nh.mapped()),
                          [ctx](auto&& watcher) {
           logger().info("op_effect: disconnect watcher {}", ctx.key);
-          return watcher->remove(ctx.send_disconnect);
+          return watcher->remove();
         });
       } else {
         logger().info("op_effect: disconnect failed to find watcher {}", ctx.key);
@@ -246,7 +268,7 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_unwatch(
     });
 }
 
-OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_ping(
+OpsExecuter::watch_ierrorator::future<> OpsExecuter::do_op_watch_subop_ping(
   OSDOp& osd_op,
   ObjectState& os,
   ceph::os::Transaction& txn)
@@ -270,7 +292,7 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch_subop_ping(
   return seastar::now();
 }
 
-OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_watch(
+OpsExecuter::watch_ierrorator::future<> OpsExecuter::do_op_watch(
   OSDOp& osd_op,
   ObjectState& os,
   ceph::os::Transaction& txn)
@@ -303,7 +325,7 @@ static uint64_t get_next_notify_id(epoch_t e)
   return (((uint64_t)e) << 32) | ((uint64_t)(next_notify_id++));
 }
 
-OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_notify(
+OpsExecuter::watch_ierrorator::future<> OpsExecuter::do_op_notify(
   OSDOp& osd_op,
   const ObjectState& os)
 {
@@ -313,19 +335,21 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_notify(
     return crimson::ct_error::enoent::make();
   }
   struct notify_ctx_t {
-    crimson::net::ConnectionRef conn;
+    crimson::net::ConnectionXcoreRef conn;
     notify_info_t ninfo;
     const uint64_t client_gid;
     const epoch_t epoch;
 
-    notify_ctx_t(const MOSDOp& msg)
-      : conn(msg.get_connection()),
+    notify_ctx_t(const ExecutableMessage& msg,
+                 crimson::net::ConnectionXcoreRef conn)
+      : conn(conn),
         client_gid(msg.get_reqid().name.num()),
         epoch(msg.get_map_epoch()) {
     }
   };
-  return with_effect_on_obc(notify_ctx_t{ get_message() },
-    [&] (auto& ctx) {
+  return with_effect_on_obc(
+    notify_ctx_t{ get_message(), conn },
+    [&](auto& ctx) {
       try {
         auto bp = osd_op.indata.cbegin();
         uint32_t ver; // obsolete
@@ -345,13 +369,13 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_notify(
       ceph::encode(ctx.ninfo.notify_id, osd_op.outdata);
       return seastar::now();
     },
-    [] (auto&& ctx, ObjectContextRef obc) {
+    [](auto&& ctx, ObjectContextRef obc, Ref<PG>) {
       auto alive_watchers = obc->watchers | boost::adaptors::map_values
-                                          | boost::adaptors::filtered(
-        [] (const auto& w) {
-          // FIXME: filter as for the `is_ping` in `Watch::start_notify`
-          return w->is_alive();
-        });
+        | boost::adaptors::filtered(
+          [] (const auto& w) {
+            // FIXME: filter as for the `is_ping` in `Watch::start_notify`
+            return w->is_alive();
+          });
       return crimson::osd::Notify::create_n_propagate(
         std::begin(alive_watchers),
         std::end(alive_watchers),
@@ -359,10 +383,30 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_notify(
         ctx.ninfo,
         ctx.client_gid,
         obc->obs.oi.user_version);
-  });
+    }
+  );
 }
 
-OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_notify_ack(
+OpsExecuter::watch_ierrorator::future<> OpsExecuter::do_op_list_watchers(
+  OSDOp& osd_op,
+  const ObjectState& os)
+{
+  logger().debug("{}", __func__);
+
+  obj_list_watch_response_t response;
+  for (const auto& [key, info] : os.oi.watchers) {
+    logger().debug("{}: key cookie={}, entity={}",
+                   __func__, key.first, key.second);
+    assert(key.first == info.cookie);
+    assert(key.second.is_client());
+    response.entries.emplace_back(watch_item_t{
+      key.second, info.cookie, info.timeout_seconds, info.addr});
+  }
+  response.encode(osd_op.outdata, get_message().get_features());
+  return watch_ierrorator::now();
+}
+
+OpsExecuter::watch_ierrorator::future<> OpsExecuter::do_op_notify_ack(
   OSDOp& osd_op,
   const ObjectState& os)
 {
@@ -374,7 +418,8 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_notify_ack(
     uint64_t notify_id;
     ceph::bufferlist reply_bl;
 
-    notifyack_ctx_t(const MOSDOp& msg) : entity(msg.get_reqid().name) {
+    notifyack_ctx_t(const ExecutableMessage& msg)
+      : entity(msg.get_reqid().name) {
     }
   };
   return with_effect_on_obc(notifyack_ctx_t{ get_message() },
@@ -394,7 +439,7 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_notify_ack(
       }
       return watch_errorator::now();
     },
-    [] (auto&& ctx, ObjectContextRef obc) {
+    [] (auto&& ctx, ObjectContextRef obc, Ref<PG>) {
       logger().info("notify_ack watch_cookie={}, notify_id={}",
                     ctx.watch_cookie, ctx.notify_id);
       return seastar::do_for_each(obc->watchers,
@@ -418,6 +463,668 @@ OpsExecuter::watch_errorator::future<> OpsExecuter::do_op_notify_ack(
           return watchp->notify_ack(ctx.notify_id, ctx.reply_bl);
         });
   });
+}
+
+// Defined here because there is a circular dependency between OpsExecuter and PG
+template <class Func>
+auto OpsExecuter::do_const_op(Func&& f) {
+  // TODO: pass backend as read-only
+  return std::forward<Func>(f)(pg->get_backend(), std::as_const(obc->obs));
+}
+
+// Defined here because there is a circular dependency between OpsExecuter and PG
+template <class Func>
+auto OpsExecuter::do_write_op(Func&& f, OpsExecuter::modified_by m) {
+  ++num_write;
+  check_init_op_params(m);
+  return std::forward<Func>(f)(pg->get_backend(), obc->obs, txn);
+}
+OpsExecuter::call_errorator::future<> OpsExecuter::do_assert_ver(
+  OSDOp& osd_op,
+  const ObjectState& os)
+{
+  if (!osd_op.op.assert_ver.ver) {
+    return crimson::ct_error::invarg::make();
+  } else if (osd_op.op.assert_ver.ver < os.oi.user_version) {
+    return crimson::ct_error::erange::make();
+  } else if (osd_op.op.assert_ver.ver > os.oi.user_version) {
+    return crimson::ct_error::value_too_large::make();
+  }
+  return seastar::now();
+}
+
+OpsExecuter::list_snaps_iertr::future<> OpsExecuter::do_list_snaps(
+  OSDOp& osd_op,
+  const ObjectState& os,
+  const SnapSet& ss)
+{
+  if (msg->get_snapid() != CEPH_SNAPDIR) {
+    logger().debug("LIST_SNAPS with incorrect context");
+    return crimson::ct_error::invarg::make();
+  }
+
+  obj_list_snap_response_t resp;
+  resp.clones.reserve(ss.clones.size() + 1);
+  for (auto &clone: ss.clones) {
+    clone_info ci;
+    ci.cloneid = clone;
+
+    {
+      auto p = ss.clone_snaps.find(clone);
+      if (p == ss.clone_snaps.end()) {
+	logger().error(
+	  "OpsExecuter::do_list_snaps: {} has inconsistent "
+	  "clone_snaps, missing clone {}",
+	  os.oi.soid,
+	  clone);
+	return crimson::ct_error::invarg::make();
+      }
+      ci.snaps.reserve(p->second.size());
+      ci.snaps.insert(ci.snaps.end(), p->second.rbegin(), p->second.rend());
+    }
+
+    {
+      auto p = ss.clone_overlap.find(clone);
+      if (p == ss.clone_overlap.end()) {
+	logger().error(
+	  "OpsExecuter::do_list_snaps: {} has inconsistent "
+	  "clone_overlap, missing clone {}",
+	  os.oi.soid,
+	  clone);
+	return crimson::ct_error::invarg::make();
+      }
+      ci.overlap.reserve(p->second.num_intervals());
+      ci.overlap.insert(ci.overlap.end(), p->second.begin(), p->second.end());
+    }
+
+    {
+      auto p = ss.clone_size.find(clone);
+      if (p == ss.clone_size.end()) {
+	logger().error(
+	  "OpsExecuter::do_list_snaps: {} has inconsistent "
+	  "clone_size, missing clone {}",
+	  os.oi.soid,
+	  clone);
+	return crimson::ct_error::invarg::make();
+      }
+      ci.size = p->second;
+    }
+    resp.clones.push_back(std::move(ci));
+  }
+
+  if (!os.oi.is_whiteout()) {
+    clone_info ci;
+    ci.cloneid = CEPH_NOSNAP;
+    ci.size = os.oi.size;
+    resp.clones.push_back(std::move(ci));
+  }
+  resp.seq = ss.seq;
+  logger().error(
+    "OpsExecuter::do_list_snaps: {}, resp.clones.size(): {}",
+    os.oi.soid,
+    resp.clones.size());
+  resp.encode(osd_op.outdata);
+  return read_ierrorator::now();
+}
+
+OpsExecuter::interruptible_errorated_future<OpsExecuter::osd_op_errorator>
+OpsExecuter::execute_op(OSDOp& osd_op)
+{
+  return do_execute_op(osd_op).handle_error_interruptible(
+    osd_op_errorator::all_same_way([&osd_op](auto e, auto&& e_raw)
+      -> OpsExecuter::osd_op_errorator::future<> {
+        // All ops except for CMPEXT should have rval set to -e.value(),
+        // CMPEXT sets rval itself and shouldn't be overridden.
+        if (e.value() != ct_error::cmp_fail_error_value) {
+          osd_op.rval = -e.value();
+        }
+        if ((osd_op.op.flags & CEPH_OSD_OP_FLAG_FAILOK) &&
+	  e.value() != EAGAIN && e.value() != EINPROGRESS) {
+          return osd_op_errorator::now();
+        } else {
+          return std::move(e_raw);
+	}
+      }));
+}
+
+OpsExecuter::interruptible_errorated_future<OpsExecuter::osd_op_errorator>
+OpsExecuter::do_execute_op(OSDOp& osd_op)
+{
+  // TODO: dispatch via call table?
+  // TODO: we might want to find a way to unify both input and output
+  // of each op.
+  logger().debug(
+    "handling op {} on object {}",
+    ceph_osd_op_name(osd_op.op.op),
+    get_target());
+  switch (const ceph_osd_op& op = osd_op.op; op.op) {
+  case CEPH_OSD_OP_SYNC_READ:
+    [[fallthrough]];
+  case CEPH_OSD_OP_READ:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.read(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_SPARSE_READ:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.sparse_read(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_CHECKSUM:
+    return do_read_op([&osd_op](auto& backend, const auto& os) {
+      return backend.checksum(os, osd_op);
+    });
+  case CEPH_OSD_OP_CMPEXT:
+    return do_read_op([&osd_op](auto& backend, const auto& os) {
+      return backend.cmp_ext(os, osd_op);
+    });
+  case CEPH_OSD_OP_GETXATTR:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.getxattr(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_GETXATTRS:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.get_xattrs(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_CMPXATTR:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.cmp_xattr(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_RMXATTR:
+    return do_write_op([&osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.rm_xattr(os, osd_op, txn);
+    });
+  case CEPH_OSD_OP_CREATE:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.create(os, osd_op, txn, delta_stats);
+    });
+  case CEPH_OSD_OP_WRITE:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.write(os, osd_op, txn, *osd_op_params, delta_stats);
+    });
+  case CEPH_OSD_OP_WRITESAME:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.write_same(os, osd_op, txn, *osd_op_params, delta_stats);
+    });
+  case CEPH_OSD_OP_WRITEFULL:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.writefull(os, osd_op, txn, *osd_op_params, delta_stats);
+    });
+  case CEPH_OSD_OP_ROLLBACK:
+    return do_write_op([this, &head=obc,
+                        &osd_op](auto& backend, auto& os, auto& txn) {
+      ceph_assert(obc->ssc);
+      return backend.rollback(os, obc->ssc->snapset,
+			      osd_op, txn, *osd_op_params, delta_stats,
+                              head, pg->obc_loader, snapc);
+    });
+  case CEPH_OSD_OP_APPEND:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.append(os, osd_op, txn, *osd_op_params, delta_stats);
+    });
+  case CEPH_OSD_OP_TRUNCATE:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      // FIXME: rework needed. Move this out to do_write_op(), introduce
+      // do_write_op_no_user_modify()...
+      return backend.truncate(os, osd_op, txn, *osd_op_params, delta_stats);
+    });
+  case CEPH_OSD_OP_ZERO:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.zero(os, osd_op, txn, *osd_op_params, delta_stats);
+    });
+  case CEPH_OSD_OP_SETALLOCHINT:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.set_allochint(os, osd_op, txn, delta_stats);
+    });
+  case CEPH_OSD_OP_SETXATTR:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.setxattr(os, osd_op, txn, delta_stats);
+    });
+  case CEPH_OSD_OP_DELETE:
+  {
+    bool whiteout = false;
+    if (should_whiteout(obc->ssc->snapset, snapc)) {  // existing obj is old
+      logger().debug("{} has or will have clones, will whiteout {}",
+                     __func__, obc->obs.oi.soid);
+      whiteout = true;
+    }
+    return do_write_op([this, whiteout](auto& backend, auto& os, auto& txn) {
+      struct emptyctx_t {};
+      return with_effect_on_obc(
+	emptyctx_t{},
+	[&](auto &ctx) {
+	  int num_bytes = 0;
+	  // Calculate num_bytes to be removed
+	  if (obc->obs.oi.soid.is_snap()) {
+	    ceph_assert(obc->ssc->snapset.clone_overlap.count(
+			  obc->obs.oi.soid.snap));
+	    num_bytes = obc->ssc->snapset.get_clone_bytes(
+	      obc->obs.oi.soid.snap);
+	  } else {
+	    num_bytes = obc->obs.oi.size;
+	  }
+	  return backend.remove(os, txn, *osd_op_params,
+				delta_stats, whiteout, num_bytes);
+	},
+	[](auto &&ctx, ObjectContextRef obc, Ref<PG>) {
+	  return seastar::do_for_each(
+	    obc->watchers,
+	    [](auto &p) { return p.second->remove(); }
+	  ).then([obc] {
+	    obc->watchers.clear();
+	    return seastar::now();
+	  });
+	});
+    });
+  }
+  case CEPH_OSD_OP_CALL:
+    return this->do_op_call(osd_op);
+  case CEPH_OSD_OP_STAT:
+    // note: stat does not require RD
+    return do_const_op([this, &osd_op] (/* const */auto& backend, const auto& os) {
+      return backend.stat(os, osd_op, delta_stats);
+    });
+
+  case CEPH_OSD_OP_TMAPPUT:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.tmapput(os, osd_op, txn, delta_stats, *osd_op_params);
+    });
+  case CEPH_OSD_OP_TMAPUP:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto &txn) {
+      return backend.tmapup(os, osd_op, txn, delta_stats, *osd_op_params);
+    });
+  case CEPH_OSD_OP_TMAPGET:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.tmapget(os, osd_op, delta_stats);
+    });
+
+  // OMAP
+  case CEPH_OSD_OP_OMAPGETKEYS:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.omap_get_keys(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_OMAPGETVALS:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.omap_get_vals(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_OMAP_CMP:
+    return  do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.omap_cmp(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_OMAPGETHEADER:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.omap_get_header(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_OMAPGETVALSBYKEYS:
+    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
+      return backend.omap_get_vals_by_keys(os, osd_op, delta_stats);
+    });
+  case CEPH_OSD_OP_OMAPSETVALS:
+#if 0
+    if (!pg.get_pgpool().info.supports_omap()) {
+      return crimson::ct_error::operation_not_supported::make();
+    }
+#endif
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.omap_set_vals(os, osd_op, txn, *osd_op_params, delta_stats);
+    });
+  case CEPH_OSD_OP_OMAPSETHEADER:
+#if 0
+    if (!pg.get_pgpool().info.supports_omap()) {
+      return crimson::ct_error::operation_not_supported::make();
+    }
+#endif
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.omap_set_header(os, osd_op, txn, *osd_op_params,
+        delta_stats);
+    });
+  case CEPH_OSD_OP_OMAPRMKEYRANGE:
+#if 0
+    if (!pg.get_pgpool().info.supports_omap()) {
+      return crimson::ct_error::operation_not_supported::make();
+    }
+#endif
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.omap_remove_range(os, osd_op, txn, delta_stats);
+    });
+  case CEPH_OSD_OP_OMAPRMKEYS:
+    /** TODO: Implement supports_omap()
+    if (!pg.get_pgpool().info.supports_omap()) {
+      return crimson::ct_error::operation_not_supported::make();
+    }*/
+    return do_write_op([&osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.omap_remove_key(os, osd_op, txn);
+    });
+  case CEPH_OSD_OP_OMAPCLEAR:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return backend.omap_clear(os, osd_op, txn, *osd_op_params, delta_stats);
+    });
+
+  // watch/notify
+  case CEPH_OSD_OP_WATCH:
+    return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
+      return do_op_watch(osd_op, os, txn);
+    }, modified_by::sys);
+  case CEPH_OSD_OP_LIST_WATCHERS:
+    return do_read_op([this, &osd_op](auto&, const auto& os) {
+      return do_op_list_watchers(osd_op, os);
+    });
+  case CEPH_OSD_OP_NOTIFY:
+    return do_read_op([this, &osd_op](auto&, const auto& os) {
+      return do_op_notify(osd_op, os);
+    });
+  case CEPH_OSD_OP_NOTIFY_ACK:
+    return do_read_op([this, &osd_op](auto&, const auto& os) {
+      return do_op_notify_ack(osd_op, os);
+    });
+  case CEPH_OSD_OP_ASSERT_VER:
+    return do_read_op([this, &osd_op](auto&, const auto& os) {
+      return do_assert_ver(osd_op, os);
+    });
+  case CEPH_OSD_OP_LIST_SNAPS:
+    return do_snapset_op([this, &osd_op](const auto &os, const auto &ss) {
+      return do_list_snaps(osd_op, os, ss);
+    });
+
+  default:
+    logger().warn("unknown op {}", ceph_osd_op_name(op.op));
+    throw std::runtime_error(
+      fmt::format("op '{}' not supported", ceph_osd_op_name(op.op)));
+  }
+}
+
+OpsExecuter::rep_op_fut_t
+OpsExecuter::flush_changes_and_submit(
+  const std::vector<OSDOp>& ops,
+  SnapMapper& snap_mapper,
+  OSDriver& osdriver)
+{
+  const bool want_mutate = !txn.empty();
+  // osd_op_params are instantiated by every wr-like operation.
+  assert(osd_op_params || !want_mutate);
+  assert(obc);
+
+  auto submitted = interruptor::now();
+  auto all_completed = interruptor::now();
+
+  if (cloning_ctx) {
+    ceph_assert(want_mutate);
+  }
+
+  apply_stats();
+  if (want_mutate) {
+    osd_op_params->at_version = pg->get_next_version();
+    osd_op_params->pg_trim_to = pg->get_pg_trim_to();
+    osd_op_params->pg_committed_to = pg->get_pg_committed_to();
+    osd_op_params->last_complete = pg->get_info().last_complete;
+
+    std::vector<pg_log_entry_t> log_entries;
+
+    if (cloning_ctx) {
+      log_entries.emplace_back(complete_cloning_ctx());
+    }
+
+    log_entries.emplace_back(prepare_head_update(ops, txn));
+
+    if (auto log_rit = log_entries.rbegin(); log_rit != log_entries.rend()) {
+      ceph_assert(log_rit->version == osd_op_params->at_version);
+    }
+    auto [_submitted, _all_completed] = co_await pg->submit_transaction(
+      std::move(obc),
+      cloning_ctx ? std::move(cloning_ctx->clone_obc) : nullptr,
+      std::move(txn),
+      std::move(*osd_op_params),
+      std::move(log_entries)
+    );
+
+    submitted = std::move(_submitted);
+    all_completed = std::move(_all_completed);
+  }
+
+  if (op_effects.size()) [[unlikely]] {
+    // need extra ref pg due to apply_stats() which can be executed after
+    // informing snap mapper
+    all_completed =
+      std::move(all_completed).then_interruptible([this, pg=this->pg] {
+      // let's do the cleaning of `op_effects` in destructor
+      return interruptor::do_for_each(op_effects,
+        [pg=std::move(pg)](auto& op_effect) {
+        return op_effect->execute(pg);
+      });
+    });
+  }
+
+  co_return std::make_tuple(
+    std::move(submitted),
+    std::move(all_completed));
+}
+
+pg_log_entry_t OpsExecuter::prepare_head_update(
+  const std::vector<OSDOp>& ops,
+  ceph::os::Transaction &txn)
+{
+  LOG_PREFIX(OpsExecuter::prepare_head_update);
+  assert(obc->obs.oi.soid.snap >= CEPH_MAXSNAP);
+  assert(obc->obs.oi.soid.is_head());
+
+  update_clone_overlap();
+  if (cloning_ctx) {
+    obc->ssc->snapset = std::move(cloning_ctx->new_snapset);
+  }
+  if (snapc.seq > obc->ssc->snapset.seq) {
+     // update snapset with latest snap context
+     obc->ssc->snapset.seq = snapc.seq;
+  }
+
+  pg_log_entry_t ret{
+    obc->obs.exists ?
+      pg_log_entry_t::MODIFY : pg_log_entry_t::DELETE,
+    obc->obs.oi.soid,
+    osd_op_params->at_version,
+    obc->obs.oi.version,
+    osd_op_params->user_modify ? osd_op_params->at_version.version : 0,
+    osd_op_params->req_id,
+    osd_op_params->mtime,
+    op_info.allows_returnvec() && !ops.empty() ? ops.back().rval.code : 0};
+
+  if (op_info.allows_returnvec()) {
+    // also the per-op values are recorded in the pg log
+    ret.set_op_returns(ops);
+    DEBUGDPP("op returns: {}", *pg, ret.op_returns);
+  }
+  ret.clean_regions = std::move(osd_op_params->clean_regions);
+
+
+  if (obc->obs.exists) {
+    obc->obs.oi.prior_version = obc->obs.oi.version;
+    obc->obs.oi.version = osd_op_params->at_version;
+    if (osd_op_params->user_modify)
+      obc->obs.oi.user_version = osd_op_params->at_version.version;
+    obc->obs.oi.last_reqid = osd_op_params->req_id;
+    obc->obs.oi.mtime = osd_op_params->mtime;
+    obc->obs.oi.local_mtime = ceph_clock_now();
+    
+    obc->ssc->exists = true;
+    pg->get_backend().set_metadata(
+      obc->obs.oi.soid,
+      obc->obs.oi,
+      obc->obs.oi.soid.is_head() ? &(obc->ssc->snapset) : nullptr,
+      txn);
+  } else {
+    // reset cached ObjectState without enforcing eviction
+    obc->obs.oi = object_info_t(obc->obs.oi.soid);
+  }
+  
+  DEBUGDPP("entry: {}", *pg, ret);
+  return ret;
+}
+
+// Defined here because there is a circular dependency between OpsExecuter and PG
+uint32_t OpsExecuter::get_pool_stripe_width() const {
+  return pg->get_pgpool().info.get_stripe_width();
+}
+
+// Defined here because there is a circular dependency between OpsExecuter and PG
+version_t OpsExecuter::get_last_user_version() const
+{
+  return pg->get_last_user_version();
+}
+
+void OpsExecuter::prepare_cloning_ctx(
+  const SnapContext& snapc,
+  const ObjectState& initial_obs,
+  const SnapSet& initial_snapset,
+  PGBackend& backend,
+  ceph::os::Transaction& txn)
+{
+  LOG_PREFIX(OpsExecuter::prepare_cloning_ctx);
+  const hobject_t& soid = initial_obs.oi.soid;
+  logger().debug("{} {} snapset={} snapc={}",
+                 __func__, soid,
+                 initial_snapset, snapc);
+
+  cloning_ctx = std::make_unique<CloningContext>();
+  cloning_ctx->new_snapset = initial_snapset;
+
+  // clone object, the snap field is set to the seq of the SnapContext
+  // at its creation.
+  cloning_ctx->coid = soid;
+  cloning_ctx->coid.snap = snapc.seq;
+
+  // existing snaps are stored in descending order in snapc,
+  // cloned_snaps vector will hold all the snaps stored until snapset.seq
+  const std::vector<snapid_t> cloned_snaps = [&] {
+    auto last = std::find_if(
+      std::begin(snapc.snaps), std::end(snapc.snaps),
+      [&](snapid_t snap_id) { return snap_id <= initial_snapset.seq; });
+    return std::vector<snapid_t>{std::begin(snapc.snaps), last};
+  }();
+
+  // make clone here, but populate in metadata in complete_cloning_ctx
+  backend.clone_for_write(soid, cloning_ctx->coid, txn);
+
+  cloning_ctx->clone_obc = prepare_clone(cloning_ctx->coid, initial_obs);
+
+  delta_stats.num_objects++;
+  if (cloning_ctx->clone_obc->obs.oi.is_omap()) {
+    delta_stats.num_objects_omap++;
+  }
+  delta_stats.num_object_clones++;
+  // newsnapset is obc's ssc
+  cloning_ctx->new_snapset.clones.push_back(cloning_ctx->coid.snap);
+  cloning_ctx->new_snapset.clone_size[cloning_ctx->coid.snap] = initial_obs.oi.size;
+  cloning_ctx->new_snapset.clone_snaps[cloning_ctx->coid.snap] = cloned_snaps;
+
+  // clone_overlap should contain an entry for each clone
+  // (an empty interval_set if there is no overlap)
+  auto &overlap = cloning_ctx->new_snapset.clone_overlap[cloning_ctx->coid.snap];
+  if (initial_obs.oi.size) {
+    overlap.insert(0, initial_obs.oi.size);
+  }
+
+  // log clone
+  DEBUGDPP("cloning v {} to {} v {} snaps={} snapset={}", *pg,
+	   initial_obs.oi.version, cloning_ctx->coid,
+	   osd_op_params->at_version, cloned_snaps, cloning_ctx->new_snapset);
+}
+
+pg_log_entry_t OpsExecuter::complete_cloning_ctx()
+{
+  ceph_assert(cloning_ctx);
+  const auto &coid = cloning_ctx->coid;
+  cloning_ctx->clone_obc->obs.oi.version = osd_op_params->at_version;
+
+  osd_op_params->at_version.version++;
+
+  pg->get_backend().set_metadata(
+    cloning_ctx->coid,
+    cloning_ctx->clone_obc->obs.oi,
+    nullptr /* snapset */,
+    txn);
+
+  pg_log_entry_t ret{
+    pg_log_entry_t::CLONE,
+    coid,
+    cloning_ctx->clone_obc->obs.oi.version,
+    cloning_ctx->clone_obc->obs.oi.prior_version,
+    cloning_ctx->clone_obc->obs.oi.user_version,
+    osd_reqid_t(),
+    cloning_ctx->clone_obc->obs.oi.mtime, // will be replaced in `apply_to()`
+    0
+  };
+  ceph_assert(cloning_ctx->new_snapset.clone_snaps.count(coid.snap));
+  encode(cloning_ctx->new_snapset.clone_snaps[coid.snap], ret.snaps);
+  ret.clean_regions.mark_data_region_dirty(0, cloning_ctx->clone_obc->obs.oi.size);
+  ret.mtime = cloning_ctx->clone_obc->obs.oi.mtime;
+  return ret;
+}
+
+void OpsExecuter::update_clone_overlap() {
+  interval_set<uint64_t> *newest_overlap;
+  if (cloning_ctx) {
+    newest_overlap =
+      &cloning_ctx->new_snapset.clone_overlap.rbegin()->second;
+  } else if (op_info.may_write() 
+    && obc->obs.exists 
+    && !obc->ssc->snapset.clones.empty()) {
+    newest_overlap =
+      &obc->ssc->snapset.clone_overlap.rbegin()->second;
+  } else {
+    return;
+  }
+
+  assert(osd_op_params);
+  osd_op_params->modified_ranges.intersection_of(*newest_overlap);
+  newest_overlap->subtract(osd_op_params->modified_ranges);
+  delta_stats.num_bytes += osd_op_params->modified_ranges.size();
+}
+
+ObjectContextRef OpsExecuter::prepare_clone(
+  const hobject_t& coid,
+  const ObjectState& initial_obs)
+{
+  ceph_assert(pg->is_primary());
+  ObjectState clone_obs{coid};
+  clone_obs.exists = true;
+  // clone_obs.oi.version will be populated in complete_cloning_ctx
+  clone_obs.oi.prior_version = initial_obs.oi.version;
+  clone_obs.oi.copy_user_bits(initial_obs.oi);
+  clone_obs.oi.clear_flag(object_info_t::FLAG_WHITEOUT);
+
+  auto [clone_obc, existed] = pg->obc_registry.get_cached_obc(std::move(coid));
+  ceph_assert(!existed);
+
+  clone_obc->set_clone_state(std::move(clone_obs));
+  clone_obc->ssc = obc->ssc;
+  return clone_obc;
+}
+
+void OpsExecuter::apply_stats()
+{
+  pg->apply_stats(get_target(), delta_stats);
+}
+
+OpsExecuter::OpsExecuter(Ref<PG> pg,
+                         ObjectContextRef _obc,
+                         const OpInfo& op_info,
+                         abstracted_msg_t&& msg,
+                         crimson::net::ConnectionXcoreRef conn,
+                         const SnapContext& _snapc)
+  : pg(std::move(pg)),
+    obc(std::move(_obc)),
+    op_info(op_info),
+    msg(std::move(msg)),
+    conn(conn),
+    snapc(_snapc)
+{
+  if (op_info.may_write() && should_clone(*obc, snapc)) {
+    do_write_op([this](auto& backend, auto& os, auto& txn) {
+      prepare_cloning_ctx(
+	std::as_const(snapc),
+	std::as_const(obc->obs),
+	std::as_const(obc->ssc->snapset),
+	backend,
+	txn);
+    });
+  }
 }
 
 static inline std::unique_ptr<const PGLSFilter> get_pgls_filter(
@@ -477,7 +1184,7 @@ static inline std::unique_ptr<const PGLSFilter> get_pgls_filter(
   return filter;
 }
 
-static seastar::future<hobject_t> pgls_filter(
+static PG::interruptible_future<hobject_t> pgls_filter(
   const PGLSFilter& filter,
   const PGBackend& backend,
   const hobject_t& sobj)
@@ -485,19 +1192,17 @@ static seastar::future<hobject_t> pgls_filter(
   if (const auto xattr = filter.get_xattr(); !xattr.empty()) {
     logger().debug("pgls_filter: filter is interested in xattr={} for obj={}",
                    xattr, sobj);
-    return backend.getxattr(sobj, xattr).safe_then(
-      [&filter, sobj] (ceph::bufferptr bp) {
+    return backend.getxattr(sobj, std::move(xattr)).safe_then_interruptible(
+      [&filter, sobj] (ceph::bufferlist val) {
         logger().debug("pgls_filter: got xvalue for obj={}", sobj);
 
-        ceph::bufferlist val;
-        val.push_back(std::move(bp));
         const bool filtered = filter.filter(sobj, val);
         return seastar::make_ready_future<hobject_t>(filtered ? sobj : hobject_t{});
       }, PGBackend::get_attr_errorator::all_same_way([&filter, sobj] {
         logger().debug("pgls_filter: got error for obj={}", sobj);
 
         if (filter.reject_empty_xattr()) {
-          return seastar::make_ready_future<hobject_t>(hobject_t{});
+          return seastar::make_ready_future<hobject_t>();
         }
         ceph::bufferlist val;
         const bool filtered = filter.filter(sobj, val);
@@ -510,7 +1215,7 @@ static seastar::future<hobject_t> pgls_filter(
   }
 }
 
-static seastar::future<ceph::bufferlist> do_pgnls_common(
+static PG::interruptible_future<ceph::bufferlist> do_pgnls_common(
   const hobject_t& pg_start,
   const hobject_t& pg_end,
   const PGBackend& backend,
@@ -526,8 +1231,10 @@ static seastar::future<ceph::bufferlist> do_pgnls_common(
     throw std::invalid_argument("outside of PG bounds");
   }
 
-  return backend.list_objects(lower_bound, limit).then(
-    [&backend, filter, nspace](auto objects, auto next) {
+  return backend.list_objects(lower_bound, limit).then_interruptible(
+    [&backend, filter, nspace](auto&& ret)
+    -> PG::interruptible_future<std::tuple<std::vector<hobject_t>, hobject_t>> {
+      auto& [objects, next] = ret;
       auto in_my_namespace = [&nspace](const hobject_t& obj) {
         using crimson::common::local_conf;
         if (obj.get_namespace() == local_conf()->osd_hit_set_namespace) {
@@ -538,7 +1245,8 @@ static seastar::future<ceph::bufferlist> do_pgnls_common(
           return obj.get_namespace() == nspace;
         }
       };
-      auto to_pglsed = [&backend, filter] (const hobject_t& obj) {
+      auto to_pglsed = [&backend, filter] (const hobject_t& obj)
+		       -> PG::interruptible_future<hobject_t> {
         // this transformation looks costly. However, I don't have any
         // reason to think PGLS* operations are critical for, let's say,
         // general performance.
@@ -563,11 +1271,13 @@ static seastar::future<ceph::bufferlist> do_pgnls_common(
           // the sole purpose of this chaining is to pass `next` to 2nd
           // stage altogether with items
           logger().debug("do_pgnls_common: 1st done");
-          return seastar::make_ready_future<decltype(items), decltype(next)>(
-            std::move(items), std::move(next));
+          return seastar::make_ready_future<
+            std::tuple<std::vector<hobject_t>, hobject_t>>(
+              std::move(items), std::move(next));
       });
-  }).then(
-    [pg_end, filter] (const std::vector<hobject_t>& items, auto next) {
+  }).then_interruptible(
+    [pg_end] (auto&& ret) {
+      auto& [items, next] = ret;
       auto is_matched = [] (const auto& obj) {
         return !obj.is_min();
       };
@@ -583,13 +1293,13 @@ static seastar::future<ceph::bufferlist> do_pgnls_common(
       response.handle = next.is_max() ? pg_end : next;
       ceph::bufferlist out;
       encode(response, out);
-      logger().debug("{}: response.entries.size()=",
-                     __func__, response.entries.size());
+      logger().debug("do_pgnls_common: response.entries.size()= {}",
+                     response.entries.size());
       return seastar::make_ready_future<ceph::bufferlist>(std::move(out));
   });
 }
 
-static seastar::future<> do_pgnls(
+static PG::interruptible_future<> do_pgnls(
   const PG& pg,
   const std::string& nspace,
   OSDOp& osd_op)
@@ -602,7 +1312,7 @@ static seastar::future<> do_pgnls(
   }
   const auto pg_start = pg.get_pgid().pgid.get_hobj_start();
   const auto pg_end = \
-    pg.get_pgid().pgid.get_hobj_end(pg.get_pool().info.get_pg_num());
+    pg.get_pgid().pgid.get_hobj_end(pg.get_pgpool().info.get_pg_num());
   return do_pgnls_common(pg_start,
                          pg_end,
                          pg.get_backend(),
@@ -610,13 +1320,13 @@ static seastar::future<> do_pgnls(
                          nspace,
                          osd_op.op.pgls.count,
                          nullptr /* no filter */)
-    .then([&osd_op](bufferlist bl) {
+    .then_interruptible([&osd_op](bufferlist bl) {
       osd_op.outdata = std::move(bl);
       return seastar::now();
   });
 }
 
-static seastar::future<> do_pgnls_filtered(
+static PG::interruptible_future<> do_pgnls_filtered(
   const PG& pg,
   const std::string& nspace,
   OSDOp& osd_op)
@@ -646,7 +1356,7 @@ static seastar::future<> do_pgnls_filtered(
   return seastar::do_with(std::move(filter),
     [&, lower_bound=std::move(lower_bound)](auto&& filter) {
       const auto pg_start = pg.get_pgid().pgid.get_hobj_start();
-      const auto pg_end = pg.get_pgid().pgid.get_hobj_end(pg.get_pool().info.get_pg_num());
+      const auto pg_end = pg.get_pgid().pgid.get_hobj_end(pg.get_pgpool().info.get_pg_num());
       return do_pgnls_common(pg_start,
                              pg_end,
                              pg.get_backend(),
@@ -654,124 +1364,14 @@ static seastar::future<> do_pgnls_filtered(
                              nspace,
                              osd_op.op.pgls.count,
                              filter.get())
-        .then([&osd_op](bufferlist bl) {
+        .then_interruptible([&osd_op](bufferlist bl) {
           osd_op.outdata = std::move(bl);
           return seastar::now();
       });
   });
 }
 
-OpsExecuter::osd_op_errorator::future<>
-OpsExecuter::execute_osd_op(OSDOp& osd_op)
-{
-  // TODO: dispatch via call table?
-  // TODO: we might want to find a way to unify both input and output
-  // of each op.
-  logger().debug(
-    "handling op {} on object {}",
-    ceph_osd_op_name(osd_op.op.op),
-    get_target());
-  switch (const ceph_osd_op& op = osd_op.op; op.op) {
-  case CEPH_OSD_OP_SYNC_READ:
-    [[fallthrough]];
-  case CEPH_OSD_OP_READ:
-    return do_read_op([&osd_op] (auto& backend, const auto& os) {
-      return backend.read(os.oi,
-                          osd_op.op.extent.offset,
-                          osd_op.op.extent.length,
-                          osd_op.op.extent.truncate_size,
-                          osd_op.op.extent.truncate_seq,
-                          osd_op.op.flags).safe_then(
-        [&osd_op](ceph::bufferlist&& bl) {
-          osd_op.rval = bl.length();
-          osd_op.outdata = std::move(bl);
-          return osd_op_errorator::now();
-        });
-    });
-  case CEPH_OSD_OP_GETXATTR:
-    return do_read_op([&osd_op] (auto& backend, const auto& os) {
-      return backend.getxattr(os, osd_op);
-    });
-  case CEPH_OSD_OP_CREATE:
-    return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
-      return backend.create(os, osd_op, txn);
-    }, true);
-  case CEPH_OSD_OP_WRITE:
-    return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
-      return backend.write(os, osd_op, txn);
-    }, true);
-  case CEPH_OSD_OP_WRITEFULL:
-    return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
-      return backend.writefull(os, osd_op, txn);
-    }, true);
-  case CEPH_OSD_OP_SETALLOCHINT:
-    return osd_op_errorator::now();
-  case CEPH_OSD_OP_SETXATTR:
-    return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
-      return backend.setxattr(os, osd_op, txn);
-    }, true);
-  case CEPH_OSD_OP_DELETE:
-    return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
-      return backend.remove(os, txn);
-    }, true);
-  case CEPH_OSD_OP_CALL:
-    return this->do_op_call(osd_op);
-  case CEPH_OSD_OP_STAT:
-    // note: stat does not require RD
-    return do_const_op([&osd_op] (/* const */auto& backend, const auto& os) {
-      return backend.stat(os, osd_op);
-    });
-  case CEPH_OSD_OP_TMAPUP:
-    // TODO: there was an effort to kill TMAP in ceph-osd. According to
-    // @dzafman this isn't possible yet. Maybe it could be accomplished
-    // before crimson's readiness and we'd luckily don't need to carry.
-    return dont_do_legacy_op();
-
-  // OMAP
-  case CEPH_OSD_OP_OMAPGETKEYS:
-    return do_read_op([&osd_op] (auto& backend, const auto& os) {
-      return backend.omap_get_keys(os, osd_op);
-    });
-  case CEPH_OSD_OP_OMAPGETVALS:
-    return do_read_op([&osd_op] (auto& backend, const auto& os) {
-      return backend.omap_get_vals(os, osd_op);
-    });
-  case CEPH_OSD_OP_OMAPGETVALSBYKEYS:
-    return do_read_op([&osd_op] (auto& backend, const auto& os) {
-      return backend.omap_get_vals_by_keys(os, osd_op);
-    });
-  case CEPH_OSD_OP_OMAPSETVALS:
-#if 0
-    if (!pg.get_pool().info.supports_omap()) {
-      return crimson::ct_error::operation_not_supported::make();
-    }
-#endif
-    return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
-      return backend.omap_set_vals(os, osd_op, txn);
-    }, true);
-
-  // watch/notify
-  case CEPH_OSD_OP_WATCH:
-    return do_write_op([this, &osd_op] (auto& backend, auto& os, auto& txn) {
-      return do_op_watch(osd_op, os, txn);
-    }, false);
-  case CEPH_OSD_OP_NOTIFY:
-    return do_read_op([this, &osd_op] (auto&, const auto& os) {
-      return do_op_notify(osd_op, os);
-    });
-  case CEPH_OSD_OP_NOTIFY_ACK:
-    return do_read_op([this, &osd_op] (auto&, const auto& os) {
-      return do_op_notify_ack(osd_op, os);
-    });
-
-  default:
-    logger().warn("unknown op {}", ceph_osd_op_name(op.op));
-    throw std::runtime_error(
-      fmt::format("op '{}' not supported", ceph_osd_op_name(op.op)));
-  }
-}
-
-static seastar::future<ceph::bufferlist> do_pgls_common(
+static PG::interruptible_future<ceph::bufferlist> do_pgls_common(
   const hobject_t& pg_start,
   const hobject_t& pg_end,
   const PGBackend& backend,
@@ -788,11 +1388,13 @@ static seastar::future<ceph::bufferlist> do_pgls_common(
   }
 
   using entries_t = decltype(pg_ls_response_t::entries);
-  return backend.list_objects(lower_bound, limit).then(
-    [&backend, filter, nspace](auto objects, auto next) {
-      return seastar::when_all_succeed(
-        seastar::map_reduce(std::move(objects),
-          [&backend, filter, nspace](const hobject_t& obj) {
+  return backend.list_objects(lower_bound, limit).then_interruptible(
+    [&backend, filter, nspace](auto&& ret) {
+      auto& [objects, next] = ret;
+      return PG::interruptor::when_all(
+        PG::interruptor::map_reduce(std::move(objects),
+          [&backend, filter, nspace](const hobject_t& obj)
+	  -> PG::interruptible_future<hobject_t>{
             if (obj.get_namespace() == nspace) {
               if (filter) {
                 return pgls_filter(*filter, backend, obj);
@@ -800,18 +1402,20 @@ static seastar::future<ceph::bufferlist> do_pgls_common(
                 return seastar::make_ready_future<hobject_t>(obj);
               }
             } else {
-              return seastar::make_ready_future<hobject_t>(hobject_t{});
+              return seastar::make_ready_future<hobject_t>();
             }
           },
           entries_t{},
-          [](entries_t&& entries, hobject_t obj) {
+          [](entries_t entries, hobject_t obj) {
             if (!obj.is_min()) {
               entries.emplace_back(obj.oid, obj.get_key());
             }
             return entries;
           }),
         seastar::make_ready_future<hobject_t>(next));
-    }).then([pg_end](entries_t entries, hobject_t next) {
+    }).then_interruptible([pg_end](auto&& ret) {
+      auto entries = std::move(std::get<0>(ret).get());
+      auto next = std::move(std::get<1>(ret).get());
       pg_ls_response_t response;
       response.handle = next.is_max() ? pg_end : next;
       response.entries = std::move(entries);
@@ -823,7 +1427,7 @@ static seastar::future<ceph::bufferlist> do_pgls_common(
   });
 }
 
-static seastar::future<> do_pgls(
+static PG::interruptible_future<> do_pgls(
    const PG& pg,
    const std::string& nspace,
    OSDOp& osd_op)
@@ -837,7 +1441,7 @@ static seastar::future<> do_pgls(
   }
   const auto pg_start = pg.get_pgid().pgid.get_hobj_start();
   const auto pg_end =
-    pg.get_pgid().pgid.get_hobj_end(pg.get_pool().info.get_pg_num());
+    pg.get_pgid().pgid.get_hobj_end(pg.get_pgpool().info.get_pg_num());
   return do_pgls_common(pg_start,
 			pg_end,
 			pg.get_backend(),
@@ -845,13 +1449,13 @@ static seastar::future<> do_pgls(
 			nspace,
 			osd_op.op.pgls.count,
 			nullptr /* no filter */)
-    .then([&osd_op](bufferlist bl) {
+    .then_interruptible([&osd_op](bufferlist bl) {
       osd_op.outdata = std::move(bl);
       return seastar::now();
     });
 }
 
-static seastar::future<> do_pgls_filtered(
+static PG::interruptible_future<> do_pgls_filtered(
   const PG& pg,
   const std::string& nspace,
   OSDOp& osd_op)
@@ -881,7 +1485,7 @@ static seastar::future<> do_pgls_filtered(
   return seastar::do_with(std::move(filter),
     [&, lower_bound=std::move(lower_bound)](auto&& filter) {
       const auto pg_start = pg.get_pgid().pgid.get_hobj_start();
-      const auto pg_end = pg.get_pgid().pgid.get_hobj_end(pg.get_pool().info.get_pg_num());
+      const auto pg_end = pg.get_pgid().pgid.get_hobj_end(pg.get_pgpool().info.get_pg_num());
       return do_pgls_common(pg_start,
                             pg_end,
                             pg.get_backend(),
@@ -889,34 +1493,26 @@ static seastar::future<> do_pgls_filtered(
                             nspace,
                             osd_op.op.pgls.count,
                             filter.get())
-        .then([&osd_op](bufferlist bl) {
+        .then_interruptible([&osd_op](bufferlist bl) {
           osd_op.outdata = std::move(bl);
           return seastar::now();
       });
   });
 }
 
-seastar::future<>
-OpsExecuter::execute_pg_op(OSDOp& osd_op)
+PgOpsExecuter::interruptible_future<>
+PgOpsExecuter::execute_op(OSDOp& osd_op)
 {
-  logger().warn("handling op {}", ceph_osd_op_name(osd_op.op.op));
+  logger().debug("handling op {}", ceph_osd_op_name(osd_op.op.op));
   switch (const ceph_osd_op& op = osd_op.op; op.op) {
   case CEPH_OSD_OP_PGLS:
-    return do_pg_op([&osd_op] (const auto& pg, const auto& nspace) {
-      return do_pgls(pg, nspace, osd_op);
-    });
+    return do_pgls(pg, nspace, osd_op);
   case CEPH_OSD_OP_PGLS_FILTER:
-    return do_pg_op([&osd_op] (const auto& pg, const auto& nspace) {
-      return do_pgls_filtered(pg, nspace, osd_op);
-    });
+    return do_pgls_filtered(pg, nspace, osd_op);
   case CEPH_OSD_OP_PGNLS:
-    return do_pg_op([&osd_op] (const auto& pg, const auto& nspace) {
-      return do_pgnls(pg, nspace, osd_op);
-    });
+    return do_pgnls(pg, nspace, osd_op);
   case CEPH_OSD_OP_PGNLS_FILTER:
-    return do_pg_op([&osd_op] (const auto& pg, const auto& nspace) {
-      return do_pgnls_filtered(pg, nspace, osd_op);
-    });
+    return do_pgnls_filtered(pg, nspace, osd_op);
   default:
     logger().warn("unknown op {}", ceph_osd_op_name(op.op));
     throw std::runtime_error(

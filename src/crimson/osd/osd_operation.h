@@ -3,41 +3,129 @@
 
 #pragma once
 
-#include <algorithm>
-#include <array>
-#include <set>
-#include <vector>
-#include <boost/intrusive/list.hpp>
-#include <boost/intrusive_ptr.hpp>
-#include <boost/smart_ptr/intrusive_ref_counter.hpp>
-#include <seastar/core/shared_mutex.hh>
-#include <seastar/core/future.hh>
+#include "crimson/common/operation.h"
+#include "crimson/osd/pg_interval_interrupt_condition.h"
+#include "crimson/osd/scheduler/scheduler.h"
+#include "osd/osd_types.h"
 
-#include "include/ceph_assert.h"
-
-namespace ceph {
-  class Formatter;
+namespace crimson::os::seastore {
+  template<class OpT>
+  class OperationProxyT;
 }
 
 namespace crimson::osd {
 
+/// Ordering stages for a class of operations ordered by PG.
+struct ConnectionPipeline {
+  struct AwaitActive : OrderedExclusivePhaseT<AwaitActive> {
+    static constexpr auto type_name =
+      "ConnectionPipeline::await_active";
+  } await_active;
+
+  struct AwaitMap : OrderedExclusivePhaseT<AwaitMap> {
+    static constexpr auto type_name =
+      "ConnectionPipeline::await_map";
+  } await_map;
+
+  struct GetPGMapping : OrderedExclusivePhaseT<GetPGMapping> {
+    static constexpr auto type_name =
+      "ConnectionPipeline::get_pg_mapping";
+  } get_pg_mapping;
+};
+
+struct PerShardPipeline {
+  struct CreateOrWaitPG : OrderedExclusivePhaseT<CreateOrWaitPG> {
+    static constexpr auto type_name =
+      "PerShardPipeline::create_or_wait_pg";
+  } create_or_wait_pg;
+};
+
+struct PGPeeringPipeline {
+  struct AwaitMap : OrderedExclusivePhaseT<AwaitMap> {
+    static constexpr auto type_name = "PeeringEvent::PGPipeline::await_map";
+  } await_map;
+  struct Process : OrderedExclusivePhaseT<Process> {
+    static constexpr auto type_name = "PeeringEvent::PGPipeline::process";
+  } process;
+};
+
+struct CommonPGPipeline {
+  struct WaitPGReady : OrderedConcurrentPhaseT<WaitPGReady> {
+    static constexpr auto type_name = "CommonPGPipeline:::wait_pg_ready";
+  } wait_pg_ready;
+  struct GetOBC : OrderedExclusivePhaseT<GetOBC> {
+    static constexpr auto type_name = "CommonPGPipeline:::get_obc";
+  } get_obc;
+};
+
+struct PGRepopPipeline {
+  struct Process : OrderedExclusivePhaseT<Process> {
+    static constexpr auto type_name = "PGRepopPipeline::process";
+  } process;
+  struct WaitCommit : OrderedConcurrentPhaseT<WaitCommit> {
+    static constexpr auto type_name = "PGRepopPipeline::wait_repop";
+  } wait_commit;
+  struct SendReply : OrderedExclusivePhaseT<SendReply> {
+    static constexpr auto type_name = "PGRepopPipeline::send_reply";
+  } send_reply;
+};
+
+struct CommonOBCPipeline {
+  struct Process : OrderedExclusivePhaseT<Process> {
+    static constexpr auto type_name = "CommonOBCPipeline::process";
+  } process;
+  struct WaitRepop : OrderedConcurrentPhaseT<WaitRepop> {
+    static constexpr auto type_name = "CommonOBCPipeline::wait_repop";
+  } wait_repop;
+  struct SendReply : OrderedExclusivePhaseT<SendReply> {
+    static constexpr auto type_name = "CommonOBCPipeline::send_reply";
+  } send_reply;
+};
+
+
 enum class OperationTypeCode {
   client_request = 0,
-  peering_event = 1,
-  compound_peering_request = 2,
-  pg_advance_map = 3,
-  pg_creation = 4,
-  replicated_request = 5,
-  last_op = 6
+  peering_event,
+  pg_advance_map,
+  pg_creation,
+  replicated_request,
+  background_recovery,
+  background_recovery_sub,
+  internal_client_request,
+  historic_client_request,
+  historic_slow_client_request,
+  logmissing_request,
+  logmissing_request_reply,
+  snaptrim_event,
+  snaptrimobj_subevent,
+  scrub_requested,
+  scrub_message,
+  scrub_find_range,
+  scrub_reserve_range,
+  scrub_scan,
+  last_op
 };
 
 static constexpr const char* const OP_NAMES[] = {
   "client_request",
   "peering_event",
-  "compound_peering_request",
   "pg_advance_map",
   "pg_creation",
   "replicated_request",
+  "background_recovery",
+  "background_recovery_sub",
+  "internal_client_request",
+  "historic_client_request",
+  "historic_slow_client_request",
+  "logmissing_request",
+  "logmissing_request_reply",
+  "snaptrim_event",
+  "snaptrimobj_subevent",
+  "scrub_requested",
+  "scrub_message",
+  "scrub_find_range",
+  "scrub_reserve_range",
+  "scrub_scan",
 };
 
 // prevent the addition of OperationTypeCode-s with no matching OP_NAMES entry:
@@ -45,143 +133,24 @@ static_assert(
   (sizeof(OP_NAMES)/sizeof(OP_NAMES[0])) ==
   static_cast<int>(OperationTypeCode::last_op));
 
-class OperationRegistry;
-
-using registry_hook_t = boost::intrusive::list_member_hook<
-  boost::intrusive::link_mode<boost::intrusive::auto_unlink>>;
-
-class Operation;
-class Blocker;
-
-/**
- * Provides an abstraction for registering and unregistering a blocker
- * for the duration of a future becoming available.
- */
-template <typename... T>
-class blocking_future {
-  friend class Operation;
-  friend class Blocker;
-  Blocker *blocker;
-  seastar::future<T...> fut;
-  blocking_future(Blocker *b, seastar::future<T...> &&f)
-    : blocker(b), fut(std::move(f)) {}
-
-  template <typename... V, typename... U>
-  friend blocking_future<V...> make_ready_blocking_future(U&&... args);
-};
-
-template <typename... V, typename... U>
-blocking_future<V...> make_ready_blocking_future(U&&... args) {
-  return blocking_future<V...>(
-    nullptr,
-    seastar::make_ready_future<V...>(std::forward<U>(args)...));
-}
-
-/**
- * Provides an interface for dumping diagnostic information about
- * why a particular op is not making progress.
- */
-class Blocker {
-protected:
-  virtual void dump_detail(ceph::Formatter *f) const = 0;
-
-public:
-  template <typename... T>
-  blocking_future<T...> make_blocking_future(seastar::future<T...> &&f) {
-    return blocking_future(this, std::move(f));
-  }
-
-  void dump(ceph::Formatter *f) const;
-
-  virtual const char *get_type_name() const = 0;
-
-  virtual ~Blocker() = default;
+struct InterruptibleOperation : Operation {
+  template <typename ValuesT = void>
+  using interruptible_future =
+    ::crimson::interruptible::interruptible_future<
+      ::crimson::osd::IOInterruptCondition, ValuesT>;
+  using interruptor =
+    ::crimson::interruptible::interruptor<
+      ::crimson::osd::IOInterruptCondition>;
 };
 
 template <typename T>
-class BlockerT : public Blocker {
-public:
-  const char *get_type_name() const final {
-    return T::type_name;
-  }
-
-  virtual ~BlockerT() = default;
-};
-
-/**
- * Common base for all crimson-osd operations.  Mainly provides
- * an interface for registering ops in flight and dumping
- * diagnostic information.
- */
-class Operation : public boost::intrusive_ref_counter<
-  Operation, boost::thread_unsafe_counter> {
- public:
-  uint64_t get_id() const {
-    return id;
-  }
-
-  virtual OperationTypeCode get_type() const = 0;
-  virtual const char *get_type_name() const = 0;
-  virtual void print(std::ostream &) const = 0;
-
-  template <typename... T>
-  seastar::future<T...> with_blocking_future(blocking_future<T...> &&f) {
-    if (f.fut.available()) {
-      return std::move(f.fut);
-    }
-    assert(f.blocker);
-    add_blocker(f.blocker);
-    return std::move(f.fut).then_wrapped([this, blocker=f.blocker](auto &&arg) {
-      clear_blocker(blocker);
-      return std::move(arg);
-    });
-  }
-
-  void dump(ceph::Formatter *f);
-  void dump_brief(ceph::Formatter *f);
-  virtual ~Operation() = default;
-
- protected:
-  virtual void dump_detail(ceph::Formatter *f) const = 0;
-
- private:
-  registry_hook_t registry_hook;
-
-  std::vector<Blocker*> blockers;
-  uint64_t id = 0;
-  void set_id(uint64_t in_id) {
-    id = in_id;
-  }
-
-  void add_blocker(Blocker *b) {
-    blockers.push_back(b);
-  }
-
-  void clear_blocker(Blocker *b) {
-    auto iter = std::find(blockers.begin(), blockers.end(), b);
-    if (iter != blockers.end()) {
-      blockers.erase(iter);
-    }
-  }
-
-  friend class OperationRegistry;
-};
-using OperationRef = boost::intrusive_ptr<Operation>;
-
-std::ostream &operator<<(std::ostream &, const Operation &op);
-
-template <typename T>
-class OperationT : public Operation {
-
-protected:
-  virtual void dump_detail(ceph::Formatter *f) const = 0;
-
-public:
+struct OperationT : InterruptibleOperation {
   static constexpr const char *type_name = OP_NAMES[static_cast<int>(T::type)];
   using IRef = boost::intrusive_ptr<T>;
+  using ICRef = boost::intrusive_ptr<const T>;
 
-  OperationTypeCode get_type() const final {
-    return T::type;
+  unsigned get_type() const final {
+    return static_cast<unsigned>(T::type);
   }
 
   const char *get_type_name() const final {
@@ -189,93 +158,222 @@ public:
   }
 
   virtual ~OperationT() = default;
+
+private:
+  virtual void dump_detail(ceph::Formatter *f) const = 0;
+};
+
+template <class T>
+class TrackableOperationT : public OperationT<T> {
+  T* that() {
+    return static_cast<T*>(this);
+  }
+  const T* that() const {
+    return static_cast<const T*>(this);
+  }
+
+protected:
+  template<class EventT>
+  decltype(auto) get_event() {
+    // all out derivates are supposed to define the list of tracking
+    // events accessible via `std::get`. This will usually boil down
+    // into an instance of `std::tuple`.
+    return std::get<EventT>(that()->tracking_events);
+  }
+
+  template<class EventT>
+  decltype(auto) get_event() const {
+    return std::get<EventT>(that()->tracking_events);
+  }
+
+  using OperationT<T>::OperationT;
+
+  struct StartEvent : TimeEvent<StartEvent> {};
+  struct CompletionEvent : TimeEvent<CompletionEvent> {};
+
+  template <class EventT, class... Args>
+  void track_event(Args&&... args) {
+    // the idea is to have a visitor-like interface that allows to double
+    // dispatch (backend, blocker type)
+    get_event<EventT>().trigger(*that(), std::forward<Args>(args)...);
+  }
+
+  template <class BlockingEventT>
+  typename BlockingEventT::template Trigger<T>
+  get_trigger() {
+    return {get_event<BlockingEventT>(), *that()};
+  }
+
+  template <class BlockingEventT, class InterruptorT=void, class F>
+  auto with_blocking_event(F&& f) {
+    auto ret = std::forward<F>(f)(get_trigger<BlockingEventT>());
+    if constexpr (std::is_same_v<InterruptorT, void>) {
+      return ret;
+    } else {
+      using ret_t = decltype(ret);
+      return typename InterruptorT::template futurize_t<ret_t>{std::move(ret)};
+    }
+  }
+
+public:
+  static constexpr bool is_trackable = true;
+  virtual bool requires_pg() const {
+    return true;
+  }
+};
+
+template <class T>
+class PhasedOperationT : public TrackableOperationT<T> {
+  using base_t = TrackableOperationT<T>;
+
+  T* that() {
+    return static_cast<T*>(this);
+  }
+  const T* that() const {
+    return static_cast<const T*>(this);
+  }
+
+protected:
+  using TrackableOperationT<T>::TrackableOperationT;
+
+  template <class InterruptorT=void, class StageT>
+  auto enter_stage(StageT& stage) {
+    return this->template with_blocking_event<typename StageT::BlockingEvent,
+	                                      InterruptorT>(
+      [&stage, this] (auto&& trigger) {
+        // delegated storing the pipeline handle to let childs to match
+        // the lifetime of pipeline with e.g. ConnectedSocket (important
+        // for ConnectionPipeline).
+        return that()->get_handle().template enter<T>(stage, std::move(trigger));
+    });
+  }
+
+  template <class StageT>
+  void enter_stage_sync(StageT& stage) {
+    that()->get_handle().template enter_sync<T>(
+        stage, this->template get_trigger<typename StageT::BlockingEvent>());
+  }
+
+  template <class OpT>
+  friend class crimson::os::seastore::OperationProxyT;
+
+  // PGShardManager::start_pg_operation needs access to enter_stage, we can make this
+  // more sophisticated later on
+  friend class PGShardManager;
 };
 
 /**
  * Maintains a set of lists of all active ops.
  */
-class OperationRegistry {
-  friend class Operation;
-  using op_list_member_option = boost::intrusive::member_hook<
-    Operation,
-    registry_hook_t,
-    &Operation::registry_hook
-    >;
-  using op_list = boost::intrusive::list<
-    Operation,
-    op_list_member_option,
-    boost::intrusive::constant_time_size<false>>;
+struct OSDOperationRegistry : OperationRegistryT<
+  static_cast<size_t>(OperationTypeCode::last_op)
+> {
+  OSDOperationRegistry();
 
-  std::array<
-    op_list,
-    static_cast<int>(OperationTypeCode::last_op)
-  > registries;
+  void do_stop() override;
 
-  std::array<
-    uint64_t,
-    static_cast<int>(OperationTypeCode::last_op)
-  > op_id_counters = {};
+  void put_historic(const class ClientRequest& op);
+  void _put_historic(
+    op_list& list,
+    const class ClientRequest& op,
+    uint64_t max);
 
-public:
-  template <typename T, typename... Args>
-  typename T::IRef create_operation(Args&&... args) {
-    typename T::IRef op = new T(std::forward<Args>(args)...);
-    registries[static_cast<int>(T::type)].push_back(*op);
-    op->set_id(op_id_counters[static_cast<int>(T::type)]++);
-    return op;
-  }
+  size_t dump_historic_client_requests(ceph::Formatter* f) const;
+  size_t dump_slowest_historic_client_requests(ceph::Formatter* f) const;
+  void visit_ops_in_flight(std::function<void(const ClientRequest&)>&& visit);
+
+private:
+  size_t num_recent_ops = 0;
+  size_t num_slow_ops = 0;
 };
-
 /**
- * Ensures that at most one op may consider itself in the phase at a time.
- * Ops will see enter() unblock in the order in which they tried to enter
- * the phase.  entering (though not necessarily waiting for the future to
- * resolve) a new phase prior to exiting the previous one will ensure that
- * the op ordering is preserved.
+ * Throttles set of currently running operations
+ *
+ * Very primitive currently, assumes all ops are equally
+ * expensive and simply limits the number that can be
+ * concurrently active.
  */
-class OrderedPipelinePhase : public Blocker {
-  const char * name;
+class OperationThrottler : public BlockerT<OperationThrottler>,
+			private md_config_obs_t {
+  friend BlockerT<OperationThrottler>;
+  static constexpr const char* type_name = "OperationThrottler";
 
-protected:
-  virtual void dump_detail(ceph::Formatter *f) const final;
-  const char *get_type_name() const final {
-    return name;
+  template <typename OperationT, typename F>
+  auto with_throttle(
+    OperationT* op,
+    crimson::osd::scheduler::params_t params,
+    F &&f) {
+    if (!max_in_progress) return f();
+    return acquire_throttle(params)
+      .then(std::forward<F>(f))
+      .then([this](auto x) {
+	release_throttle();
+	return x;
+      });
   }
 
+  template <typename OperationT, typename F>
+  seastar::future<> with_throttle_while(
+    OperationT* op,
+    crimson::osd::scheduler::params_t params,
+    F &&f) {
+    return with_throttle(op, params, f).then([this, params, op, f](bool cont) {
+      return cont
+	? seastar::yield().then([params, op, f, this] {
+	  return with_throttle_while(op, params, f); })
+	: seastar::now();
+    });
+  }
+
+
 public:
-  seastar::shared_mutex mutex;
+  OperationThrottler(ConfigProxy &conf);
 
-  /**
-   * Used to encapsulate pipeline residency state.
-   */
-  class Handle {
-    OrderedPipelinePhase *phase = nullptr;
+  std::vector<std::string> get_tracked_keys() const noexcept final;
+  void handle_conf_change(const ConfigProxy& conf,
+			  const std::set<std::string> &changed) final;
+  void update_from_config(const ConfigProxy &conf);
 
-  public:
-    Handle() = default;
+  bool available() const {
+    return !max_in_progress || in_progress < max_in_progress;
+  }
 
-    Handle(const Handle&) = delete;
-    Handle(Handle&&) = delete;
-    Handle &operator=(const Handle&) = delete;
-    Handle &operator=(Handle&&) = delete;
+  template <typename F>
+  auto with_throttle(
+    crimson::osd::scheduler::params_t params,
+    F &&f) {
+    if (!max_in_progress) return f();
+    return acquire_throttle(params)
+      .then(std::forward<F>(f))
+      .finally([this] {
+	release_throttle();
+      });
+  }
 
-    /**
-     * Returns a future which unblocks when the handle has entered the passed
-     * OrderedPipelinePhase.  If already in a phase, enter will also release
-     * that phase after placing itself in the queue for the next one to preserve
-     * ordering.
-     */
-    blocking_future<> enter(OrderedPipelinePhase &phase);
+  template <class OpT, class... Args>
+  seastar::future<> with_throttle_while(
+    BlockingEvent::Trigger<OpT>&& trigger,
+    Args&&... args) {
+    return trigger.maybe_record_blocking(
+      with_throttle_while(std::forward<Args>(args)...), *this);
+  }
 
-    /**
-     * Releases the current phase if there is one.  Called in ~Handle().
-     */
-    void exit();
+private:
+  void dump_detail(Formatter *f) const final;
 
-    ~Handle();
-  };
+  crimson::osd::scheduler::SchedulerRef scheduler;
 
-  OrderedPipelinePhase(const char *name) : name(name) {}
+  uint64_t max_in_progress = 0;
+  uint64_t in_progress = 0;
+
+  uint64_t pending = 0;
+
+  void wake();
+
+  seastar::future<> acquire_throttle(
+    crimson::osd::scheduler::params_t params);
+
+  void release_throttle();
 };
 
 }

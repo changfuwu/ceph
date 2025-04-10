@@ -4,10 +4,10 @@
 #ifndef _MSG_ASYNC_PROTOCOL_V2_
 #define _MSG_ASYNC_PROTOCOL_V2_
 
-#include <boost/container/static_vector.hpp>
-
 #include "Protocol.h"
 #include "crypto_onwire.h"
+#include "compression_meta.h"
+#include "compression_onwire.h"
 #include "frames_v2.h"
 
 class ProtocolV2 : public Protocol {
@@ -19,6 +19,7 @@ private:
     HELLO_CONNECTING,
     AUTH_CONNECTING,
     AUTH_CONNECTING_SIGN,
+    COMPRESSION_CONNECTING,
     SESSION_CONNECTING,
     SESSION_RECONNECTING,
     START_ACCEPT,
@@ -27,6 +28,7 @@ private:
     AUTH_ACCEPTING,
     AUTH_ACCEPTING_MORE,
     AUTH_ACCEPTING_SIGN,
+    COMPRESSION_ACCEPTING,
     SESSION_ACCEPTING,
     READY,
     THROTTLE_MESSAGE,
@@ -46,6 +48,7 @@ private:
                                       "HELLO_CONNECTING",
                                       "AUTH_CONNECTING",
                                       "AUTH_CONNECTING_SIGN",
+                                      "COMPRESSION_CONNECTING",
                                       "SESSION_CONNECTING",
                                       "SESSION_RECONNECTING",
                                       "START_ACCEPT",
@@ -54,6 +57,7 @@ private:
                                       "AUTH_ACCEPTING",
                                       "AUTH_ACCEPTING_MORE",
                                       "AUTH_ACCEPTING_SIGN",
+                                      "COMPRESSION_ACCEPTING",
                                       "SESSION_ACCEPTING",
                                       "READY",
                                       "THROTTLE_MESSAGE",
@@ -67,13 +71,14 @@ private:
     return statenames[state];
   }
 
-public:
   // TODO: move into auth_meta?
   ceph::crypto::onwire::rxtx_t session_stream_handlers;
+  ceph::compression::onwire::rxtx_t session_compression_handlers;
+  
 private:
   entity_name_t peer_name;
   State state;
-  uint64_t peer_required_features;
+  uint64_t peer_supported_features;  // CEPH_MSGR2_FEATURE_*
 
   uint64_t client_cookie;
   uint64_t server_cookie;
@@ -88,7 +93,12 @@ private:
     bool is_prepared {false};
     Message* m {nullptr};
   };
-  std::map<int, std::list<out_queue_entry_t>> out_queue;
+
+  /**
+   * A queue for each priority value, highest priority first.
+   */
+  std::map<int, std::list<out_queue_entry_t>, std::greater<int>> out_queue;
+
   std::list<Message *> sent;
   std::atomic<uint64_t> out_seq{0};
   std::atomic<uint64_t> in_seq{0};
@@ -97,10 +107,12 @@ private:
   using ProtFuncPtr = void (ProtocolV2::*)();
   Ct<ProtocolV2> *bannerExchangeCallback;
 
-  boost::container::static_vector<ceph::msgr::v2::segment_t,
-				  ceph::msgr::v2::MAX_NUM_SEGMENTS> rx_segments_desc;
-  boost::container::static_vector<ceph::bufferlist,
-				  ceph::msgr::v2::MAX_NUM_SEGMENTS> rx_segments_data;
+  ceph::msgr::v2::FrameAssembler tx_frame_asm;
+  ceph::msgr::v2::FrameAssembler rx_frame_asm;
+
+  ceph::bufferlist rx_preamble;
+  ceph::bufferlist rx_epilogue;
+  ceph::msgr::v2::segment_bls_t rx_segments_data;
   ceph::msgr::v2::Tag next_tag;
   utime_t backoff;  // backoff time
   utime_t recv_stamp;
@@ -115,6 +127,7 @@ private:
   bool keepalive;
   bool write_in_progress = false;
 
+  CompConnectionMeta comp_meta;
   std::ostream& _conn_prefix(std::ostream *_dout);
   void run_continuation(Ct<ProtocolV2> *pcontinuation);
   void run_continuation(Ct<ProtocolV2> &continuation);
@@ -122,12 +135,15 @@ private:
   Ct<ProtocolV2> *read(CONTINUATION_RXBPTR_TYPE<ProtocolV2> &next,
                        rx_buffer_t&& buffer);
   template <class F>
-  Ct<ProtocolV2> *write(const std::string &desc,
+  Ct<ProtocolV2> *write(std::string_view desc,
                         CONTINUATION_TYPE<ProtocolV2> &next,
 			F &frame);
-  Ct<ProtocolV2> *write(const std::string &desc,
+  Ct<ProtocolV2> *write(std::string_view desc,
                         CONTINUATION_TYPE<ProtocolV2> &next,
                         ceph::bufferlist &buffer);
+
+  template <class F>
+  bool append_frame(F& frame);
 
   void requeue_sent();
   uint64_t discard_requeued_up_to(uint64_t out_seq, uint64_t seq);
@@ -140,9 +156,8 @@ private:
   void prepare_send_message(uint64_t features, Message *m);
   out_queue_entry_t _get_next_outgoing();
   ssize_t write_message(Message *m, bool more);
-  void append_keepalive();
-  void append_keepalive_ack(utime_t &timestamp);
   void handle_message_ack(uint64_t seq);
+  void reset_compression();
 
   CONTINUATION_DECL(ProtocolV2, _wait_for_peer_banner);
   READ_BPTR_HANDLER_CONTINUATION_DECL(ProtocolV2, _handle_peer_banner);
@@ -162,16 +177,21 @@ private:
   CONTINUATION_DECL(ProtocolV2, throttle_message);
   CONTINUATION_DECL(ProtocolV2, throttle_bytes);
   CONTINUATION_DECL(ProtocolV2, throttle_dispatch_queue);
+  CONTINUATION_DECL(ProtocolV2, finish_compression);
 
   Ct<ProtocolV2> *read_frame();
   Ct<ProtocolV2> *finish_auth();
   Ct<ProtocolV2> *finish_client_auth();
+  Ct<ProtocolV2> *finish_server_auth();
   Ct<ProtocolV2> *handle_read_frame_preamble_main(rx_buffer_t &&buffer, int r);
   Ct<ProtocolV2> *read_frame_segment();
   Ct<ProtocolV2> *handle_read_frame_segment(rx_buffer_t &&rx_buffer, int r);
+  Ct<ProtocolV2> *_handle_read_frame_segment();
   Ct<ProtocolV2> *handle_read_frame_epilogue_main(rx_buffer_t &&buffer, int r);
+  Ct<ProtocolV2> *_handle_read_frame_epilogue_main();
   Ct<ProtocolV2> *handle_read_frame_dispatch();
   Ct<ProtocolV2> *handle_frame_payload();
+  Ct<ProtocolV2> *finish_compression();
 
   Ct<ProtocolV2> *ready();
 
@@ -179,7 +199,6 @@ private:
   Ct<ProtocolV2> *throttle_message();
   Ct<ProtocolV2> *throttle_bytes();
   Ct<ProtocolV2> *throttle_dispatch_queue();
-  Ct<ProtocolV2> *read_message_data_prepare();
 
   Ct<ProtocolV2> *handle_keepalive2(ceph::bufferlist &payload);
   Ct<ProtocolV2> *handle_keepalive2_ack(ceph::bufferlist &payload);
@@ -204,6 +223,8 @@ public:
   virtual void write_event() override;
   virtual bool is_queued() override;
 
+  virtual void dump(Formatter *f) override;
+
 private:
   // Client Protocol
   CONTINUATION_DECL(ProtocolV2, start_client_banner_exchange);
@@ -220,6 +241,7 @@ private:
   Ct<ProtocolV2> *handle_auth_reply_more(ceph::bufferlist &payload);
   Ct<ProtocolV2> *handle_auth_done(ceph::bufferlist &payload);
   Ct<ProtocolV2> *handle_auth_signature(ceph::bufferlist &payload);
+  Ct<ProtocolV2> *start_session_connect();
   Ct<ProtocolV2> *send_client_ident();
   Ct<ProtocolV2> *send_reconnect();
   Ct<ProtocolV2> *handle_ident_missing_features(ceph::bufferlist &payload);
@@ -229,6 +251,9 @@ private:
   Ct<ProtocolV2> *handle_wait(ceph::bufferlist &payload);
   Ct<ProtocolV2> *handle_reconnect_ok(ceph::bufferlist &payload);
   Ct<ProtocolV2> *handle_server_ident(ceph::bufferlist &payload);
+  Ct<ProtocolV2> *send_compression_request();
+  Ct<ProtocolV2> *handle_compression_done(ceph::bufferlist &payload);
+
 
   // Server Protocol
   CONTINUATION_DECL(ProtocolV2, start_server_banner_exchange);
@@ -250,9 +275,8 @@ private:
   Ct<ProtocolV2> *send_server_ident();
   Ct<ProtocolV2> *send_reconnect_ok();
   Ct<ProtocolV2> *server_ready();
+  Ct<ProtocolV2> *handle_compression_request(ceph::bufferlist &payload);
 
-  uint32_t get_onwire_size(uint32_t logical_size) const;
-  uint32_t get_epilogue_size() const;
   size_t get_current_msg_size() const;
 };
 

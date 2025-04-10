@@ -2,11 +2,14 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "BitmapFreelistManager.h"
+
+#include <bit>
 #include "kv/KeyValueDB.h"
 #include "os/kv.h"
 #include "include/stringify.h"
 
 #include "common/debug.h"
+#include "common/strtol.h" // for strict_iecstrtoll()
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_bluestore
@@ -68,7 +71,7 @@ int BitmapFreelistManager::create(uint64_t new_size, uint64_t granularity,
 				  KeyValueDB::Transaction txn)
 {
   bytes_per_block = granularity;
-  ceph_assert(isp2(bytes_per_block));
+  ceph_assert(std::has_single_bit(bytes_per_block));
   size = p2align(new_size, bytes_per_block);
   blocks_per_key = cct->_conf->bluestore_freelist_blocks_per_key;
 
@@ -82,7 +85,7 @@ int BitmapFreelistManager::create(uint64_t new_size, uint64_t granularity,
     // set past-eof blocks as allocated
     _xor(size, blocks * bytes_per_block - size, txn);
   }
-  dout(10) << __func__
+  dout(1) << __func__
 	   << " size 0x" << std::hex << size
 	   << " bytes_per_block 0x" << bytes_per_block
 	   << " blocks 0x" << blocks
@@ -114,7 +117,7 @@ int BitmapFreelistManager::create(uint64_t new_size, uint64_t granularity,
 int BitmapFreelistManager::_expand(uint64_t old_size, KeyValueDB* db)
 {
   assert(old_size < size);
-  ceph_assert(isp2(bytes_per_block));
+  ceph_assert(std::has_single_bit(bytes_per_block));
 
   KeyValueDB::Transaction txn;
   txn = db->get_transaction();
@@ -167,7 +170,7 @@ int BitmapFreelistManager::read_size_meta_from_db(KeyValueDB* kvdb,
   int r = kvdb->get(meta_prefix, "size", &v);
   if (r < 0) {
     derr << __func__ << " missing size meta in DB" << dendl;
-    return ENOENT;
+    return -ENOENT;
   } else {
     auto p = v.cbegin();
     decode(*res, p);
@@ -216,12 +219,11 @@ void BitmapFreelistManager::_load_from_db(KeyValueDB* kvdb)
 }
 
 
-int BitmapFreelistManager::init(const bluestore_bdev_label_t& label,
-  KeyValueDB *kvdb,
-  bool db_in_read_only)
+int BitmapFreelistManager::init(KeyValueDB *kvdb, bool db_in_read_only,
+  std::function<int(const std::string&, std::string*)> cfg_reader)
 {
   dout(1) << __func__ << dendl;
-  int r = _init_from_label(label);
+  int r = _read_cfg(cfg_reader);
   if (r != 0) {
     dout(1) << __func__ << " fall back to legacy meta repo" << dendl;
     _load_from_db(kvdb);
@@ -238,70 +240,43 @@ int BitmapFreelistManager::init(const bluestore_bdev_label_t& label,
   return 0;
 }
 
-int BitmapFreelistManager::_init_from_label(const bluestore_bdev_label_t& label)
+int BitmapFreelistManager::_read_cfg(
+  std::function<int(const std::string&, std::string*)> cfg_reader)
 {
   dout(1) << __func__ << dendl;
 
-  int r = ENOENT;
   string err;
 
-  auto it = label.meta.find("bfm_size");
-  auto end = label.meta.end();
-  if (it != end) {
-    size = strict_iecstrtoll(it->second.c_str(), &err);
-    if (!err.empty()) {
-      derr << __func__ << " Failed to parse - "
-        << it->first << ":" << it->second
-        << ", error: " << err << dendl;
+  const size_t key_count = 4;
+  string keys[key_count] = {
+    "bfm_size",
+    "bfm_blocks",
+    "bfm_bytes_per_block",
+    "bfm_blocks_per_key"};
+  uint64_t* vals[key_count] = {
+    &size,
+    &blocks,
+    &bytes_per_block,
+    &blocks_per_key};
+
+  for (size_t i = 0; i < key_count; i++) {
+    string val;
+    int r = cfg_reader(keys[i], &val);
+    if (r == 0) {
+      *(vals[i]) = strict_iecstrtoll(val, &err);
+      if (!err.empty()) {
+        derr << __func__ << " Failed to parse - "
+          << keys[i] << ":" << val
+          << ", error: " << err << dendl;
+        return -EINVAL;
+      }
+    } else {
+      // this is expected for legacy deployed OSDs
+      dout(0) << __func__ << " " << keys[i] << " not found in bdev meta" << dendl;
       return r;
     }
-  } else {
-    // this is expected for legacy deployed OSDs
-    dout(0) << __func__ << " bfm_size not found in bdev meta" << dendl;
-    return r;
   }
 
-  it = label.meta.find("bfm_blocks");
-  if (it != end) {
-    blocks = strict_iecstrtoll(it->second.c_str(), &err);
-    if (!err.empty()) {
-      derr << __func__ << " Failed to parse - "
-        << it->first << ":" << it->second
-        << ", error: " << err << dendl;
-      return r;
-    }
-  } else {
-    derr << __func__ << " bfm_blocks not found in bdev meta" << dendl;
-    return r;
-  }
-
-  it = label.meta.find("bfm_bytes_per_block");
-  if (it != end) {
-    bytes_per_block = strict_iecstrtoll(it->second.c_str(), &err);
-    if (!err.empty()) {
-      derr << __func__ << " Failed to parse - "
-        << it->first << ":" << it->second
-        << ", error: " << err << dendl;
-      return r;
-    }
-  } else {
-    derr << __func__ << " bfm_bytes_per_block not found in bdev meta" << dendl;
-    return r;
-  }
-  it = label.meta.find("bfm_blocks_per_key");
-  if (it != end) {
-    blocks_per_key = strict_iecstrtoll(it->second.c_str(), &err);
-    if (!err.empty()) {
-      derr << __func__ << " Failed to parse - "
-        << it->first << ":" << it->second
-        << ", error: " << err << dendl;
-      return r;
-    }
-  } else {
-    derr << __func__ << " bfm_blocks_per_key not found in bdev meta" << dendl;
-    return r;
-  }
-  r = 0;
   return 0;
 }
 
@@ -508,135 +483,15 @@ void BitmapFreelistManager::dump(KeyValueDB *kvdb)
   }
 }
 
-void BitmapFreelistManager::_verify_range(KeyValueDB *kvdb,
-					  uint64_t offset, uint64_t length,
-					  int val)
-{
-  unsigned errors = 0;
-  uint64_t first_key = offset & key_mask;
-  uint64_t last_key = (offset + length - 1) & key_mask;
-  if (first_key == last_key) {
-    string k;
-    make_offset_key(first_key, &k);
-    bufferlist bl;
-    kvdb->get(bitmap_prefix, k, &bl);
-    if (bl.length() > 0) {
-      const char *p = bl.c_str();
-      unsigned s = (offset & ~key_mask) / bytes_per_block;
-      unsigned e = ((offset + length - 1) & ~key_mask) / bytes_per_block;
-      for (unsigned i = s; i <= e; ++i) {
-	int has = !!(p[i >> 3] & (1ull << (i & 7)));
-	if (has != val) {
-	  derr << __func__ << " key 0x" << std::hex << first_key << " bit 0x"
-	       << i << " has 0x" << has << " expected 0x" << val
-	       << std::dec << dendl;
-	  ++errors;
-	}
-      }
-    } else {
-      if (val) {
-	derr << __func__ << " key 0x" << std::hex << first_key
-	     << " not present, expected 0x" << val << std::dec << dendl;
-	++errors;
-      }
-    }
-  } else {
-    // first key
-    {
-      string k;
-      make_offset_key(first_key, &k);
-      bufferlist bl;
-      kvdb->get(bitmap_prefix, k, &bl);
-      if (bl.length()) {
-	const char *p = bl.c_str();
-	unsigned s = (offset & ~key_mask) / bytes_per_block;
-	unsigned e = blocks_per_key;
-	for (unsigned i = s; i < e; ++i) {
-	  int has = !!(p[i >> 3] & (1ull << (i & 7)));
-	  if (has != val) {
-	    derr << __func__ << " key 0x" << std::hex << first_key << " bit 0x"
-		 << i << " has 0x" << has << " expected 0x" << val << std::dec
-		 << dendl;
-	    ++errors;
-	  }
-	}
-      } else {
-	if (val) {
-	  derr << __func__ << " key 0x" << std::hex << first_key
-	       << " not present, expected 0x" << val << std::dec << dendl;
-	  ++errors;
-	}
-      }
-      first_key += bytes_per_key;
-    }
-    // middle keys
-    if (first_key < last_key) {
-      while (first_key < last_key) {
-	string k;
-	make_offset_key(first_key, &k);
-	bufferlist bl;
-	kvdb->get(bitmap_prefix, k, &bl);
-	if (bl.length() > 0) {
-	  const char *p = bl.c_str();
-	  for (unsigned i = 0; i < blocks_per_key; ++i) {
-	    int has = !!(p[i >> 3] & (1ull << (i & 7)));
-	    if (has != val) {
-	      derr << __func__ << " key 0x" << std::hex << first_key << " bit 0x"
-		   << i << " has 0x" << has << " expected 0x" << val
-		   << std::dec << dendl;
-	      ++errors;
-	    }
-	  }
-	} else {
-	  if (val) {
-	    derr << __func__ << " key 0x" << std::hex << first_key
-		 << " not present, expected 0x" << val << std::dec << dendl;
-	    ++errors;
-	  }
-	}
-	first_key += bytes_per_key;
-      }
-    }
-    ceph_assert(first_key == last_key);
-    {
-      string k;
-      make_offset_key(first_key, &k);
-      bufferlist bl;
-      kvdb->get(bitmap_prefix, k, &bl);
-      if (bl.length() > 0) {
-	const char *p = bl.c_str();
-	unsigned e = ((offset + length - 1) & ~key_mask) / bytes_per_block;
-	for (unsigned i = 0; i < e; ++i) {
-	  int has = !!(p[i >> 3] & (1ull << (i & 7)));
-	  if (has != val) {
-	    derr << __func__ << " key 0x" << std::hex << first_key << " bit 0x"
-		 << i << " has 0x" << has << " expected 0x" << val << std::dec
-		 << dendl;
-	    ++errors;
-	  }
-	}
-      } else {
-	if (val) {
-	  derr << __func__ << " key 0x" << std::hex << first_key
-	       << " not present, expected 0x" << val << std::dec << dendl;
-	  ++errors;
-	}
-      }
-    }
-  }
-  if (errors) {
-    derr << __func__ << " saw " << errors << " errors" << dendl;
-    ceph_abort_msg("bitmap freelist errors");
-  }
-}
-
 void BitmapFreelistManager::allocate(
   uint64_t offset, uint64_t length,
   KeyValueDB::Transaction txn)
 {
   dout(10) << __func__ << " 0x" << std::hex << offset << "~" << length
 	   << std::dec << dendl;
-  _xor(offset, length, txn);
+  if (!is_null_manager()) {
+    _xor(offset, length, txn);
+  }
 }
 
 void BitmapFreelistManager::release(
@@ -645,7 +500,9 @@ void BitmapFreelistManager::release(
 {
   dout(10) << __func__ << " 0x" << std::hex << offset << "~" << length
 	   << std::dec << dendl;
-  _xor(offset, length, txn);
+  if (!is_null_manager()) {
+    _xor(offset, length, txn);
+  }
 }
 
 void BitmapFreelistManager::_xor(
@@ -753,4 +610,20 @@ void BitmapFreelistManager::get_meta(
   }
   res->emplace_back("bfm_bytes_per_block", stringify(bytes_per_block));
   res->emplace_back("bfm_blocks_per_key", stringify(blocks_per_key));
+}
+
+bool BitmapFreelistManager::validate(uint64_t min_alloc_size) const
+{
+  bool ret = true;
+  auto my_alloc_size = get_alloc_size();
+  ceph_assert(my_alloc_size);
+  ceph_assert(min_alloc_size);
+  if (!is_null_manager() &&
+       ((min_alloc_size < my_alloc_size) || (min_alloc_size % my_alloc_size))) {
+    derr << __func__ << " inconsistent alloc units:" << std::hex
+         << "0x" << get_alloc_size() << " vs. 0x" << min_alloc_size
+         << std::dec << dendl;
+    ret = false;
+  }
+  return ret;
 }

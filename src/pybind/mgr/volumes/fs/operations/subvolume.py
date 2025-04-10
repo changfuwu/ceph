@@ -1,16 +1,11 @@
-import os
-import errno
 from contextlib import contextmanager
 
-import cephfs
-
-from .snapshot_util import mksnap, rmsnap
-from ..fs_util import listdir, get_ancestor_xattr
-from ..exception import VolumeException
-
+from .volume import open_volume, open_volume_lockless
+from .group import open_group
+from .template import SubvolumeOpType
 from .versions import loaded_subvolumes
 
-def create_subvol(fs, vol_spec, group, subvolname, size, isolate_nspace, pool, mode, uid, gid):
+def create_subvol(mgr, fs, vol_spec, group, subvolname, size, isolate_nspace, pool, mode, uid, gid, earmark, normalization, case_insensitive):
     """
     create a subvolume (create a subvolume with the max known version).
 
@@ -23,12 +18,16 @@ def create_subvol(fs, vol_spec, group, subvolname, size, isolate_nspace, pool, m
     :param mode: the user permissions
     :param uid: the user identifier
     :param gid: the group identifier
+    :param earmark: metadata string to identify if subvolume is associated with nfs/smb
+    :param normalization: the unicode normalization form to use (nfd, nfc, nfkd or nfkc)
+    :param case_insensitive: whether to make the subvolume case insensitive or not
     :return: None
     """
-    subvolume = loaded_subvolumes.get_subvolume_object_max(fs, vol_spec, group, subvolname)
-    subvolume.create(size, isolate_nspace, pool, mode, uid, gid)
+    subvolume = loaded_subvolumes.get_subvolume_object_max(mgr, fs, vol_spec, group, subvolname)
+    subvolume.create(size, isolate_nspace, pool, mode, uid, gid, earmark, normalization, case_insensitive)
 
-def create_clone(fs, vol_spec, group, subvolname, pool, source_volume, source_subvolume, snapname):
+
+def create_clone(mgr, fs, vol_spec, group, subvolname, pool, source_volume, source_subvolume, snapname):
     """
     create a cloned subvolume.
 
@@ -42,10 +41,11 @@ def create_clone(fs, vol_spec, group, subvolname, pool, source_volume, source_su
     :param snapname: source subvolume snapshot
     :return None
     """
-    subvolume = loaded_subvolumes.get_subvolume_object_max(fs, vol_spec, group, subvolname)
+    subvolume = loaded_subvolumes.get_subvolume_object_max(mgr, fs, vol_spec, group, subvolname)
     subvolume.create_clone(pool, source_volume, source_subvolume, snapname)
 
-def remove_subvol(fs, vol_spec, group, subvolname, force=False):
+
+def remove_subvol(mgr, fs, vol_spec, group, subvolname, force=False, retainsnaps=False):
     """
     remove a subvolume.
 
@@ -56,14 +56,13 @@ def remove_subvol(fs, vol_spec, group, subvolname, force=False):
     :param force: force remove subvolumes
     :return: None
     """
-    nc_flag = True if not force else False
-    with open_subvol(fs, vol_spec, group, subvolname, need_complete=nc_flag) as subvolume:
-        if subvolume.list_snapshots():
-            raise VolumeException(-errno.ENOTEMPTY, "subvolume '{0}' has snapshots".format(subvolname))
-        subvolume.remove()
+    op_type = SubvolumeOpType.REMOVE if not force else SubvolumeOpType.REMOVE_FORCE
+    with open_subvol(mgr, fs, vol_spec, group, subvolname, op_type) as subvolume:
+        subvolume.remove(retainsnaps)
+
 
 @contextmanager
-def open_subvol(fs, vol_spec, group, subvolname, need_complete=True, expected_types=[]):
+def open_subvol(mgr, fs, vol_spec, group, subvolname, op_type):
     """
     open a subvolume. This API is to be used as a context manager.
 
@@ -71,12 +70,70 @@ def open_subvol(fs, vol_spec, group, subvolname, need_complete=True, expected_ty
     :param vol_spec: volume specification
     :param group: group object for the subvolume
     :param subvolname: subvolume name
-    :param need_complete: check if the subvolume is usable (since cloned subvolumes can
-                          be in transient state). defaults to True.
-    :param expected_types: check if the subvolume is one the provided types. defaults to
-                           all.
+    :param op_type: operation type for which subvolume is being opened
     :return: yields a subvolume object (subclass of SubvolumeTemplate)
     """
-    subvolume = loaded_subvolumes.get_subvolume_object(fs, vol_spec, group, subvolname)
-    subvolume.open(need_complete, expected_types)
+    subvolume = loaded_subvolumes.get_subvolume_object(mgr, fs, vol_spec, group, subvolname)
+    subvolume.open(op_type)
     yield subvolume
+
+
+@contextmanager
+def open_subvol_in_vol(vc, vol_spec, vol_name, group_name, subvol_name,
+                       op_type, lockless=False):
+    open_vol = open_volume_lockless if lockless else open_volume
+
+    with open_vol(vc, vol_name) as vol_handle:
+        with open_group(vol_handle, vol_spec, group_name) as group:
+            with open_subvol(vc.mgr, vol_handle, vol_spec, group, subvol_name,
+                             op_type) as subvol:
+                yield vol_handle, group, subvol
+
+
+@contextmanager
+def open_subvol_in_group(mgr, vol_handle, vol_spec, group_name, subvol_name,
+                         op_type, lockless=False):
+    with open_group(vol_handle, vol_spec, group_name) as group:
+        with open_subvol(mgr, vol_handle, vol_spec, group, subvol_name,
+                         op_type) as subvol:
+            yield subvol
+
+
+@contextmanager
+def open_clone_subvol_pair_in_vol(vc, vol_spec, vol_name, group_name,
+                                  subvol_name, lockless=False):
+    with open_subvol_in_vol(vc, vol_spec, vol_name, group_name, subvol_name,
+                            SubvolumeOpType.CLONE_INTERNAL, lockless) \
+                            as (vol_handle, _, dst_subvol):
+        src_volname, src_group_name, src_subvol_name, src_snap_name = \
+            dst_subvol.get_clone_source()
+
+        if group_name == src_group_name and subvol_name == src_subvol_name:
+            # use the same subvolume to avoid metadata overwrites
+            yield (dst_subvol, dst_subvol, src_snap_name)
+        else:
+            with open_subvol_in_group(vc.mgr, vol_handle, vol_spec,
+                                      src_group_name, src_subvol_name,
+                                      SubvolumeOpType.CLONE_SOURCE) \
+                                      as src_subvol:
+                yield (dst_subvol, src_subvol, src_snap_name)
+
+
+@contextmanager
+def open_clone_subvol_pair_in_group(mgr, vol_handle, vol_spec, volname,
+                                    group_name, subvol_name, lockless=False):
+    with open_subvol_in_group(mgr, vol_handle, vol_spec, group_name,
+                              subvol_name, SubvolumeOpType.CLONE_INTERNAL,
+                              lockless) as dst_subvol:
+        src_volname, src_group_name, src_subvol_name, src_snap_name = \
+            dst_subvol.get_clone_source()
+
+        if group_name == src_group_name and subvol_name == src_subvol_name:
+            # use the same subvolume to avoid metadata overwrites
+            yield (dst_subvol, dst_subvol, src_snap_name)
+        else:
+            with open_subvol_in_group(mgr, vol_handle, vol_spec,
+                                      src_group_name, src_subvol_name,
+                                      SubvolumeOpType.CLONE_SOURCE) \
+                                      as src_subvol:
+                yield (dst_subvol, src_subvol, src_snap_name)

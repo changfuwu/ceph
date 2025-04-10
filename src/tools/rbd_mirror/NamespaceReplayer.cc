@@ -2,7 +2,6 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "NamespaceReplayer.h"
-#include <boost/bind.hpp>
 #include "common/Formatter.h"
 #include "common/debug.h"
 #include "common/errno.h"
@@ -10,6 +9,7 @@
 #include "librbd/Utils.h"
 #include "librbd/api/Config.h"
 #include "librbd/api/Mirror.h"
+#include "librbd/asio/ContextWQ.h"
 #include "ServiceDaemon.h"
 #include "Threads.h"
 
@@ -36,7 +36,8 @@ const std::string SERVICE_DAEMON_REMOTE_COUNT_KEY("image_remote_count");
 
 template <typename I>
 NamespaceReplayer<I>::NamespaceReplayer(
-    const std::string &name,
+    const std::string &local_name,
+    const std::string &remote_name,
     librados::IoCtx &local_io_ctx, librados::IoCtx &remote_io_ctx,
     const std::string &local_mirror_uuid,
     const std::string& local_mirror_peer_uuid,
@@ -47,7 +48,8 @@ NamespaceReplayer<I>::NamespaceReplayer(
     ServiceDaemon<I> *service_daemon,
     journal::CacheManagerHandler *cache_manager_handler,
     PoolMetaCache* pool_meta_cache) :
-  m_namespace_name(name),
+  m_local_namespace_name(local_name),
+  m_remote_namespace_name(remote_name),
   m_local_mirror_uuid(local_mirror_uuid),
   m_local_mirror_peer_uuid(local_mirror_peer_uuid),
   m_remote_pool_meta(remote_pool_meta),
@@ -57,26 +59,29 @@ NamespaceReplayer<I>::NamespaceReplayer(
   m_cache_manager_handler(cache_manager_handler),
   m_pool_meta_cache(pool_meta_cache),
   m_lock(ceph::make_mutex(librbd::util::unique_lock_name(
-      "rbd::mirror::NamespaceReplayer " + name, this))),
+      "rbd::mirror::NamespaceReplayer " + local_name, this))),
   m_local_pool_watcher_listener(this, true),
   m_remote_pool_watcher_listener(this, false),
   m_image_map_listener(this) {
-  dout(10) << name << dendl;
+  dout(10) << "local_name=" << local_name
+           << ", remote_name="  << remote_name
+           << ", local_mirror_uuid=" << m_local_mirror_uuid
+           << dendl;
 
   m_local_io_ctx.dup(local_io_ctx);
-  m_local_io_ctx.set_namespace(name);
+  m_local_io_ctx.set_namespace(local_name);
   m_remote_io_ctx.dup(remote_io_ctx);
-  m_remote_io_ctx.set_namespace(name);
+  m_remote_io_ctx.set_namespace(remote_name);
 }
 
 template <typename I>
-bool NamespaceReplayer<I>::is_blacklisted() const {
+bool NamespaceReplayer<I>::is_blocklisted() const {
   std::lock_guard locker{m_lock};
-  return m_instance_replayer->is_blacklisted() ||
+  return m_instance_replayer->is_blocklisted() ||
          (m_local_pool_watcher &&
-          m_local_pool_watcher->is_blacklisted()) ||
+          m_local_pool_watcher->is_blocklisted()) ||
          (m_remote_pool_watcher &&
-          m_remote_pool_watcher->is_blacklisted());
+          m_remote_pool_watcher->is_blocklisted());
 }
 
 template <typename I>
@@ -125,6 +130,10 @@ void NamespaceReplayer<I>::print_status(Formatter *f)
 
   std::lock_guard locker{m_lock};
 
+  f->open_object_section("namespace_replayer_status");
+  f->dump_string("local_namespace", m_local_namespace_name);
+  f->dump_string("remote_namespace", m_remote_namespace_name);
+
   m_instance_replayer->print_status(f);
 
   if (m_image_deleter) {
@@ -132,6 +141,8 @@ void NamespaceReplayer<I>::print_status(Formatter *f)
     m_image_deleter->print_status(f);
     f->close_section();
   }
+
+  f->close_section(); // namespace_replayer_status
 }
 
 template <typename I>
@@ -385,7 +396,7 @@ void NamespaceReplayer<I>::init_instance_watcher() {
   ceph_assert(!m_instance_watcher);
 
   m_instance_watcher.reset(InstanceWatcher<I>::create(
-      m_local_io_ctx, m_threads->work_queue, m_instance_replayer.get(),
+      m_local_io_ctx, *m_threads->asio_engine, m_instance_replayer.get(),
       m_image_sync_throttler));
   auto ctx = create_context_callback<NamespaceReplayer<I>,
       &NamespaceReplayer<I>::handle_init_instance_watcher>(this);
@@ -808,7 +819,7 @@ void NamespaceReplayer<I>::shut_down_image_map(Context *on_finish) {
 template <typename I>
 void NamespaceReplayer<I>::handle_shut_down_image_map(int r, Context *on_finish) {
   dout(5) << "r=" << r << dendl;
-  if (r < 0 && r != -EBLACKLISTED) {
+  if (r < 0 && r != -EBLOCKLISTED) {
     derr << "failed to shut down image map: " << cpp_strerror(r) << dendl;
   }
 
@@ -854,6 +865,16 @@ void NamespaceReplayer<I>::handle_remove_image(const std::string &mirror_uuid,
 
   m_instance_watcher->notify_peer_image_removed(instance_id, global_image_id,
                                                 mirror_uuid, on_finish);
+}
+
+template <typename I>
+std::string NamespaceReplayer<I>::get_local_namespace() {
+  return m_local_namespace_name;
+}
+
+template <typename I>
+std::string NamespaceReplayer<I>::get_remote_namespace() {
+  return m_remote_namespace_name;
 }
 
 } // namespace mirror

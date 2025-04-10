@@ -20,14 +20,14 @@
  */
 /*
  * C++2014 dependencies removed.  Uses of std::string_view adapted to
- * boost::string_ref.  Matt Benjamin <mbenjamin@redhat.com>
+ * std::string_view.  Matt Benjamin <mbenjamin@redhat.com>
  */
 
 #ifndef SSTRING_HH_
 #define SSTRING_HH_
 
+#include <string_view>
 #include <type_traits>
-#include <boost/utility/string_view.hpp>
 
 #include "include/buffer.h"
 #include "include/denc.h"
@@ -44,6 +44,7 @@ template <typename char_type, typename Size, Size max_size>
 class basic_sstring {
     static_assert(
             (std::is_same<char_type, char>::value
+             || std::is_same<char_type, char8_t>::value
              || std::is_same<char_type, signed char>::value
              || std::is_same<char_type, unsigned char>::value),
             "basic_sstring only supports single byte char types");
@@ -527,8 +528,8 @@ public:
     const char_type& operator[](size_type pos) const {
         return str()[pos];
     }
-    operator boost::basic_string_view<char_type, traits_type>() const {
-		return boost::basic_string_view<char_type, traits_type>(str(), size());
+    operator std::basic_string_view<char_type, traits_type>() const {
+		return std::basic_string_view<char_type, traits_type>(str(), size());
     }
     template <typename string_type, typename T>
     friend inline string_type to_sstring(T value);
@@ -611,7 +612,7 @@ template <typename char_type, typename size_type, size_type max_size>
 struct hash<basic_sstring<char_type, size_type, max_size>> {
     size_t operator()(const basic_sstring<char_type, size_type, max_size>& s) const {
 		using traits_type = std::char_traits<char_type>;
-		return std::hash<boost::basic_string_view<char_type,traits_type>>()(s);
+		return std::hash<std::basic_string_view<char_type,traits_type>>()(s);
     }
 };
 

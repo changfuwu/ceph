@@ -17,61 +17,52 @@
 #include "common/Formatter.h"
 #include "common/safe_io.h"
 
-#ifndef  WITH_SEASTAR
-#include "filestore/FileStore.h"
 #include "memstore/MemStore.h"
-#endif
 #if defined(WITH_BLUESTORE)
 #include "bluestore/BlueStore.h"
 #endif
-#ifndef WITH_SEASTAR
+#ifdef WITH_KSTORE
 #include "kstore/KStore.h"
 #endif
 
 using std::string;
 
-ObjectStore *ObjectStore::create(CephContext *cct,
-				 const string& type,
-				 const string& data,
-				 const string& journal,
-				 osflagbits_t flags)
+std::unique_ptr<ObjectStore> ObjectStore::create(
+  CephContext *cct,
+  const string& type,
+  const string& data)
 {
-#ifndef WITH_SEASTAR
-  if (type == "filestore") {
-    return new FileStore(cct, data, journal, flags);
-  }
   if (type == "memstore") {
-    return new MemStore(cct, data);
+    return std::make_unique<MemStore>(cct, data);
   }
-#endif
 #if defined(WITH_BLUESTORE)
-  if (type == "bluestore") {
-    return new BlueStore(cct, data);
-  }
-#ifndef WITH_SEASTAR
-  if (type == "random") {
-    if (rand() % 2) {
-      return new FileStore(cct, data, journal, flags);
-    } else {
-      return new BlueStore(cct, data);
-    }
+  if (type == "bluestore" || type == "random") {
+    return std::make_unique<BlueStore>(cct, data);
   }
 #endif
-#else
-#ifndef WITH_SEASTAR
-  if (type == "random") {
-    return new FileStore(cct, data, journal, flags);
+  return nullptr;
+}
+
+std::unique_ptr<ObjectStore> ObjectStore::create(
+  CephContext *cct,
+  const string& type,
+  const string& data,
+  const string& journal,
+  osflagbits_t flags)
+{
+  if (type == "filestore") {
+    lgeneric_derr(cct) << __func__ << ": FileStore has been deprecated and is no longer supported" << dendl;
+    return nullptr;
   }
-#endif
-#endif
-#ifndef WITH_SEASTAR
+  #ifdef WITH_KSTORE
   if (type == "kstore" &&
       cct->check_experimental_feature_enabled("kstore")) {
-    return new KStore(cct, data);
+    return std::make_unique<KStore>(cct, data);
   }
-#endif
-  return NULL;
+  #endif
+  return create(cct, type, data);
 }
+
 
 int ObjectStore::probe_block_device_fsid(
   CephContext *cct,
@@ -86,16 +77,6 @@ int ObjectStore::probe_block_device_fsid(
   r = BlueStore::get_block_device_fsid(cct, path, fsid);
   if (r == 0) {
     lgeneric_dout(cct, 0) << __func__ << " " << path << " is bluestore, "
-			  << *fsid << dendl;
-    return r;
-  }
-#endif
-
-#ifndef WITH_SEASTAR
-  // okay, try FileStore (journal).
-  r = FileStore::get_block_device_fsid(cct, path, fsid);
-  if (r == 0) {
-    lgeneric_dout(cct, 0) << __func__ << " " << path << " is filestore, "
 			  << *fsid << dendl;
     return r;
   }
@@ -130,4 +111,9 @@ int ObjectStore::read_meta(const std::string& key,
   }
   *value = string(buf, r);
   return 0;
+}
+
+int ObjectStore::get_ideal_list_max()
+{
+  return cct->_conf->osd_objectstore_ideal_list_max;
 }

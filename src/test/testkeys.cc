@@ -1,4 +1,7 @@
 #include "auth/cephx/CephxKeyServer.h"
+
+#include <iostream> // for std::cout
+
 #include "common/ceph_argparse.h"
 #include "global/global_init.h"
 #include "common/config.h"
@@ -8,10 +11,11 @@
 
 #define AES_KEY_LEN	16
 
+using namespace std;
+
 int main(int argc, const char **argv)
 {
-  vector<const char*> args;
-  argv_to_vec(argc, argv, args);
+  auto args = argv_to_vec(argc, argv);
 
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
                          CODE_ENVIRONMENT_UTILITY,

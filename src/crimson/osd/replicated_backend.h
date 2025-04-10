@@ -5,6 +5,7 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include <seastar/core/future.hh>
+#include <seastar/core/weak_ptr.hh>
 #include "include/buffer_fwd.h"
 #include "osd/osd_types.h"
 
@@ -13,39 +14,70 @@
 
 namespace crimson::osd {
   class ShardServices;
+  class PG;
 }
 
 class ReplicatedBackend : public PGBackend
 {
 public:
   ReplicatedBackend(pg_t pgid, pg_shard_t whoami,
+		    crimson::osd::PG& pg,
 		    CollectionRef coll,
-		    crimson::osd::ShardServices& shard_services);
+		    crimson::osd::ShardServices& shard_services,
+		    DoutPrefixProvider &dpp);
   void got_rep_op_reply(const MOSDRepOpReply& reply) final;
+  seastar::future<> stop() final;
+  void on_actingset_changed(bool same_primary) final;
 private:
-  ll_read_errorator::future<ceph::bufferlist> _read(const hobject_t& hoid,
-					            uint64_t off,
-					            uint64_t len,
-					            uint32_t flags) override;
-  seastar::future<crimson::osd::acked_peers_t>
-  _submit_transaction(std::set<pg_shard_t>&& pg_shards,
-		      const hobject_t& hoid,
-		      ceph::os::Transaction&& txn,
-		      const osd_op_params_t& osd_op_p,
-		      epoch_t min_epoch, epoch_t max_epoch,
-		      std::vector<pg_log_entry_t>&& log_entries) final;
+  ll_read_ierrorator::future<ceph::bufferlist>
+    _read(const hobject_t& hoid, uint64_t off,
+	  uint64_t len, uint32_t flags) override;
+  rep_op_fut_t submit_transaction(
+    const std::set<pg_shard_t> &pg_shards,
+    const hobject_t& hoid,
+    crimson::osd::ObjectContextRef&& new_clone,
+    ceph::os::Transaction&& txn,
+    osd_op_params_t&& osd_op_p,
+    epoch_t min_epoch, epoch_t max_epoch,
+    std::vector<pg_log_entry_t>&& log_entries) final;
   const pg_t pgid;
   const pg_shard_t whoami;
-  crimson::osd::ShardServices& shard_services;
-  ceph_tid_t next_txn_id = 0;
-  struct pending_on_t {
-    pending_on_t(size_t pending)
-      : pending{static_cast<unsigned>(pending)}
+  class pending_on_t : public seastar::weakly_referencable<pending_on_t> {
+  public:
+    pending_on_t(
+      size_t pending,
+      const eversion_t& at_version,
+      const eversion_t& last_complete)
+      : pending{static_cast<unsigned>(pending)},
+	at_version(at_version),
+	last_complete(last_complete)
     {}
     unsigned pending;
+    // The order of pending_txns' at_version must be the same as their
+    // corresponding ceph_tid_t, as we rely on this condition for checking
+    // whether a client request is already completed. To put it another
+    // way, client requests at_version must be updated synchorously/simultaneously
+    // with ceph_tid_t.
+    const eversion_t at_version;
+    const eversion_t last_complete;
     crimson::osd::acked_peers_t acked_peers;
-    seastar::promise<> all_committed;
+    seastar::shared_promise<> all_committed;
   };
   using pending_transactions_t = std::map<ceph_tid_t, pending_on_t>;
   pending_transactions_t pending_trans;
+  crimson::osd::PG& pg;
+
+  MURef<MOSDRepOp> new_repop_msg(
+    const pg_shard_t &pg_shard,
+    const hobject_t &hoid,
+    const bufferlist &encoded_txn,
+    const osd_op_params_t &osd_op_p,
+    epoch_t min_epoch,
+    epoch_t map_epoch,
+    const std::vector<pg_log_entry_t> &log_entries,
+    bool send_op,
+    ceph_tid_t tid);
+
+  seastar::future<> request_committed(
+    const osd_reqid_t& reqid, const eversion_t& at_version) final;
 };

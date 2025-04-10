@@ -82,28 +82,23 @@ void VarLenGenerator::get_ranges_map(
 }
 
 void ObjectDesc::iterator::adjust_stack() {
-  while (!stack.empty() && pos >= stack.front().second.next) {
-    ceph_assert(pos == stack.front().second.next);
-    size = stack.front().second.size;
-    current = stack.front().first;
-    stack.pop_front();
+  while (!stack.empty() && pos >= stack.top().second.next) {
+    ceph_assert(pos == stack.top().second.next);
+    size = stack.top().second.size;
+    current = stack.top().first;
+    stack.pop();
   }
 
   if (stack.empty()) {
     cur_valid_till = std::numeric_limits<uint64_t>::max();
   } else {
-    cur_valid_till = stack.front().second.next;
+    cur_valid_till = stack.top().second.next;
   }
 
   while (current != layers.end() && !current->covers(pos)) {
     uint64_t next = current->next(pos);
     if (next < cur_valid_till) {
-      stack.push_front(
-	make_pair(
-	  current,
-	  StackState{next, size}
-	  )
-	);
+      stack.emplace(current, StackState{next, size});
       cur_valid_till = next;
     }
 
@@ -130,15 +125,18 @@ void ObjectDesc::update(ContentsGenerator *gen, const ContDesc &next) {
   return;
 }
 
-bool ObjectDesc::check(bufferlist &to_check) {
+bool ObjectDesc::check(bufferlist &to_check,
+		       const std::pair<uint64_t, uint64_t>& offlen) {
   iterator objiter = begin();
+  const auto [offset, size] = offlen;
+  objiter.seek(offset);
+  std::cout << "seeking to " << offset << std::endl;
   uint64_t error_at = 0;
   if (!objiter.check_bl_advance(to_check, &error_at)) {
     std::cout << "incorrect buffer at pos " << error_at << std::endl;
     return false;
   }
 
-  uint64_t size = layers.begin()->first->get_length(layers.begin()->second);
   if (to_check.length() < size) {
     std::cout << "only read " << to_check.length()
 	      << " out of size " << size << std::endl;
@@ -148,11 +146,14 @@ bool ObjectDesc::check(bufferlist &to_check) {
 }
 
 bool ObjectDesc::check_sparse(const std::map<uint64_t, uint64_t>& extents,
-			      bufferlist &to_check)
+			      bufferlist &to_check,
+			      const std::pair<uint64_t, uint64_t>& offlen)
 {
+  const auto [offset_to_skip, _] = offlen;
+  uint64_t pos = offset_to_skip;
   uint64_t off = 0;
-  uint64_t pos = 0;
   auto objiter = begin();
+  objiter.seek(pos);
   for (auto &&extiter : extents) {
     // verify hole
     {

@@ -1,19 +1,39 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 
-#include <errno.h>
-#include "include/encoding.h"
 #include "ECUtil.h"
+
+#include <sstream>
+
+#include <errno.h>
+#include "common/ceph_context.h"
+#include "global/global_context.h"
+#include "include/encoding.h"
+
+/* This file is soon going to be replaced (before next release), so we are going
+ * to simply ignore all deprecated warnings.
+ * */
+IGNORE_DEPRECATED
 
 using namespace std;
 using ceph::bufferlist;
 using ceph::ErasureCodeInterfaceRef;
 using ceph::Formatter;
 
+std::pair<uint64_t, uint64_t> ECUtil::stripe_info_t::chunk_aligned_offset_len_to_chunk(
+  std::pair<uint64_t, uint64_t> in) const {
+  pair<uint64_t, uint64_t> tmp = offset_len_to_stripe_bounds(in);
+  return std::make_pair(
+    chunk_aligned_logical_offset_to_chunk_offset(tmp.first),
+    chunk_aligned_logical_size_to_chunk_size(tmp.second));
+}
+
 int ECUtil::decode(
   const stripe_info_t &sinfo,
   ErasureCodeInterfaceRef &ec_impl,
+  const set<int> want_to_read,
   map<int, bufferlist> &to_decode,
-  bufferlist *out) {
+  bufferlist *out)
+{
   ceph_assert(to_decode.size());
 
   uint64_t total_data_size = to_decode.begin()->second.length();
@@ -39,9 +59,9 @@ int ECUtil::decode(
       chunks[j->first].substr_of(j->second, i, sinfo.get_chunk_size());
     }
     bufferlist bl;
-    int r = ec_impl->decode_concat(chunks, &bl);
+    int r = ec_impl->decode_concat(want_to_read, chunks, &bl);
     ceph_assert(r == 0);
-    ceph_assert(bl.length() == sinfo.get_stripe_width());
+    ceph_assert(bl.length() % sinfo.get_chunk_size() == 0);
     out->claim_append(bl);
   }
   return 0;
@@ -246,3 +266,5 @@ const string &ECUtil::get_hinfo_key()
 {
   return HINFO_KEY;
 }
+
+END_IGNORE_DEPRECATED

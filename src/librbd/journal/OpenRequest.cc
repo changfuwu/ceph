@@ -4,11 +4,11 @@
 #include "librbd/journal/OpenRequest.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "journal/Journaler.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/Journal.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/journal/Types.h"
 #include "librbd/journal/Utils.h"
 
@@ -83,7 +83,7 @@ void OpenRequest<I>::handle_init(int r) {
   }
 
   journal::ImageClientMeta *image_client_meta =
-    boost::get<journal::ImageClientMeta>(&client_data.client_meta);
+    std::get_if<journal::ImageClientMeta>(&client_data.client_meta);
   if (image_client_meta == nullptr) {
     lderr(cct) << this << " " << __func__ << ": "
                << "failed to extract client meta data" << dendl;

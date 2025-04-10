@@ -1,14 +1,18 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#ifndef CEPH_CLS_RGW_CONST_H
-#define CEPH_CLS_RGW_CONST_H
+#pragma once
 
 #define RGW_CLASS "rgw"
 
+/* Special error code returned by cls bucket list operation if it was
+ * unable to skip past enough not visible entries to return any
+ * entries in the call. */
+constexpr int RGWBIAdvanceAndRetryError = -EFBIG;
+
 /* bucket index */
 #define RGW_BUCKET_INIT_INDEX "bucket_init_index"
-
+#define RGW_BUCKET_INIT_INDEX2 "bucket_init_index2"
 
 #define RGW_BUCKET_SET_TAG_TIMEOUT "bucket_set_tag_timeout"
 #define RGW_BUCKET_LIST "bucket_list"
@@ -30,7 +34,10 @@
 
 #define RGW_BI_GET "bi_get"
 #define RGW_BI_PUT "bi_put"
+#define RGW_BI_PUT_ENTRIES "bi_put_entries"
 #define RGW_BI_LIST "bi_list"
+
+#define RGW_RESHARD_LOG_TRIM "reshard_log_trim"
 
 #define RGW_BI_LOG_LIST "bi_log_list"
 #define RGW_BI_LOG_TRIM "bi_log_trim"
@@ -60,6 +67,9 @@
 #define RGW_LC_GET_HEAD "lc_get_head"
 #define RGW_LC_LIST_ENTRIES "lc_list_entries"
 
+/* multipart */
+#define RGW_MP_UPLOAD_PART_INFO_UPDATE "mp_upload_part_info_update"
+
 /* resharding */
 #define RGW_RESHARD_ADD "reshard_add"
 #define RGW_RESHARD_LIST "reshard_list"
@@ -68,8 +78,7 @@
 
 /* resharding attribute  */
 #define RGW_SET_BUCKET_RESHARDING "set_bucket_resharding"
+#define RGW_SET_BUCKET_RESHARDING2 "set_bucket_resharding2"
 #define RGW_CLEAR_BUCKET_RESHARDING "clear_bucket_resharding"
 #define RGW_GUARD_BUCKET_RESHARDING "guard_bucket_resharding"
 #define RGW_GET_BUCKET_RESHARDING "get_bucket_resharding"
-
-#endif

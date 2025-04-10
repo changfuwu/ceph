@@ -1,3 +1,14 @@
+.. _cephfs_add_remote_mds:
+
+.. warning:: The material on this page is to be used only for manually setting
+   up a Ceph cluster. If you intend to use an automated tool such as
+   :doc:`/cephadm/index` to set up a Ceph cluster, do not use the
+   instructions on this page.
+
+.. note:: If you are certain that you know what you are doing and you intend to
+   manually deploy MDS daemons, see :doc:`/cephadm/services/mds/` before
+   proceeding.
+
 ============================
  Deploying Metadata Servers
 ============================
@@ -28,7 +39,7 @@ The other dimension to MDS performance is the available RAM for caching. The
 MDS necessarily manages a distributed and cooperative metadata cache among all
 clients and other active MDSs. Therefore it is essential to provide the MDS
 with sufficient RAM to enable faster metadata access and mutation. The default
-MDS cache size (see also :doc:`/cephfs/cache-size-limits`) is 4GB. It is
+MDS cache size (see also :doc:`/cephfs/cache-configuration`) is 4GB. It is
 recommended to provision at least 8GB of RAM for the MDS to support this cache
 size.
 
@@ -44,8 +55,7 @@ the MDS server. Even if a single MDS daemon is unable to fully utilize the
 hardware, it may be desirable later on to start more active MDS daemons on the
 same node to fully utilize the available cores and memory. Additionally, it may
 become clear with workloads on the cluster that performance improves with
-multiple active MDS on the same node rather than over-provisioning a single
-MDS.
+multiple active MDS on the same node rather than a single overloaded MDS.
 
 Finally, be aware that CephFS is a highly-available file system by supporting
 standby MDS (see also :ref:`mds-standby`) for rapid failover. To get a real
@@ -62,7 +72,7 @@ means limiting its cache size.
 Adding an MDS
 =============
 
-#. Create an mds data point ``/var/lib/ceph/mds/ceph-${id}``. The daemon only uses this directory to store its keyring.
+#. Create an mds directory ``/var/lib/ceph/mds/ceph-${id}``. The daemon only uses this directory to store its keyring.
 
 #. Create the authentication key, if you use CephX: ::
 
@@ -105,5 +115,12 @@ the following method.
 #. Remove the ``/var/lib/ceph/mds/ceph-${id}`` directory on the MDS. ::
 
 	$ sudo rm -rf /var/lib/ceph/mds/ceph-${id}
+
+
+.. note:: When an active MDS either has health warning MDS_TRIM or
+   MDS_CACHE_OVERSIZED, confirmation flag (--yes-i-really-mean-it)
+   needs to be passed, else the command will fail. It is not recommended to
+   restart an MDS which has these warnings since slow recovery at restart may
+   lead to more problems.
 
 .. _MDS Config Reference: ../mds-config-ref

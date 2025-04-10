@@ -7,7 +7,9 @@
 #include <ostream>
 #include <set>
 #include <map>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <boost/scoped_ptr.hpp>
 #include "include/encoding.h"
 #include "common/Formatter.h"
@@ -17,24 +19,18 @@
 /**
  * Defines virtual interface to be implemented by key value store
  *
- * Kyoto Cabinet or LevelDB should implement this
+ * Kyoto Cabinet should implement this
  */
 class KeyValueDB {
 public:
-  /*
-   *  See RocksDB's definition of a column family(CF) and how to use it.
-   *  The interfaces of KeyValueDB is extended, when a column family is created.
-   *  Prefix will be the name of column family to use.
-   */
-  struct ColumnFamily {
-    std::string name;      //< name of this individual column family
-    std::string option;    //< configure option string for this CF
-    ColumnFamily(const std::string &name, const std::string &option)
-      : name(name), option(option) {}
-  };
-
   class TransactionImpl {
   public:
+    // amount of ops included
+    virtual size_t get_count() const = 0;
+
+    // total encoded data size
+    virtual size_t get_size_bytes() const = 0;
+
     /// Set Keys
     void set(
       const std::string &prefix,                      ///< [in] Prefix for keys, or CF name
@@ -155,18 +151,17 @@ public:
   /// test whether we can successfully initialize; may have side effects (e.g., create)
   static int test_init(const std::string& type, const std::string& dir);
   virtual int init(std::string option_str="") = 0;
-  virtual int open(std::ostream &out, const std::vector<ColumnFamily>& cfs = {}) = 0;
+  virtual int open(std::ostream &out, const std::string& cfs="") = 0;
   // std::vector cfs contains column families to be created when db is created.
-  virtual int create_and_open(std::ostream &out,
-			      const std::vector<ColumnFamily>& cfs = {}) = 0;
+  virtual int create_and_open(std::ostream &out, const std::string& cfs="") = 0;
 
-  virtual int open_read_only(std::ostream &out, const std::vector<ColumnFamily>& cfs = {}) {
+  virtual int open_read_only(std::ostream &out, const std::string& cfs="") {
     return -ENOTSUP;
   }
 
   virtual void close() { }
 
-  /// Try to repair K/V database. leveldb and rocksdb require that database must be not opened.
+  /// Try to repair K/V database. rocksdb requires that database must be not opened.
   virtual int repair(std::ostream &out) { return 0; }
 
   virtual Transaction get_transaction() = 0;
@@ -217,6 +212,10 @@ public:
       return "";
     }
     virtual ceph::buffer::list value() = 0;
+    // When valid() returns true, value returned as string-view
+    // is guaranteed to be valid until iterator is moved to another
+    // position; that is until call to next() / seek_to_first() / etc.
+    virtual std::string_view value_as_sv() = 0;
     virtual int status() = 0;
     virtual ~SimplestIteratorImpl() {}
   };
@@ -226,7 +225,12 @@ public:
     virtual ~IteratorImpl() {}
     virtual int seek_to_last() = 0;
     virtual int prev() = 0;
+    // When valid() returns true, key returned as string-view
+    // is guaranteed to be valid until iterator is moved to another
+    // position; that is until call to next() / seek_to_first() / etc.
+    virtual std::string_view key_as_sv() = 0;
     virtual std::pair<std::string, std::string> raw_key() = 0;
+    virtual std::pair<std::string_view, std::string_view> raw_key_as_sv() = 0;
     virtual ceph::buffer::ptr value_as_ptr() {
       ceph::buffer::list bl = value();
       if (bl.length() == 1) {
@@ -253,7 +257,9 @@ public:
     virtual int next() = 0;
     virtual int prev() = 0;
     virtual std::string key() = 0;
+    virtual std::string_view key_as_sv() = 0;
     virtual std::pair<std::string,std::string> raw_key() = 0;
+    virtual std::pair<std::string_view, std::string_view> raw_key_as_sv() = 0;
     virtual bool raw_key_is_prefixed(const std::string &prefix) = 0;
     virtual ceph::buffer::list value() = 0;
     virtual ceph::buffer::ptr value_as_ptr() {
@@ -264,6 +270,7 @@ public:
         return ceph::buffer::ptr();
       }
     }
+    virtual std::string_view value_as_sv() = 0;
     virtual int status() = 0;
     virtual size_t key_size() {
       return 0;
@@ -277,6 +284,8 @@ public:
 
 private:
   // This class filters a WholeSpaceIterator by a prefix.
+  // Performs as a dummy wrapper over WholeSpaceIterator
+  // if prefix is empty
   class PrefixIteratorImpl : public IteratorImpl {
     const std::string prefix;
     WholeSpaceIterator generic_iter;
@@ -286,10 +295,14 @@ private:
     ~PrefixIteratorImpl() override { }
 
     int seek_to_first() override {
-      return generic_iter->seek_to_first(prefix);
+      return prefix.empty() ?
+	generic_iter->seek_to_first() :
+	generic_iter->seek_to_first(prefix);
     }
     int seek_to_last() override {
-      return generic_iter->seek_to_last(prefix);
+      return prefix.empty() ?
+	generic_iter->seek_to_last() :
+	generic_iter->seek_to_last(prefix);
     }
     int upper_bound(const std::string &after) override {
       return generic_iter->upper_bound(prefix, after);
@@ -300,7 +313,11 @@ private:
     bool valid() override {
       if (!generic_iter->valid())
 	return false;
-      return generic_iter->raw_key_is_prefixed(prefix);
+      if (prefix.empty())
+        return true;
+      return prefix.empty() ?
+	      true :
+	      generic_iter->raw_key_is_prefixed(prefix);
     }
     int next() override {
       return generic_iter->next();
@@ -311,8 +328,14 @@ private:
     std::string key() override {
       return generic_iter->key();
     }
+    std::string_view key_as_sv() override {
+      return generic_iter->key_as_sv();
+    }
     std::pair<std::string, std::string> raw_key() override {
       return generic_iter->raw_key();
+    }
+    std::pair<std::string_view, std::string_view> raw_key_as_sv() override {
+      return generic_iter->raw_key_as_sv();
     }
     ceph::buffer::list value() override {
       return generic_iter->value();
@@ -320,25 +343,32 @@ private:
     ceph::buffer::ptr value_as_ptr() override {
       return generic_iter->value_as_ptr();
     }
+    std::string_view value_as_sv() override {
+      return generic_iter->value_as_sv();
+    }
     int status() override {
       return generic_iter->status();
     }
   };
-public:
-
-  virtual WholeSpaceIterator get_wholespace_iterator() = 0;
-  virtual Iterator get_iterator(const std::string &prefix) {
+protected:
+  Iterator make_iterator(const std::string &prefix, WholeSpaceIterator w_iter) {
     return std::make_shared<PrefixIteratorImpl>(
       prefix,
-      get_wholespace_iterator());
+      w_iter);
   }
+public:
+  typedef uint32_t IteratorOpts;
+  static const uint32_t ITERATOR_NOCACHE = 1;
 
-  void add_column_family(const std::string& cf_name, void *handle) {
-    cf_handles.insert(std::make_pair(cf_name, handle));
-  }
+  struct IteratorBounds {
+    std::optional<std::string> lower_bound;
+    std::optional<std::string> upper_bound;
+  };
 
-  bool is_column_family(const std::string& prefix) {
-    return cf_handles.count(prefix);
+  virtual WholeSpaceIterator get_wholespace_iterator(IteratorOpts opts = 0) = 0;
+  virtual Iterator get_iterator(const std::string &prefix, IteratorOpts opts = 0, IteratorBounds bounds = IteratorBounds()) {
+    return make_iterator(prefix,
+      get_wholespace_iterator(opts));
   }
 
   virtual uint64_t get_estimated_size(std::map<std::string,uint64_t> &extra) = 0;
@@ -358,9 +388,19 @@ public:
     return -EOPNOTSUPP;
   }
 
+  virtual int64_t get_cache_usage(std::string prefix) const {
+    return -EOPNOTSUPP;
+  }
+
   virtual std::shared_ptr<PriorityCache::PriCache> get_priority_cache() const {
     return nullptr;
   }
+
+  virtual std::shared_ptr<PriorityCache::PriCache> get_priority_cache(std::string prefix) const {
+    return nullptr;
+  }
+
+
 
   virtual ~KeyValueDB() {}
 
@@ -438,8 +478,6 @@ protected:
   std::vector<std::pair<std::string,
 			std::shared_ptr<MergeOperator> > > merge_ops;
 
-  /// column families in use, name->handle
-  std::unordered_map<std::string, void *> cf_handles;
 };
 
 #endif

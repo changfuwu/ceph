@@ -5,13 +5,14 @@
 #include "common/debug.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "journal/Journaler.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/journal/Types.h"
-#include <boost/variant.hpp>
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
@@ -33,7 +34,7 @@ EventPreprocessor<I>::EventPreprocessor(I &local_image_ctx,
                                         Journaler &remote_journaler,
                                         const std::string &local_mirror_uuid,
                                         MirrorPeerClientMeta *client_meta,
-                                        ContextWQ *work_queue)
+                                        librbd::asio::ContextWQ *work_queue)
   : m_local_image_ctx(local_image_ctx), m_remote_journaler(remote_journaler),
     m_local_mirror_uuid(local_mirror_uuid), m_client_meta(client_meta),
     m_work_queue(work_queue) {
@@ -93,8 +94,8 @@ void EventPreprocessor<I>::preprocess_event() {
   m_snap_seqs = m_client_meta->snap_seqs;
   m_snap_seqs_updated = prune_snap_map(&m_snap_seqs);
 
-  int r = boost::apply_visitor(PreprocessEventVisitor(this),
-                               m_event_entry->event);
+  int r = std::visit(PreprocessEventVisitor(this),
+                     m_event_entry->event);
   if (r < 0) {
     finish(r);
     return;

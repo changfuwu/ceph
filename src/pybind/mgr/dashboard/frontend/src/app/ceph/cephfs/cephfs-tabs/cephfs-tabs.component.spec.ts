@@ -2,17 +2,16 @@ import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { Component, Input } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 
-import { TreeModule } from 'angular-tree-component';
-import * as _ from 'lodash';
-import { TabsModule } from 'ngx-bootstrap/tabs';
+import { NgbNavModule } from '@ng-bootstrap/ng-bootstrap';
+import _ from 'lodash';
 import { ToastrModule } from 'ngx-toastr';
 import { of } from 'rxjs';
 
-import { configureTestBed, i18nProviders } from '../../../../testing/unit-test-helper';
-import { CephfsService } from '../../../shared/api/cephfs.service';
-import { ViewCacheStatus } from '../../../shared/enum/view-cache-status.enum';
-import { CdTableSelection } from '../../../shared/models/cd-table-selection';
-import { SharedModule } from '../../../shared/shared.module';
+import { CephfsService } from '~/app/shared/api/cephfs.service';
+import { TableStatusViewCache } from '~/app/shared/classes/table-status-view-cache';
+import { ViewCacheStatus } from '~/app/shared/enum/view-cache-status.enum';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { CephfsClientsComponent } from '../cephfs-clients/cephfs-clients.component';
 import { CephfsDetailComponent } from '../cephfs-detail/cephfs-detail.component';
 import { CephfsDirectoriesComponent } from '../cephfs-directories/cephfs-directories.component';
@@ -36,7 +35,7 @@ describe('CephfsTabsComponent', () => {
   const setReload = (sth?: any) => (component['reloadSubscriber'] = sth);
   const mockRunOutside = () => {
     component['subscribeInterval'] = () => {
-      // It's mocked because the rxjs timer subscription ins't called through the use of 'tick'.
+      // It's mocked because the rxjs timer subscription isn't called through the use of 'tick'.
       setReload({
         unsubscribed: false,
         unsubscribe: () => {
@@ -49,24 +48,22 @@ describe('CephfsTabsComponent', () => {
     };
   };
 
-  const setSelection = (selection: object[]) => {
-    component.selection.selected = selection;
+  const setSelection = (selection: any) => {
+    component.selection = selection;
     component.ngOnChanges();
   };
 
   const selectFs = (id: number, name: string) => {
-    setSelection([
-      {
-        id,
-        mdsmap: {
-          info: {
-            something: {
-              name
-            }
+    setSelection({
+      id,
+      mdsmap: {
+        info: {
+          something: {
+            name
           }
         }
       }
-    ]);
+    });
   };
 
   const updateData = () => {
@@ -81,27 +78,20 @@ describe('CephfsTabsComponent', () => {
   }
 
   configureTestBed({
-    imports: [
-      SharedModule,
-      TabsModule.forRoot(),
-      HttpClientTestingModule,
-      TreeModule,
-      ToastrModule.forRoot()
-    ],
+    imports: [SharedModule, NgbNavModule, HttpClientTestingModule, ToastrModule.forRoot()],
     declarations: [
       CephfsTabsComponent,
       CephfsChartStubComponent,
       CephfsDetailComponent,
       CephfsDirectoriesComponent,
       CephfsClientsComponent
-    ],
-    providers: [i18nProviders]
+    ]
   });
 
   beforeEach(() => {
     fixture = TestBed.createComponent(CephfsTabsComponent);
     component = fixture.componentInstance;
-    component.selection = new CdTableSelection();
+    component.selection = undefined;
     data = {
       standbys: 'b',
       pools: [{}, {}],
@@ -113,7 +103,7 @@ describe('CephfsTabsComponent', () => {
         data: [{}, {}, {}, {}]
       }
     };
-    service = TestBed.get(CephfsService);
+    service = TestBed.inject(CephfsService);
     spyOn(service, 'getTabs').and.callFake(() => of(data));
 
     fixture.detectChanges();
@@ -126,14 +116,12 @@ describe('CephfsTabsComponent', () => {
   });
 
   it('should resist invalid mds info', () => {
-    setSelection([
-      {
-        id: 3,
-        mdsmap: {
-          info: {}
-        }
+    setSelection({
+      id: 3,
+      mdsmap: {
+        info: {}
       }
-    ]);
+    });
     expect(component.grafanaId).toBe(undefined);
   });
 
@@ -152,9 +140,9 @@ describe('CephfsTabsComponent', () => {
     };
     const defaultClients: Record<string, any> = {
       data: [],
-      status: ViewCacheStatus.ValueNone
+      status: new TableStatusViewCache(ViewCacheStatus.ValueNone)
     };
-    component['subscribeInterval'] = () => {};
+    component['subscribeInterval'] = () => undefined;
     updateData();
     expect(component.clients).not.toEqual(defaultClients);
     expect(component.details).not.toEqual(defaultDetails);
@@ -212,7 +200,7 @@ describe('CephfsTabsComponent', () => {
     });
 
     it('should should unsubscribe on deselect', () => {
-      setSelection([]);
+      setSelection(undefined);
       expect(old.unsubscribed).toBe(true);
       expect(getReload()).toBe(undefined); // Cleared timer subscription
     });

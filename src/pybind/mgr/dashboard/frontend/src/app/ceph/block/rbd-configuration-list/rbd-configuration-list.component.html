@@ -5,22 +5,21 @@
 </cd-table>
 
 <ng-template #configurationSourceTpl
-             let-row="row"
-             let-value="value">
+             let-value="data.value">
 
   <div [ngSwitch]="value">
     <span *ngSwitchCase="'global'"
-          i18n>{{ value | titlecase }}</span>
+          i18n>Global</span>
     <strong *ngSwitchCase="'image'"
-            i18n>{{ value | titlecase }}</strong>
+            i18n>Image</strong>
     <strong *ngSwitchCase="'pool'"
-            i18n>{{ value | titlecase }}</strong>
+            i18n>Pool</strong>
   </div>
 </ng-template>
 
 <ng-template #configurationValueTpl
-             let-row="row"
-             let-value="value">
+             let-row="data.row"
+             let-value="data.value">
   <div [ngSwitch]="row.type">
     <span *ngSwitchCase="typeField.bps">{{ value | dimlessBinaryPerSecond }}</span>
     <span *ngSwitchCase="typeField.milliseconds">{{ value | milliseconds }}</span>

@@ -16,12 +16,14 @@
 #ifndef DAMAGE_TABLE_H_
 #define DAMAGE_TABLE_H_
 
+#include "mdstypes.h"
+
+#include <memory>
+#include <string>
 #include <string_view>
 
-#include "mdstypes.h"
-#include "include/random.h"
-
 class CDir;
+class CInode;
 
 typedef uint64_t damage_entry_id_t;
 
@@ -29,18 +31,15 @@ typedef enum
 {
   DAMAGE_ENTRY_DIRFRAG,
   DAMAGE_ENTRY_DENTRY,
-  DAMAGE_ENTRY_BACKTRACE
+  DAMAGE_ENTRY_BACKTRACE,
+  DAMAGE_ENTRY_UNINLINE_FILE
 
 } damage_entry_type_t;
 
 class DamageEntry
 {
   public:
-    DamageEntry()
-    {
-      id = ceph::util::generate_random_number<damage_entry_id_t>(0, 0xffffffff);
-      reported_at = ceph_clock_now();
-    }
+    DamageEntry();
 
     virtual ~DamageEntry();
 
@@ -155,6 +154,22 @@ class DamageTable
      */
     bool notify_remote_damaged(inodeno_t ino, std::string_view path);
 
+    void remove_dentry_damage_entry(CDir *dir);
+
+    void remove_dirfrag_damage_entry(CDir *dir);
+
+    void remove_backtrace_damage_entry(inodeno_t ino);
+
+    /**
+     * Indicate that there was some error when attempting to unline data of
+     * the file.
+     *
+     * @return true if fatal
+     */
+    bool notify_uninline_failed(
+      inodeno_t ino, mds_rank_t rank, int32_t failure_errno,
+      std::string_view scrub_tag, std::string_view path);
+
     bool is_dentry_damaged(
       const CDir *dir_frag,
       std::string_view dname,
@@ -186,6 +201,9 @@ class DamageTable
     // Map of all inodes which could not be resolved remotely
     // (i.e. have probably/possibly missing backtraces)
     std::map<inodeno_t, DamageEntryRef> remotes;
+
+    // Map of all inodes for which Data Uninlining failed
+    std::map<inodeno_t, DamageEntryRef> uninline_failures;
 
     // All damage, by ID.  This is a secondary index
     // to the dirfrag, dentry, remote maps.  It exists

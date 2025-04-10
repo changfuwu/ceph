@@ -18,11 +18,13 @@
 
 #include "include/types.h"
 #include "include/fs_types.h"
+#include "include/mempool.h"
 #include "MClientRequest.h"
 
 #include "msg/Message.h"
 #include "include/ceph_features.h"
 #include "common/errno.h"
+#include "common/strescape.h"
 
 /***
  *
@@ -47,20 +49,23 @@
 
 struct LeaseStat {
   // this matches ceph_mds_reply_lease
-  __u16 mask;
-  __u32 duration_ms;  
-  __u32 seq;
+  __u16 mask = 0;
+  __u32 duration_ms = 0;
+  __u32 seq = 0;
+  std::string alternate_name;
 
-  LeaseStat() : mask(0), duration_ms(0), seq(0) {}
+  LeaseStat() = default;
   LeaseStat(__u16 msk, __u32 dur, __u32 sq) : mask{msk}, duration_ms{dur}, seq{sq} {}
 
   void decode(ceph::buffer::list::const_iterator &bl, const uint64_t features) {
     using ceph::decode;
     if (features == (uint64_t)-1) {
-      DECODE_START(1, bl);
+      DECODE_START(2, bl);
       decode(mask, bl);
       decode(duration_ms, bl);
       decode(seq, bl);
+      if (struct_v >= 2)
+        decode(alternate_name, bl);
       DECODE_FINISH(bl);
     }
     else {
@@ -72,7 +77,11 @@ struct LeaseStat {
 };
 
 inline std::ostream& operator<<(std::ostream& out, const LeaseStat& l) {
-  return out << "lease(mask " << l.mask << " dur " << l.duration_ms << ")";
+  out << "lease(mask " << l.mask << " dur " << l.duration_ms;
+  if (l.alternate_name.size()) {
+    out << " altn " << binstrprint(l.alternate_name, 128) << ")";
+  }
+  return out << ")";
 }
 
 struct DirStat {
@@ -106,6 +115,8 @@ struct DirStat {
 };
 
 struct InodeStat {
+  using optmetadata_singleton_client_t = optmetadata_singleton<optmetadata_client_t<std::allocator>,std::allocator>;
+
   vinodeno_t vino;
   uint32_t rdev = 0;
   version_t version = 0;
@@ -135,6 +146,12 @@ struct InodeStat {
   quota_info_t quota;
 
   mds_rank_t dir_pin;
+  std::map<std::string,std::string> snap_metadata;
+
+  std::vector<uint8_t> fscrypt_auth;
+  std::vector<uint8_t> fscrypt_file;
+
+  optmetadata_multiton<optmetadata_singleton_client_t,std::allocator> optmetadata;
 
  public:
   InodeStat() {}
@@ -142,10 +159,14 @@ struct InodeStat {
     decode(p, features);
   }
 
+  void print(std::ostream& os) const {
+    os << "InodeStat(... " << optmetadata << ")";
+  }
+
   void decode(ceph::buffer::list::const_iterator &p, const uint64_t features) {
     using ceph::decode;
     if (features == (uint64_t)-1) {
-      DECODE_START(2, p);
+      DECODE_START(8, p);
       decode(vino.ino, p);
       decode(vino.snapid, p);
       decode(rdev, p);
@@ -193,6 +214,24 @@ struct InodeStat {
       if (struct_v >= 3) {
         decode(snap_btime, p);
       } // else remains zero
+      if (struct_v >= 4) {
+        decode(rstat.rsnaps, p);
+      } // else remains zero
+      if (struct_v >= 5) {
+        decode(snap_metadata, p);
+      }
+      if (struct_v >= 6) {
+        bool fscrypt_flag;
+
+        decode(fscrypt_flag, p); // ignore this
+      }
+      if (struct_v >= 7) {
+        decode(fscrypt_auth, p);
+        decode(fscrypt_file, p);
+      }
+      if (struct_v >= 8) {
+        decode(optmetadata, p);
+      }
       DECODE_FINISH(p);
     }
     else {
@@ -263,7 +302,7 @@ struct InodeStat {
 };
 
 struct openc_response_t {
-  _inodeno_t			created_ino;
+  _inodeno_t			created_ino{0};
   interval_set<inodeno_t>	delegated_inos;
 
 public:
@@ -281,10 +320,20 @@ public:
     decode(delegated_inos, p);
     DECODE_FINISH(p);
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("created_ino", created_ino);
+    f->dump_stream("delegated_inos") << delegated_inos;
+  }
+  static void generate_test_instances(std::list<openc_response_t*>& ls) {
+    ls.push_back(new openc_response_t);
+    ls.push_back(new openc_response_t);
+    ls.back()->created_ino = 1;
+    ls.back()->delegated_inos.insert(1, 10);
+  }
 } __attribute__ ((__may_alias__));
 WRITE_CLASS_ENCODER(openc_response_t)
 
-class MClientReply : public SafeMessage {
+class MClientReply final : public MMDSOp {
 public:
   // reply data
   struct ceph_mds_reply_head head {};
@@ -298,26 +347,33 @@ public:
   epoch_t get_mdsmap_epoch() const { return head.mdsmap_epoch; }
 
   int get_result() const {
-    return ceph_to_hostos_errno((__s32)(__u32)head.result);
+    // MDS now uses host errors, as defined in errno.cc, for current platform.
+    // errorcode32_t is converting, internally, the error code from host to ceph, when encoding, and vice versa,
+    // when decoding, resulting having LINUX codes on the wire, and HOST code on the receiver.
+    // assumes this code is executing after decode_payload() function has been called
+    return head.result;
   }
 
-  void set_result(int r) { head.result = r; }
+  // errorcode32_t is used in decode/encode methods
+  void set_result(int r) {
+    head.result = r;
+  }
 
   void set_unsafe() { head.safe = 0; }
 
   bool is_safe() const { return head.safe; }
 
 protected:
-  MClientReply() : SafeMessage{CEPH_MSG_CLIENT_REPLY} {}
+  MClientReply() : MMDSOp{CEPH_MSG_CLIENT_REPLY} {}
   MClientReply(const MClientRequest &req, int result = 0) :
-    SafeMessage{CEPH_MSG_CLIENT_REPLY} {
+    MMDSOp{CEPH_MSG_CLIENT_REPLY} {
     memset(&head, 0, sizeof(head));
     header.tid = req.get_tid();
     head.op = req.get_op();
-    head.result = result;
     head.safe = 1;
+    set_result(result);
   }
-  ~MClientReply() override {}
+  ~MClientReply() final {}
 
 public:
   std::string_view get_type_name() const override { return "creply"; }
@@ -341,6 +397,13 @@ public:
     using ceph::decode;
     auto p = payload.cbegin();
     decode(head, p);
+    // errorcode32_t implements conversion from/to different host error codes
+    // casting needed since error codes are signed int32 and head.result is unsigned int32
+    // errortype_t::code_t is alias for __s32, which is signed
+    // ceph_mds_reply_head::code_t is alias for __le32 which is unsigned
+    errorcode32_t temp;
+    temp.set_wire_to_host(static_cast<errorcode32_t::code_t>(head.result));
+    head.result = static_cast<ceph_mds_reply_head::code_t>(temp.code);
     decode(trace_bl, p);
     decode(extra_bl, p);
     decode(snapbl, p);
@@ -348,7 +411,16 @@ public:
   }
   void encode_payload(uint64_t features) override {
     using ceph::encode;
-    encode(head, payload);
+    // errorcode32_t implements conversion from/to different host error codes
+    // casting needed since error codes are signed int32 and head.result is unsigned int32
+    // errortype_t::code_t is alias for __s32, which is signed
+    // ceph_mds_reply_head::code_t is alias for __le32 which is unsigned
+    // the Messenger layer expects to be able to call encode_payload multiple times on message retries
+    // this is the reason we must copy the head and to modify the copy's 'result' field
+    auto temp_head = head;
+    errorcode32_t temp{static_cast<errorcode32_t::code_t>(temp_head.result)};
+    temp_head.result = static_cast<ceph_mds_reply_head::code_t>(temp.get_host_to_wire());
+    encode(temp_head, payload);
     encode(trace_bl, payload);
     encode(extra_bl, payload);
     encode(snapbl, payload);
@@ -357,7 +429,7 @@ public:
 
   // dir contents
   void set_extra_bl(ceph::buffer::list& bl) {
-    extra_bl.claim(bl);
+    extra_bl = std::move(bl);
   }
   ceph::buffer::list& get_extra_bl() {
     return extra_bl;
@@ -368,7 +440,7 @@ public:
 
   // trace
   void set_trace(ceph::buffer::list& bl) {
-    trace_bl.claim(bl);
+    trace_bl = std::move(bl);
   }
   ceph::buffer::list& get_trace_bl() {
     return trace_bl;
@@ -379,6 +451,8 @@ public:
 private:
   template<class T, typename... Args>
   friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
+  template<class T, typename... Args>
+  friend MURef<T> crimson::make_message(Args&&... args);
 };
 
 #endif

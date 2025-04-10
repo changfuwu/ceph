@@ -9,13 +9,12 @@
 #include <string>
 #include <vector>
 
-class ContextWQ;
-
 struct Context;
 
 namespace librbd {
 
 struct ImageCtx;
+namespace asio { struct ContextWQ; }
 
 namespace api {
 
@@ -31,6 +30,11 @@ struct Mirror {
 
   static int mode_get(librados::IoCtx& io_ctx, rbd_mirror_mode_t *mirror_mode);
   static int mode_set(librados::IoCtx& io_ctx, rbd_mirror_mode_t mirror_mode);
+
+  static int remote_namespace_get(librados::IoCtx& io_ctx,
+                                  std::string* remote_namespace);
+  static int remote_namespace_set(librados::IoCtx& io_ctx,
+                                  const std::string& remote_namespace);
 
   static int uuid_get(librados::IoCtx& io_ctx, std::string* mirror_uuid);
   static void uuid_get(librados::IoCtx& io_ctx, std::string* mirror_uuid,
@@ -95,11 +99,11 @@ struct Mirror {
                              mirror_image_info_t *mirror_image_info,
                              Context *on_finish);
   static int image_get_info(librados::IoCtx& io_ctx,
-                            ContextWQ *op_work_queue,
+                            asio::ContextWQ *op_work_queue,
                             const std::string &image_id,
                             mirror_image_info_t *mirror_image_info);
   static void image_get_info(librados::IoCtx& io_ctx,
-                             ContextWQ *op_work_queue,
+                             asio::ContextWQ *op_work_queue,
                              const std::string &image_id,
                              mirror_image_info_t *mirror_image_info,
                              Context *on_finish);
@@ -113,7 +117,10 @@ struct Mirror {
                                       Context *on_finish);
   static int image_get_instance_id(ImageCtxT *ictx, std::string *instance_id);
 
-  static int image_snapshot_create(ImageCtxT *ictx, uint64_t *snap_id);
+  static int image_snapshot_create(ImageCtxT *ictx, uint32_t flags,
+                                   uint64_t *snap_id);
+  static void image_snapshot_create(ImageCtxT *ictx, uint32_t flags,
+                                    uint64_t *snap_id, Context *on_finish);
 };
 
 } // namespace api

@@ -4,6 +4,8 @@
           [columns]="columns"
           columnMode="flex"
           selectionType="single"
+          [hasDetails]="true"
+          (setExpandedRow)="setExpandedRow($event)"
           (updateSelection)="updateSelection($event)"
           identifier="module"
           (fetchData)="getModuleList($event)">
@@ -12,7 +14,7 @@
                     [selection]="selection"
                     [tableActions]="tableActions">
   </cd-table-actions>
-  <cd-mgr-module-details cdTableDetail
-                         [selection]="selection">
+  <cd-mgr-module-details *cdTableDetail
+                         [selection]="expandedRow">
   </cd-mgr-module-details>
 </cd-table>

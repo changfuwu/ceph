@@ -52,9 +52,37 @@ function get_osds_up() {
     local objectname=$2
 
     local osds=$(ceph --format xml osd map $poolname $objectname 2>/dev/null | \
-        $XMLSTARLET sel -t -m "//up/osd" -v . -o ' ')
+        xmlstarlet sel -t -m "//up/osd" -v . -o ' ')
     # get rid of the trailing space
     echo $osds
+}
+
+function TEST_reweight_vs_classes() {
+    local dir=$1
+
+    # CrushWrapper::update_item (and ceph osd crush set) must rebuild the shadow
+    # tree too. https://tracker.ceph.com/issues/48065
+
+    run_mon $dir a || return 1
+    run_osd $dir 0 || return 1
+    run_osd $dir 1 || return 1
+    run_osd $dir 2 || return 1
+
+    ceph osd crush set-device-class ssd osd.0 || return 1
+    ceph osd crush class ls-osd ssd | grep 0 || return 1
+    ceph osd crush set-device-class ssd osd.1 || return 1
+    ceph osd crush class ls-osd ssd | grep 1 || return 1
+
+    ceph osd crush reweight osd.0 1
+
+    h=`hostname -s`
+    ceph osd crush dump | jq ".buckets[] | select(.name==\"$h\") | .items[0].weight" | grep 65536
+    ceph osd crush dump | jq ".buckets[] | select(.name==\"$h~ssd\") | .items[0].weight" | grep 65536
+
+    ceph osd crush set 0 2 host=$h
+
+    ceph osd crush dump | jq ".buckets[] | select(.name==\"$h\") | .items[0].weight" | grep 131072
+    ceph osd crush dump | jq ".buckets[] | select(.name==\"$h~ssd\") | .items[0].weight" | grep 131072
 }
 
 function TEST_classes() {

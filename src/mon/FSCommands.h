@@ -19,26 +19,31 @@
 #include "Monitor.h"
 #include "CommandHandler.h"
 
-#include "osd/OSDMap.h"
-#include "mds/FSMap.h"
-
+#include <iosfwd>
+#include <memory>
 #include <string>
-#include <sstream>
+#include <variant>
+
+class Filesystem;
+class FSMap;
+class OSDMap;
 
 class FileSystemCommandHandler : protected CommandHandler
 {
 protected:
   std::string prefix;
 
+  using fs_or_fscid = std::variant<Filesystem*, fs_cluster_id_t>;
   enum {
     POOL_METADATA,
     POOL_DATA_DEFAULT,
     POOL_DATA_EXTRA,
   };
+
   /**
    * Return 0 if the pool is suitable for use with CephFS, or
    * in case of errors return a negative error code, and populate
-   * the passed stringstream with an explanation.
+   * the passed ostream with an explanation.
    *
    * @param metadata whether the pool will be for metadata (stricter checks)
    */
@@ -47,9 +52,12 @@ protected:
       const int64_t pool_id,
       int type,
       bool force,
-      std::stringstream *ss) const;
+      std::ostream *ss,
+      bool allow_overlay = false) const;
 
-  virtual std::string const &get_prefix() {return prefix;}
+  virtual std::string const &get_prefix() const {return prefix;}
+
+  int set_val(Monitor *mon, FSMap& fsmap, MonOpRequestRef op, const cmdmap_t& cmdmap, std::ostream &ss, fs_or_fscid fs, std::string var, std::string val);
 
 public:
   FileSystemCommandHandler(const std::string &prefix_)
@@ -59,23 +67,39 @@ public:
   virtual ~FileSystemCommandHandler()
   {}
 
-  bool can_handle(std::string const &prefix_)
+  int is_op_allowed(const MonOpRequestRef& op, const FSMap& fsmap,
+		    const cmdmap_t& cmdmap, std::ostream &ss) const;
+
+  int can_handle(std::string const &prefix_, MonOpRequestRef& op, FSMap& fsmap,
+	         const cmdmap_t& cmdmap, std::ostream &ss) const
   {
-    return get_prefix() == prefix_;
+    if (get_prefix() != prefix_) {
+      return 0;
+    }
+
+    if (get_prefix() == "fs new" || get_prefix() == "fs flag set") {
+      return 1;
+    }
+
+    return is_op_allowed(op, fsmap, cmdmap, ss);
   }
 
   static std::list<std::shared_ptr<FileSystemCommandHandler> > load(Paxos *paxos);
-
-  virtual bool batched_propose() {
-    return false;
-  }
 
   virtual int handle(
     Monitor *mon,
     FSMap &fsmap,
     MonOpRequestRef op,
     const cmdmap_t& cmdmap,
-    std::stringstream &ss) = 0;
+    std::ostream &ss) = 0;
 };
+
+
+static constexpr auto errmsg_for_unhealthy_mds = \
+  "MDS has one of two health warnings which could extend recovery: "
+  "MDS_TRIM or MDS_CACHE_OVERSIZED. MDS failover is not recommended "
+  "since it might cause unexpected file system unavailability. If "
+  "you wish to proceed, pass --yes-i-really-mean-it";
+
 
 #endif

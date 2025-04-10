@@ -16,12 +16,16 @@
 
 #include <stdio.h>
 
+#include <iostream> // for std::cout
+
 #include "global/global_init.h"
 #include "common/ceph_argparse.h"
 #include "global/global_context.h"
 #include "gtest/gtest.h"
 #include "include/btree_map.h"
 #include "include/mempool.h"
+
+using namespace std;
 
 void check_usage(mempool::pool_index_t ix)
 {
@@ -366,6 +370,21 @@ TEST(mempool, bufferlist_reassign)
   ASSERT_EQ(bytes_before, mempool::osd::allocated_bytes());
 }
 
+TEST(mempool, bufferlist_c_str)
+{
+  bufferlist bl;
+  int len = 1048576;
+  size_t before = mempool::osd::allocated_bytes();
+  bl.append(buffer::create_aligned(len, 4096));
+  bl.append(buffer::create_aligned(len, 4096));
+  bl.reassign_to_mempool(mempool::mempool_osd);
+  size_t after = mempool::osd::allocated_bytes();
+  ASSERT_GE(after, before + len * 2);
+  bl.c_str();
+  size_t after_c_str = mempool::osd::allocated_bytes();
+  ASSERT_EQ(after, after_c_str);
+}
+
 TEST(mempool, btree_map_test)
 {
   typedef mempool::pool_allocator<mempool::mempool_osd,
@@ -387,12 +406,43 @@ TEST(mempool, btree_map_test)
   ASSERT_EQ(0, mempool::osd::allocated_bytes());
 }
 
+TEST(mempool, check_shard_select)
+{
+  const size_t samples = mempool::get_num_shards() * 30;
+
+  std::unique_ptr<std::atomic_int[]> shards =
+    std::make_unique<std::atomic_int[]>(mempool::get_num_shards());
+
+  std::vector<std::thread> workers;
+  for (size_t i = 0; i < samples; i++) {
+    workers.push_back(
+      std::thread([&](){
+          size_t i = mempool::pick_a_shard_int();
+          shards[i]++;
+        }));
+  }
+  for (auto& t:workers) {
+    t.join();
+  }
+  workers.clear();
+
+#if !defined(MEMPOOL_SCHED_GETCPU)
+  size_t missed = 0;
+  for (size_t i = 0; i < mempool::get_num_shards(); i++) {
+    if (shards[i] != 30) {
+      // Each shard is expected to have exactly 30 threads
+      missed++;
+    }
+  }
+  EXPECT_EQ(missed, 0u);
+#endif
+  // Else: test_c2c.cc is a better test of the sharding algorithm
+}
 
 
 int main(int argc, char **argv)
 {
-  vector<const char*> args;
-  argv_to_vec(argc, (const char **)argv, args);
+  auto args = argv_to_vec(argc, argv);
 
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
 			 CODE_ENVIRONMENT_UTILITY,

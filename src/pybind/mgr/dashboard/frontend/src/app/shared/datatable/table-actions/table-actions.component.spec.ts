@@ -1,11 +1,13 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { configureTestBed, PermissionHelper } from '../../../../testing/unit-test-helper';
-import { ComponentsModule } from '../../components/components.module';
-import { CdTableAction } from '../../models/cd-table-action';
-import { CdTableSelection } from '../../models/cd-table-selection';
-import { Permission } from '../../models/permissions';
+import { PipesModule } from '~/app/shared/pipes/pipes.module';
+
+import { ComponentsModule } from '~/app/shared/components/components.module';
+import { CdTableAction } from '~/app/shared/models/cd-table-action';
+import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
+import { Permission } from '~/app/shared/models/permissions';
+import { configureTestBed, PermissionHelper } from '~/testing/unit-test-helper';
 import { TableActionsComponent } from './table-actions.component';
 
 describe('TableActionsComponent', () => {
@@ -21,7 +23,7 @@ describe('TableActionsComponent', () => {
 
   configureTestBed({
     declarations: [TableActionsComponent],
-    imports: [ComponentsModule, RouterTestingModule]
+    imports: [ComponentsModule, PipesModule, RouterTestingModule]
   });
 
   beforeEach(() => {
@@ -123,52 +125,92 @@ describe('TableActionsComponent', () => {
     expect(tableActions).toEqual({
       'create,update,delete': {
         actions: ['Add', 'Edit', 'Protect', 'Unprotect', 'Copy', 'Delete'],
-        primary: { multiple: 'Delete', executing: 'Edit', single: 'Edit', no: 'Add' }
+        primary: {
+          multiple: 'Add',
+          executing: 'Add',
+          single: 'Add',
+          no: 'Add'
+        }
       },
       'create,update': {
         actions: ['Add', 'Edit', 'Protect', 'Unprotect', 'Copy'],
-        primary: { multiple: 'Add', executing: 'Edit', single: 'Edit', no: 'Add' }
+        primary: {
+          multiple: 'Add',
+          executing: 'Add',
+          single: 'Add',
+          no: 'Add'
+        }
       },
       'create,delete': {
         actions: ['Add', 'Copy', 'Delete'],
-        primary: { multiple: 'Delete', executing: 'Copy', single: 'Copy', no: 'Add' }
+        primary: {
+          multiple: 'Add',
+          executing: 'Add',
+          single: 'Add',
+          no: 'Add'
+        }
       },
       create: {
         actions: ['Add', 'Copy'],
-        primary: { multiple: 'Add', executing: 'Copy', single: 'Copy', no: 'Add' }
+        primary: {
+          multiple: 'Add',
+          executing: 'Add',
+          single: 'Add',
+          no: 'Add'
+        }
       },
       'update,delete': {
         actions: ['Edit', 'Protect', 'Unprotect', 'Delete'],
-        primary: { multiple: 'Delete', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       update: {
         actions: ['Edit', 'Protect', 'Unprotect'],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       delete: {
         actions: ['Delete'],
-        primary: { multiple: 'Delete', executing: 'Delete', single: 'Delete', no: 'Delete' }
+        primary: {
+          multiple: 'Delete',
+          executing: 'Delete',
+          single: 'Delete',
+          no: 'Delete'
+        }
       },
       'no-permissions': {
         actions: [],
-        primary: { multiple: '', executing: '', single: '', no: '' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       }
     });
   });
 
   it('should convert any name to a proper CSS class', () => {
-    expect(component.toClassName('Create')).toBe('create');
-    expect(component.toClassName('Mark x down')).toBe('mark-x-down');
-    expect(component.toClassName('?Su*per!')).toBe('super');
+    expect(component.toClassName({ name: 'Create' } as CdTableAction)).toBe('create');
+    expect(component.toClassName({ name: 'Mark x down' } as CdTableAction)).toBe('mark-x-down');
+    expect(component.toClassName({ name: '?Su*per!' } as CdTableAction)).toBe('super');
   });
 
   describe('useDisableDesc', () => {
-    it('should return a description if disableDesc is set for action', () => {
+    it('should return a description if disable method returns a string', () => {
       const deleteWithDescAction: CdTableAction = {
         permission: 'delete',
         icon: 'fa-times',
         canBePrimary: (selection: CdTableSelection) => selection.hasSelection,
-        disableDesc: () => {
+        disable: () => {
           return 'Delete action disabled description';
         },
         name: 'DeleteDesc'
@@ -179,7 +221,7 @@ describe('TableActionsComponent', () => {
       );
     });
 
-    it('should return no description if disableDesc is not set for action', () => {
+    it('should return no description if disable does not return string', () => {
       expect(component.useDisableDesc(deleteAction)).toBeUndefined();
     });
   });

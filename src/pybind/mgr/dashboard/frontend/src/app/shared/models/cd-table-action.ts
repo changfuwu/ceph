@@ -19,17 +19,17 @@ export class CdTableAction {
   // The font awesome icon that will be used
   icon: string;
 
-  // You can define the condition to disable the action.
-  // By default all 'update' and 'delete' actions will only be enabled
-  // if one selection is made and no task is running on the selected item.
-  disable?: (_: CdTableSelection) => boolean;
-
+  // For adding the default tooltip
+  title?: string;
   /**
+   * You can define the condition to disable the action.
+   * By default all 'update' and 'delete' actions will only be enabled
+   * if one selection is made and no task is running on the selected item.`
+   *
    * In some cases you might want to give the user a hint why a button is
-   * disabled. The specified message will be shown to the user as a button
-   * tooltip.
-   */
-  disableDesc?: Function;
+   * disabled. This is achieved by returning a string.
+   * */
+  disable?: (_: CdTableSelection) => boolean | string;
 
   /**
    * Defines if the button can become 'primary' (displayed as button and not
@@ -43,4 +43,14 @@ export class CdTableAction {
   // In some rare cases you want to hide a action that can be used by the user for example
   // if one action can lock the item and another action unlocks it
   visible?: (_: CdTableSelection) => boolean;
+
+  buttonKind?:
+    | 'primary'
+    | 'secondary'
+    | 'tertiary'
+    | 'ghost'
+    | 'danger'
+    | 'danger--primary'
+    | 'danger--tertiary'
+    | 'danger--ghost' = 'primary';
 }

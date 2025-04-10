@@ -1,8 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#ifndef RGW_META_SYNC_STATUS_H
-#define RGW_META_SYNC_STATUS_H
+#pragma once
 
 #include <string>
 
@@ -30,7 +29,7 @@ struct rgw_meta_sync_info {
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(state, bl);
     decode(num_shards, bl);
     if (struct_v >= 2) {
@@ -54,8 +53,8 @@ struct rgw_meta_sync_marker {
     IncrementalSync = 1,
   };
   uint16_t state;
-  string marker;
-  string next_step_marker;
+  std::string marker;
+  std::string next_step_marker;
   uint64_t total_entries;
   uint64_t pos;
   real_time timestamp;
@@ -97,7 +96,7 @@ WRITE_CLASS_ENCODER(rgw_meta_sync_marker)
 
 struct rgw_meta_sync_status {
   rgw_meta_sync_info sync_info;
-  map<uint32_t, rgw_meta_sync_marker> sync_markers;
+  std::map<uint32_t, rgw_meta_sync_marker> sync_markers;
 
   rgw_meta_sync_status() {}
 
@@ -120,5 +119,3 @@ struct rgw_meta_sync_status {
   static void generate_test_instances(std::list<rgw_meta_sync_status*>& ls);
 };
 WRITE_CLASS_ENCODER(rgw_meta_sync_status)
-
-#endif

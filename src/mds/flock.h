@@ -3,10 +3,13 @@
 #ifndef CEPH_MDS_FLOCK_H
 #define CEPH_MDS_FLOCK_H
 
-#include <errno.h>
+#include "include/ceph_fs.h" // for ceph_filelock
+#include "include/types.h" // for client_t
 
-#include "common/debug.h"
-#include "mdstypes.h"
+#include <cstdint>
+#include <list>
+#include <map>
+#include <ostream>
 
 inline std::ostream& operator<<(std::ostream& out, const ceph_filelock& l) {
   out << "start: " << l.start << ", length: " << l.length
@@ -71,6 +74,7 @@ inline bool operator!=(const ceph_filelock& l, const ceph_filelock& r) {
 class ceph_lock_state_t {
 public:
   explicit ceph_lock_state_t(CephContext *cct_, int type_) : cct(cct_), type(type_) {}
+  ceph_lock_state_t() : cct(NULL), type(0) {}
   ~ceph_lock_state_t();
   /**
    * Check if a lock is on the waiting_locks list.
@@ -132,6 +136,8 @@ public:
     decode(held_locks, bl);
     decode(client_held_lock_counts, bl);
   }
+  void dump(ceph::Formatter *f) const;
+  static void generate_test_instances(std::list<ceph_lock_state_t*>& ls);
   bool empty() const {
     return held_locks.empty() && waiting_locks.empty() &&
 	   client_held_lock_counts.empty() &&

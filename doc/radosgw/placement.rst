@@ -28,8 +28,8 @@ Storage Classes
 
 .. versionadded:: Nautilus
 
-Storage classes are used to customize the placement of object data. S3 Bucket
-Lifecycle rules can automate the transition of objects between storage classes.
+Storage classes specify the placement of object data. S3 Bucket
+Lifecycle (LC) rules can automate the transition of objects between storage classes.
 
 Storage classes are defined in terms of placement targets. Each zonegroup
 placement target lists its available storage classes with an initial class
@@ -86,7 +86,8 @@ The zone placement configuration can be queried with:
                       }
                   },
                   "data_extra_pool": "default.rgw.buckets.non-ec",
-                  "index_type": 0
+                  "index_type": 0,
+                  "inline_data": true
               }
           }
       ],
@@ -103,7 +104,7 @@ The zone placement configuration can be queried with:
 Adding a Placement Target
 -------------------------
 
-To create a new placement target named ``temporary``, start by adding it to
+To create a new placement target named ``temporary``, add it to
 the zonegroup:
 
 ::
@@ -123,10 +124,24 @@ Then provide the zone placement info for that target:
         --index-pool default.rgw.temporary.index \
         --data-extra-pool default.rgw.temporary.non-ec
 
+.. note:: With default placement target settings, RGW stores an object's first data chunk in the RADOS `HEAD` object along
+          with XATTR metadata. The `--placement-inline-data=false` flag may be passed with the `zone placement add` or
+          `zone placement modify` commands to change this behavior for new objects stored on the target.
+          When data is stored inline (default), it may provide an advantage for read/write workloads since the first chunk of
+          an object's data can be retrieved/stored in a single librados call along with object metadata. On the other hand, a
+          target that does not store data inline can provide a performance benefit for RGW client delete requests when
+          the BlueStore DB is located on faster storage than bucket data since it eliminates the need to access
+          slower devices synchronously while processing the client request. In that case, data associated with the deleted
+          objects is removed asynchronously in the background by garbage collection. Note that inlining is only ever performed
+          when writing to the default storage class.  Inlining is *never* performed when writing to a non-default
+	  storage class.
+
+.. _adding_a_storage_class:
+
 Adding a Storage Class
 ----------------------
 
-To add a new storage class named ``GLACIER`` to the ``default-placement`` target,
+To add a new storage class named ``STANDARD_IA`` to the ``default-placement`` target,
 start by adding it to the zonegroup:
 
 ::
@@ -134,7 +149,7 @@ start by adding it to the zonegroup:
   $ radosgw-admin zonegroup placement add \
         --rgw-zonegroup default \
         --placement-id default-placement \
-        --storage-class GLACIER
+        --storage-class STANDARD_IA
 
 Then provide the zone placement info for that storage class:
 
@@ -143,7 +158,7 @@ Then provide the zone placement info for that storage class:
   $ radosgw-admin zone placement add \
         --rgw-zone default \
         --placement-id default-placement \
-        --storage-class GLACIER \
+        --storage-class STANDARD_IA \
         --data-pool default.rgw.glacier.data \
         --compression lz4
 
@@ -239,12 +254,19 @@ name in an HTTP header with the request. The S3 protocol uses the
 ``X-Amz-Storage-Class`` header, while the Swift protocol uses the
 ``X-Object-Storage-Class`` header.
 
-When using AWS S3 SDKs such as python boto3, it is important that the non-default
-storage class will be called as one on of the AWS S3 allowed storage classes, or else the SDK
-will drop the request and raise an exception.
-
 S3 Object Lifecycle Management can then be used to move object data between
 storage classes using ``Transition`` actions.
+
+When using AWS S3 SDKs such as ``boto3``, it is important that
+storage class names match those provided by AWS S3, or else the SDK
+will drop the request and raise an exception.  Moreover, some S3 clients
+and libraries expect AWS-specific behavior when a storage class named
+or prefixed with ``GLACIER`` is used and thus will fail when accessing
+Ceph RGW services.  For this reason we advise that other storage class
+names be used with Ceph, including ``INTELLIGENT-TIERING``, ``STANDARD_IA``,
+``REDUCED_REDUNDANCY``, and ``ONEZONE_IA``. Custom storage class names like
+``CHEAPNDEEP`` are accepted by Ceph but might not be by some clients and
+libraries.
 
 .. _`Pools`: ../pools
 .. _`Multisite Configuration`: ../multisite

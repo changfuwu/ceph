@@ -1,10 +1,10 @@
-import sys
+import errno
 import logging
 import signal
 from textwrap import dedent
-from tasks.cephfs.fuse_mount import FuseMount
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
-from teuthology.orchestra.run import CommandFailedError, Raw
+from teuthology.orchestra.run import Raw
+from teuthology.exceptions import CommandFailedError
 
 log = logging.getLogger(__name__)
 
@@ -39,23 +39,37 @@ class TestSnapshots(CephFSTestCase):
     def _get_pending_snap_destroy(self, rank=0, status=None):
         return self._get_snapserver_dump(rank,status=status)["pending_destroy"]
 
+    def test_allow_new_snaps_config(self):
+        """
+        Check whether 'allow_new_snaps' setting works
+        """
+        self.mount_a.run_shell(["mkdir", "test-allow-snaps"])
+
+        self.fs.set_allow_new_snaps(False);
+        try:
+            self.mount_a.run_shell(["mkdir", "test-allow-snaps/.snap/snap00"])
+        except CommandFailedError as ce:
+            self.assertEqual(ce.exitstatus, errno.EPERM, "expected EPERM")
+        else:
+            self.fail("expected snap creatiion to fail")
+
+        self.fs.set_allow_new_snaps(True);
+        self.mount_a.run_shell(["mkdir", "test-allow-snaps/.snap/snap00"])
+        self.mount_a.run_shell(["rmdir", "test-allow-snaps/.snap/snap00"])
+        self.mount_a.run_shell(["rmdir", "test-allow-snaps"])
+
     def test_kill_mdstable(self):
         """
         check snaptable transcation
         """
-        if not isinstance(self.mount_a, FuseMount):
-            self.skipTest("Require FUSE client to forcibly kill mount")
-
         self.fs.set_allow_new_snaps(True);
         self.fs.set_max_mds(2)
         status = self.fs.wait_for_daemons()
 
-        grace = float(self.fs.get_config("mds_beacon_grace", service_type="mon"))
-
         # setup subtrees
         self.mount_a.run_shell(["mkdir", "-p", "d1/dir"])
         self.mount_a.setfattr("d1", "ceph.dir.pin", "1")
-        self.wait_until_true(lambda: self._check_subtree(1, '/d1', status=status), timeout=30)
+        self._wait_subtrees([("/d1", 1)], rank=1, path="/d1")
 
         last_created = self._get_last_created_snap(rank=0,status=status)
 
@@ -72,7 +86,7 @@ class TestSnapshots(CephFSTestCase):
             self.fs.rank_freeze(True, rank=0)
             self.fs.rank_asok(['config', 'set', "mds_kill_mdstable_at", "{0}".format(i)], rank=0, status=status)
             proc = self.mount_a.run_shell(["mkdir", "d1/dir/.snap/s1{0}".format(i)], wait=False)
-            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=0), timeout=grace*2);
+            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=0), timeout=self.fs.beacon_timeout);
             self.delete_mds_coredump(rank0['name']);
 
             self.fs.rank_fail(rank=0)
@@ -100,13 +114,12 @@ class TestSnapshots(CephFSTestCase):
             self.fs.rank_freeze(True, rank=1) # prevent failover...
             self.fs.rank_asok(['config', 'set', "mds_kill_mdstable_at", "{0}".format(i)], rank=0, status=status)
             proc = self.mount_a.run_shell(["mkdir", "d1/dir/.snap/s2{0}".format(i)], wait=False)
-            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=0), timeout=grace*2);
+            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=0), timeout=self.fs.beacon_timeout);
             self.delete_mds_coredump(rank0['name']);
 
             self.fs.rank_signal(signal.SIGKILL, rank=1)
 
-            self.mount_a.kill()
-            self.mount_a.kill_cleanup()
+            self.mount_a.suspend_netns()
 
             self.fs.rank_fail(rank=0)
             self.fs.mds_restart(rank0['name'])
@@ -131,8 +144,13 @@ class TestSnapshots(CephFSTestCase):
                 else:
                     self.assertGreater(self._get_last_created_snap(rank=0), last_created)
 
-            self.mount_a.mount()
-            self.mount_a.wait_until_mounted()
+            self.mount_a.resume_netns()
+            try:
+                proc.wait()
+            except CommandFailedError:
+                pass
+            self.mount_a.remount()
+            self.fs.flush()
 
         self.mount_a.run_shell(["rmdir", Raw("d1/dir/.snap/*")])
 
@@ -149,11 +167,10 @@ class TestSnapshots(CephFSTestCase):
             self.fs.rank_freeze(True, rank=1) # prevent failover...
             self.fs.rank_asok(['config', 'set', "mds_kill_mdstable_at", "{0}".format(i)], rank=1, status=status)
             proc = self.mount_a.run_shell(["mkdir", "d1/dir/.snap/s3{0}".format(i)], wait=False)
-            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=1), timeout=grace*2);
+            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=1), timeout=self.fs.beacon_timeout);
             self.delete_mds_coredump(rank1['name']);
 
-            self.mount_a.kill()
-            self.mount_a.kill_cleanup()
+            self.mount_a.suspend_netns()
 
             if i in [3,4]:
                 self.assertEqual(len(self._get_pending_snap_update(rank=0)), 1)
@@ -173,8 +190,13 @@ class TestSnapshots(CephFSTestCase):
                 else:
                     self.assertGreater(self._get_last_created_snap(rank=0), last_created)
 
-            self.mount_a.mount()
-            self.mount_a.wait_until_mounted()
+            self.mount_a.resume_netns()
+            try:
+                proc.wait()
+            except CommandFailedError:
+                pass
+            self.mount_a.remount()
+            self.fs.flush()
 
         self.mount_a.run_shell(["rmdir", Raw("d1/dir/.snap/*")])
 
@@ -192,11 +214,10 @@ class TestSnapshots(CephFSTestCase):
         self.fs.rank_asok(['config', 'set', "mds_kill_mdstable_at", "8"], rank=0, status=status)
         self.fs.rank_asok(['config', 'set', "mds_kill_mdstable_at", "3"], rank=1, status=status)
         proc = self.mount_a.run_shell(["mkdir", "d1/dir/.snap/s4"], wait=False)
-        self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=1), timeout=grace*2);
+        self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=1), timeout=self.fs.beacon_timeout);
         self.delete_mds_coredump(rank1['name']);
 
-        self.mount_a.kill()
-        self.mount_a.kill_cleanup()
+        self.mount_a.suspend_netns()
 
         self.assertEqual(len(self._get_pending_snap_update(rank=0)), 1)
 
@@ -205,7 +226,7 @@ class TestSnapshots(CephFSTestCase):
         self.wait_for_daemon_start([rank1['name']])
 
         # rollback triggers assertion
-        self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=0), timeout=grace*2);
+        self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=0), timeout=self.fs.beacon_timeout);
         self.delete_mds_coredump(rank0['name']);
         self.fs.rank_fail(rank=0)
         self.fs.mds_restart(rank0['name'])
@@ -216,8 +237,13 @@ class TestSnapshots(CephFSTestCase):
         self.wait_until_true(lambda: len(self._get_pending_snap_update(rank=0)) == 0, timeout=30)
         self.assertEqual(self._get_last_created_snap(rank=0), last_created)
 
-        self.mount_a.mount()
-        self.mount_a.wait_until_mounted()
+        self.mount_a.resume_netns()
+        try:
+            proc.wait()
+        except CommandFailedError:
+            pass
+        self.mount_a.remount()
+        self.fs.flush()
 
     def test_snapclient_cache(self):
         """
@@ -227,16 +253,12 @@ class TestSnapshots(CephFSTestCase):
         self.fs.set_max_mds(3)
         status = self.fs.wait_for_daemons()
 
-        grace = float(self.fs.get_config("mds_beacon_grace", service_type="mon"))
-
         self.mount_a.run_shell(["mkdir", "-p", "d0/d1/dir"])
         self.mount_a.run_shell(["mkdir", "-p", "d0/d2/dir"])
         self.mount_a.setfattr("d0", "ceph.dir.pin", "0")
         self.mount_a.setfattr("d0/d1", "ceph.dir.pin", "1")
         self.mount_a.setfattr("d0/d2", "ceph.dir.pin", "2")
-        self.wait_until_true(lambda: self._check_subtree(2, '/d0/d2', status=status), timeout=30)
-        self.wait_until_true(lambda: self._check_subtree(1, '/d0/d1', status=status), timeout=5)
-        self.wait_until_true(lambda: self._check_subtree(0, '/d0', status=status), timeout=5)
+        self._wait_subtrees([("/d0", 0), ("/d0/d1", 1), ("/d0/d2", 2)], rank="all", status=status, path="/d0")
 
         def _check_snapclient_cache(snaps_dump, cache_dump=None, rank=0):
             if cache_dump is None:
@@ -287,7 +309,7 @@ class TestSnapshots(CephFSTestCase):
         self.fs.rank_freeze(True, rank=2)
         self.fs.rank_asok(['config', 'set', "mds_kill_mdstable_at", "9"], rank=2, status=status)
         proc = self.mount_a.run_shell(["mkdir", "d0/d1/dir/.snap/s3"], wait=False)
-        self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=2), timeout=grace*2);
+        self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=2), timeout=self.fs.beacon_timeout);
         self.delete_mds_coredump(rank2['name']);
 
         # mksnap should wait for notify ack from mds.2
@@ -313,11 +335,10 @@ class TestSnapshots(CephFSTestCase):
             self.fs.rank_asok(['config', 'set', "mds_kill_mdstable_at", "4"], rank=2, status=status)
             last_created = self._get_last_created_snap(rank=0)
             proc = self.mount_a.run_shell(["mkdir", "d0/d2/dir/.snap/s{0}".format(i)], wait=False)
-            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=2), timeout=grace*2);
+            self.wait_until_true(lambda: "laggy_since" in self.fs.get_rank(rank=2), timeout=self.fs.beacon_timeout);
             self.delete_mds_coredump(rank2['name']);
 
-            self.mount_a.kill()
-            self.mount_a.kill_cleanup()
+            self.mount_a.suspend_netns()
 
             self.assertEqual(len(self._get_pending_snap_update(rank=0)), 1)
 
@@ -345,10 +366,41 @@ class TestSnapshots(CephFSTestCase):
             self.assertEqual(snaps_dump["last_created"], rank0_cache["last_created"])
             self.assertTrue(_check_snapclient_cache(snaps_dump, cache_dump=rank0_cache));
 
-            self.mount_a.mount()
-            self.mount_a.wait_until_mounted()
+            self.mount_a.resume_netns()
+            try:
+                proc.wait()
+            except CommandFailedError:
+                pass
+            self.mount_a.remount()
+            self.fs.flush()
 
         self.mount_a.run_shell(["rmdir", Raw("d0/d2/dir/.snap/*")])
+
+    def test_snapshot_check_access(self):
+        """
+        """
+
+        self.mount_a.run_shell_payload("mkdir -p dir1/dir2")
+        self.mount_a.umount_wait(require_clean=True)
+
+        newid = 'foo'
+        keyring = self.fs.authorize(newid, ('/dir1', 'rws'))
+        keyring_path = self.mount_a.client_remote.mktemp(data=keyring)
+        self.mount_a.remount(client_id=newid, client_keyring_path=keyring_path, cephfs_mntpt='/dir1')
+
+        self.mount_a.run_shell_payload("pushd dir2; dd if=/dev/urandom of=file bs=4k count=1;")
+        self.mount_a.run_shell_payload("mkdir .snap/one")
+        self.mount_a.run_shell_payload("rm -rf dir2")
+        # ???
+        # Session check_access path ~mds0/stray3/10000000001/file
+        # 2024-07-04T02:05:07.884+0000 7f319ce86640 20 Session check_access: [inode 0x10000000002 [2,2] ~mds0/stray2/10000000001/file ...] caller_uid=1141 caller_gid=1141 caller_gid_list=[1000,1141]
+        # 2024-07-04T02:05:07.884+0000 7f319ce86640 20 Session check_access path ~mds0/stray2/10000000001/file
+        # should be
+        # 2024-07-04T02:11:26.990+0000 7f6b14e71640 20 Session check_access: [inode 0x10000000002 [2,2] ~mds0/stray2/10000000001/file ...] caller_uid=1141 caller_gid=1141 caller_gid_list=[1000,1141]
+        # 2024-07-04T02:11:26.990+0000 7f6b14e71640 20 Session check_access stray_prior_path /dir1/dir2
+        # 2024-07-04T02:11:26.990+0000 7f6b14e71640 10 MDSAuthCap is_capable inode(path /dir1/dir2 owner 1141:1141 mode 0100644) by caller 1141:1141 mask 1 new 0:0 cap: MDSAuthCaps[allow rws fsname=cephfs path="/dir1"]
+        self.mount_a.run_shell_payload("stat .snap/one/dir2/file")
+
 
     def test_multimds_mksnap(self):
         """
@@ -358,16 +410,15 @@ class TestSnapshots(CephFSTestCase):
         self.fs.set_max_mds(2)
         status = self.fs.wait_for_daemons()
 
-        self.mount_a.run_shell(["mkdir", "-p", "d0/d1"])
+        self.mount_a.run_shell(["mkdir", "-p", "d0/d1/empty"])
         self.mount_a.setfattr("d0", "ceph.dir.pin", "0")
         self.mount_a.setfattr("d0/d1", "ceph.dir.pin", "1")
-        self.wait_until_true(lambda: self._check_subtree(1, '/d0/d1', status=status), timeout=30)
-        self.wait_until_true(lambda: self._check_subtree(0, '/d0', status=status), timeout=5)
+        self._wait_subtrees([("/d0", 0), ("/d0/d1", 1)], rank="all", status=status, path="/d0")
 
         self.mount_a.write_test_pattern("d0/d1/file_a", 8 * 1024 * 1024)
         self.mount_a.run_shell(["mkdir", "d0/.snap/s1"])
         self.mount_a.run_shell(["rm", "-f", "d0/d1/file_a"])
-        self.mount_a.validate_test_pattern("d0/.snap/s1/d1/file_a", 8 * 1024 * 1024)
+        self.mount_a.validate_test_pattern("d0/.snap/s1/d1/file_a", 8 * 1024 * 1024, timeout=20)
 
         self.mount_a.run_shell(["rmdir", "d0/.snap/s1"])
         self.mount_a.run_shell(["rm", "-rf", "d0"])
@@ -380,11 +431,10 @@ class TestSnapshots(CephFSTestCase):
         self.fs.set_max_mds(2)
         status = self.fs.wait_for_daemons()
 
-        self.mount_a.run_shell(["mkdir", "d0", "d1"])
+        self.mount_a.run_shell_payload("mkdir -p {d0,d1}/empty")
         self.mount_a.setfattr("d0", "ceph.dir.pin", "0")
         self.mount_a.setfattr("d1", "ceph.dir.pin", "1")
-        self.wait_until_true(lambda: self._check_subtree(1, '/d1', status=status), timeout=30)
-        self.wait_until_true(lambda: self._check_subtree(0, '/d0', status=status), timeout=5)
+        self._wait_subtrees([("/d0", 0), ("/d1", 1)], rank=0, status=status)
 
         self.mount_a.run_shell(["mkdir", "d0/d3"])
         self.mount_a.run_shell(["mkdir", "d0/.snap/s1"])
@@ -408,12 +458,11 @@ class TestSnapshots(CephFSTestCase):
         self.fs.set_max_mds(2)
         status = self.fs.wait_for_daemons()
 
-        self.mount_a.run_shell(["mkdir", "d0", "d1"])
+        self.mount_a.run_shell_payload("mkdir -p {d0,d1}/empty")
 
         self.mount_a.setfattr("d0", "ceph.dir.pin", "0")
         self.mount_a.setfattr("d1", "ceph.dir.pin", "1")
-        self.wait_until_true(lambda: self._check_subtree(1, '/d1', status=status), timeout=30)
-        self.wait_until_true(lambda: self._check_subtree(0, '/d0', status=status), timeout=5)
+        self._wait_subtrees([("/d0", 0), ("/d1", 1)], rank=0, status=status)
 
         self.mount_a.run_python(dedent("""
             import os
@@ -474,7 +523,6 @@ class TestSnapshots(CephFSTestCase):
                 # failing at the last mkdir beyond the limit is expected
                 if sno == snaps:
                     log.info("failed while creating snap #{}: {}".format(sno, repr(e)))
-                    sys.exc_clear()
                     raise TestSnapshots.SnapLimitViolationException(sno)
 
     def test_mds_max_snaps_per_dir_default_limit(self):
@@ -500,7 +548,6 @@ class TestSnapshots(CephFSTestCase):
             self.create_dir_and_snaps("accounts", new_limit + 1)
         except TestSnapshots.SnapLimitViolationException as e:
             if e.failed_snapshot_number == (new_limit + 1):
-                sys.exc_clear()
                 pass
         # then increase the limit by one and test
         new_limit = new_limit + 1
@@ -529,3 +576,72 @@ class TestSnapshots(CephFSTestCase):
             # after reducing limit we expect the new snapshot creation to fail
             pass
         self.delete_dir_and_snaps("accounts", new_limit + 1)
+
+
+class TestMonSnapsAndFsPools(CephFSTestCase):
+    MDSS_REQUIRED = 3
+
+    def test_disallow_monitor_managed_snaps_for_fs_pools(self):
+        """
+        Test that creation of monitor managed snaps fails for pools attached
+        to any file-system
+        """
+        with self.assertRaises(CommandFailedError):
+            self.fs.rados(["mksnap", "snap1"], pool=self.fs.get_data_pool_name())
+
+        with self.assertRaises(CommandFailedError):
+            self.fs.rados(["mksnap", "snap2"], pool=self.fs.get_metadata_pool_name())
+
+        with self.assertRaises(CommandFailedError):
+            test_pool_name = self.fs.get_data_pool_name()
+            base_cmd = f'osd pool mksnap {test_pool_name} snap3'
+            self.run_ceph_cmd(base_cmd)
+
+        with self.assertRaises(CommandFailedError):
+            test_pool_name = self.fs.get_metadata_pool_name()
+            base_cmd = f'osd pool mksnap {test_pool_name} snap4'
+            self.run_ceph_cmd(base_cmd)
+
+    def test_attaching_pools_with_snaps_to_fs_fails(self):
+        """
+        Test that attempt to attach pool with snapshots to an fs fails
+        """
+        test_pool_name = 'snap-test-pool'
+        base_cmd = f'osd pool create {test_pool_name}'
+        ret = self.get_ceph_cmd_result(args=base_cmd, check_status=False)
+        self.assertEqual(ret, 0)
+
+        self.fs.rados(["mksnap", "snap3"], pool=test_pool_name)
+
+        base_cmd = f'fs add_data_pool {self.fs.name} {test_pool_name}'
+        ret = self.get_ceph_cmd_result(args=base_cmd, check_status=False)
+        self.assertEqual(ret, errno.EOPNOTSUPP)
+
+        # cleanup
+        self.fs.rados(["rmsnap", "snap3"], pool=test_pool_name)
+        base_cmd = f'osd pool delete {test_pool_name}'
+        ret = self.get_ceph_cmd_result(args=base_cmd, check_status=False)
+
+    def test_using_pool_with_snap_fails_fs_creation(self):
+        """
+        Test that using a pool with snaps for fs creation fails
+        """
+        base_cmd = 'osd pool create test_data_pool'
+        ret = self.get_ceph_cmd_result(args=base_cmd, check_status=False)
+        self.assertEqual(ret, 0)
+        base_cmd = 'osd pool create test_metadata_pool'
+        ret = self.get_ceph_cmd_result(args=base_cmd, check_status=False)
+        self.assertEqual(ret, 0)
+
+        self.fs.rados(["mksnap", "snap4"], pool='test_data_pool')
+
+        base_cmd = 'fs new testfs test_metadata_pool test_data_pool'
+        ret = self.get_ceph_cmd_result(args=base_cmd, check_status=False)
+        self.assertEqual(ret, errno.EOPNOTSUPP)
+
+        # cleanup
+        self.fs.rados(["rmsnap", "snap4"], pool='test_data_pool')
+        base_cmd = 'osd pool delete test_data_pool'
+        ret = self.get_ceph_cmd_result(args=base_cmd, check_status=False)
+        base_cmd = 'osd pool delete test_metadata_pool'
+        ret = self.get_ceph_cmd_result(args=base_cmd, check_status=False)

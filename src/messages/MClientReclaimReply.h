@@ -18,7 +18,7 @@
 
 #include "msg/Message.h"
 
-class MClientReclaimReply: public SafeMessage {
+class MClientReclaimReply final : public SafeMessage {
 public:
   static constexpr int HEAD_VERSION = 1;
   static constexpr int COMPAT_VERSION = 1;
@@ -32,7 +32,8 @@ public:
 
   std::string_view get_type_name() const override { return "client_reclaim_reply"; }
   void print(std::ostream& o) const override {
-    o << "client_reclaim_reply(" << result << " e " << epoch << ")";
+    o << "client_reclaim_reply(" << result << " e " << epoch
+      << " addrs " << addrs << ")";
   }
 
   void encode_payload(uint64_t features) override {
@@ -59,7 +60,7 @@ protected:
     result(r), epoch(e) {}
 
 private:
-  ~MClientReclaimReply() override {}
+  ~MClientReclaimReply() final {}
 
   int32_t result;
   epoch_t epoch;
@@ -67,6 +68,8 @@ private:
 
   template<class T, typename... Args>
   friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
+  template<class T, typename... Args>
+  friend MURef<T> crimson::make_message(Args&&... args);
 };
 
 #endif

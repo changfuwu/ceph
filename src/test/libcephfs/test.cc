@@ -13,8 +13,10 @@
  */
 
 #include "include/compat.h"
+#include "include/filepath.h"
 #include "gtest/gtest.h"
 #include "include/cephfs/libcephfs.h"
+#include "mds/mdstypes.h"
 #include "include/stat.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -24,7 +26,10 @@
 #include <dirent.h>
 #include <sys/uio.h>
 #include <sys/time.h>
+
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 
 #include "common/Clock.h"
 
@@ -33,13 +38,26 @@
 #include <sys/xattr.h>
 #endif
 
+#include <fmt/format.h>
 #include <map>
 #include <vector>
 #include <thread>
+#include <random>
+#include <regex>
 
-#ifndef ALLPERMS
-#define ALLPERMS (S_ISUID|S_ISGID|S_ISVTX|S_IRWXU|S_IRWXG|S_IRWXO)
-#endif
+using namespace std;
+
+static std::string generate_random_string(int length = 20) {
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<> distrib('a', 'z');
+
+  std::string str;
+  for (int i = 0; i < length; ++i) {
+    str += static_cast<char>(distrib(gen));
+  }
+  return str;
+}
 
 TEST(LibCephFS, OpenEmptyComponent) {
 
@@ -75,8 +93,36 @@ TEST(LibCephFS, OpenEmptyComponent) {
 
   fd = ceph_open(cmount, c_path, O_RDONLY, 0666);
   ASSERT_LT(0, fd);
-
   ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  // cleanup
+  ASSERT_EQ(0, ceph_unlink(cmount, c_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, c_dir));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, OpenReadTruncate) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(0, ceph_create(&cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_read_file(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, "/"));
+
+  auto path = fmt::format("test_open_rdt_{}", getpid());
+  int fd = ceph_open(cmount, path.c_str(), O_WRONLY|O_CREAT, 0666);
+  ASSERT_LE(0, fd);
+
+  auto data = std::string("hello world");
+  ASSERT_EQ(ceph_write(cmount, fd, data.c_str(), data.size(), 0), (int)data.size());
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  fd = ceph_open(cmount, path.c_str(), O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(ceph_ftruncate(cmount, fd, 0), -EBADF);
+  ASSERT_EQ(ceph_ftruncate(cmount, fd, 1), -EBADF);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
   ceph_shutdown(cmount);
 }
 
@@ -437,7 +483,7 @@ TEST(LibCephFS, DirLs) {
     struct dirent rdent;
     struct ceph_statx stx;
     int len = ceph_readdirplus_r(cmount, ls_dir, &rdent, &stx,
-				 CEPH_STATX_SIZE, AT_NO_ATTR_SYNC, NULL);
+				 CEPH_STATX_SIZE, AT_STATX_DONT_SYNC, NULL);
     if (len == 0)
       break;
     ASSERT_EQ(len, 1);
@@ -447,12 +493,24 @@ TEST(LibCephFS, DirLs) {
     sscanf(name, "dirf%d", &size);
     ASSERT_TRUE(stx.stx_mask & CEPH_STATX_SIZE);
     ASSERT_EQ(stx.stx_size, (size_t)size);
+    // On Windows, dirent uses long (4B) inodes, which get trimmed
+    // and can't be used.
+    // TODO: consider defining ceph_dirent.
+    #ifndef _WIN32
     ASSERT_EQ(stx.stx_ino, rdent.d_ino);
+    #endif
     //ASSERT_EQ(st.st_mode, (mode_t)0666);
   }
   ASSERT_EQ(found, entries);
 
   ASSERT_EQ(ceph_closedir(cmount, ls_dir), 0);
+
+  // cleanup
+  for(i = 0; i < r; ++i) {
+    sprintf(bazstr, "dir_ls%d/dirf%d", mypid, i);
+    ASSERT_EQ(0, ceph_unlink(cmount, bazstr));
+  }
+  ASSERT_EQ(0, ceph_rmdir(cmount, foostr));
 
   ceph_shutdown(cmount);
 }
@@ -464,40 +522,93 @@ TEST(LibCephFS, ManyNestedDirs) {
   ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
   ASSERT_EQ(ceph_mount(cmount, NULL), 0);
 
-  const char *many_path = "a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a";
+  static const char many_path[] = "/ManyNestedDirs/A/a/a/a/a/b/B/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/Aa";
+  const filepath mfp = filepath(many_path);
   ASSERT_EQ(ceph_mkdirs(cmount, many_path, 0755), 0);
 
-  int i = 0;
-
-  for(; i < 39; ++i) {
-    ASSERT_EQ(ceph_chdir(cmount, "a"), 0);
-
+  for (auto& component : mfp) {
     struct ceph_dir_result *dirp;
-    ASSERT_EQ(ceph_opendir(cmount, "a", &dirp), 0);
+    ASSERT_EQ(ceph_opendir(cmount, ".", &dirp), 0);
     struct dirent *dent = ceph_readdir(cmount, dirp);
     ASSERT_TRUE(dent != NULL);
     ASSERT_STREQ(dent->d_name, ".");
     dent = ceph_readdir(cmount, dirp);
     ASSERT_TRUE(dent != NULL);
     ASSERT_STREQ(dent->d_name, "..");
+    if (component == "ManyNestedDirs"sv) {
+      ASSERT_EQ(0, ceph_chdir(cmount, component.c_str()));
+      ASSERT_EQ(ceph_closedir(cmount, dirp), 0);
+      continue;
+    }
     dent = ceph_readdir(cmount, dirp);
     ASSERT_TRUE(dent != NULL);
-    ASSERT_STREQ(dent->d_name, "a");
+    ASSERT_STREQ(component.c_str(), dent->d_name);
+    ASSERT_EQ(ceph_chdir(cmount, dent->d_name), 0);
     ASSERT_EQ(ceph_closedir(cmount, dirp), 0);
   }
 
-  ASSERT_STREQ(ceph_getcwd(cmount), "/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a");
-
-  ASSERT_EQ(ceph_chdir(cmount, "a/a/a"), 0);
-
-  for(i = 0; i < 39; ++i) {
-    ASSERT_EQ(ceph_chdir(cmount, ".."), 0);
-    ASSERT_EQ(ceph_rmdir(cmount, "a"), 0);
+  {
+    auto* cwd = ceph_getcwd(cmount);
+    ASSERT_STREQ(cwd, many_path);
   }
 
-  ASSERT_EQ(ceph_chdir(cmount, "/"), 0);
+  for (auto it = mfp.rbegin(); it != mfp.rend(); ++it) {
+    auto& component = *it;
+    ASSERT_EQ(ceph_chdir(cmount, ".."), 0);
+    ASSERT_EQ(ceph_rmdir(cmount, component.c_str()), 0);
+  }
 
-  ASSERT_EQ(ceph_rmdir(cmount, "a/a/a"), 0);
+  ASSERT_STREQ(ceph_getcwd(cmount), "/");
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, ManyNestedDirsCaseInsensitive) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  static const char many_path[] = "/ManyNestedDirsCaseInsensitive/A/a/a/a/a/b/B/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/Aa";
+  const filepath mfp = filepath(many_path);
+  ASSERT_EQ(0, ceph_mkdir(cmount, mfp[0].c_str(), 0755));
+  ASSERT_EQ(0, ceph_setxattr(cmount, mfp[0].c_str(), "ceph.dir.casesensitive", (void *) "0", 1, XATTR_CREATE));
+  ASSERT_EQ(ceph_mkdirs(cmount, many_path, 0755), 0);
+
+  for (auto& component : mfp) {
+    struct ceph_dir_result *dirp;
+    ASSERT_EQ(ceph_opendir(cmount, ".", &dirp), 0);
+    struct dirent *dent = ceph_readdir(cmount, dirp);
+    ASSERT_TRUE(dent != NULL);
+    ASSERT_STREQ(dent->d_name, ".");
+    dent = ceph_readdir(cmount, dirp);
+    ASSERT_TRUE(dent != NULL);
+    ASSERT_STREQ(dent->d_name, "..");
+    if (component == "ManyNestedDirsCaseInsensitive"sv) {
+      ASSERT_EQ(0, ceph_chdir(cmount, component.c_str()));
+      ASSERT_EQ(ceph_closedir(cmount, dirp), 0);
+      continue;
+    }
+    dent = ceph_readdir(cmount, dirp);
+    ASSERT_TRUE(dent != NULL);
+    ASSERT_STREQ(component.c_str(), dent->d_name);
+    ASSERT_EQ(ceph_chdir(cmount, dent->d_name), 0);
+    ASSERT_EQ(ceph_closedir(cmount, dirp), 0);
+  }
+
+  {
+    auto* cwd = ceph_getcwd(cmount);
+    ASSERT_STREQ(cwd, many_path);
+  }
+
+  for (auto it = mfp.rbegin(); it != mfp.rend(); ++it) {
+    auto& component = *it;
+    ASSERT_EQ(ceph_chdir(cmount, ".."), 0);
+    ASSERT_EQ(ceph_rmdir(cmount, component.c_str()), 0);
+  }
+
+  ASSERT_STREQ(ceph_getcwd(cmount), "/");
 
   ceph_shutdown(cmount);
 }
@@ -513,6 +624,9 @@ TEST(LibCephFS, Xattrs) {
   sprintf(test_xattr_file, "test_xattr_%d", getpid());
   int fd = ceph_open(cmount, test_xattr_file, O_CREAT, 0666);
   ASSERT_GT(fd, 0);
+
+  // test removing non-existent xattr
+  ASSERT_EQ(-ENODATA, ceph_removexattr(cmount, test_xattr_file, "user.nosuchxattr"));
 
   char i = 'a';
   char xattrk[128];
@@ -552,7 +666,7 @@ TEST(LibCephFS, Xattrs) {
     sprintf(xattrv, "testxattr%c", i);
     ASSERT_TRUE(!strncmp(xattrv, gxattrv, alen));
 
-    n = index(p, '\0');
+    n = strchr(p, '\0');
     n++;
     len -= (n - p);
     p = n;
@@ -788,6 +902,47 @@ TEST(LibCephFS, Fchmod) {
   ceph_shutdown(cmount);
 }
 
+TEST(LibCephFS, Lchmod) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char test_file[256];
+  sprintf(test_file, "test_perms_lchmod_%d", getpid());
+
+  int fd = ceph_open(cmount, test_file, O_CREAT|O_RDWR, 0666);
+  ASSERT_GT(fd, 0);
+
+  // write some stuff
+  const char *bytes = "foobarbaz";
+  ASSERT_EQ(ceph_write(cmount, fd, bytes, strlen(bytes), 0), (int)strlen(bytes));
+  ceph_close(cmount, fd);
+
+  // Create symlink
+  char test_symlink[256];
+  sprintf(test_symlink, "test_lchmod_sym_%d", getpid());
+  ASSERT_EQ(ceph_symlink(cmount, test_file, test_symlink), 0);
+
+  // get symlink stat - lstat
+  struct ceph_statx stx_orig1;
+  ASSERT_EQ(ceph_statx(cmount, test_symlink, &stx_orig1, CEPH_STATX_ALL_STATS, AT_SYMLINK_NOFOLLOW), 0);
+
+  // Change mode on symlink file
+  ASSERT_EQ(ceph_lchmod(cmount, test_symlink, 0400), 0);
+  struct ceph_statx stx_orig2;
+  ASSERT_EQ(ceph_statx(cmount, test_symlink, &stx_orig2, CEPH_STATX_ALL_STATS, AT_SYMLINK_NOFOLLOW), 0);
+
+  // Compare modes
+  ASSERT_NE(stx_orig1.stx_mode, stx_orig2.stx_mode);
+  static const int permbits = S_IRWXU|S_IRWXG|S_IRWXO;
+  ASSERT_EQ(permbits&stx_orig1.stx_mode, 0777);
+  ASSERT_EQ(permbits&stx_orig2.stx_mode, 0400);
+
+  ceph_shutdown(cmount);
+}
+
 TEST(LibCephFS, Fchown) {
   struct ceph_mount_info *cmount;
   ASSERT_EQ(ceph_create(&cmount, NULL), 0);
@@ -811,8 +966,11 @@ TEST(LibCephFS, Fchown) {
 
   ceph_close(cmount, fd);
 
+  // "nobody" will be ignored on Windows
+  #ifndef _WIN32
   fd = ceph_open(cmount, test_file, O_RDWR, 0);
   ASSERT_EQ(fd, -EACCES);
+  #endif
 
   ceph_shutdown(cmount);
 }
@@ -884,6 +1042,13 @@ TEST(LibCephFS, Symlinks) {
   // test the O_NOFOLLOW case
   fd = ceph_open(cmount, test_symlink, O_NOFOLLOW, 0);
   ASSERT_EQ(fd, -ELOOP);
+
+#if defined(__linux__) && defined(O_PATH)
+  // test the O_NOFOLLOW with O_PATH case
+  fd = ceph_open(cmount, test_symlink, O_PATH|O_NOFOLLOW, 0);
+  ASSERT_GT(fd, 0);
+  ceph_close(cmount, fd);
+#endif /* __linux */
 
   // stat the original file
   struct ceph_statx stx_orig;
@@ -1727,13 +1892,13 @@ TEST(LibCephFS, LazyStatx) {
 
   /*
    * Now sleep, do a chmod on the first client and the see whether we get a
-   * different ctime with a statx that uses AT_NO_ATTR_SYNC
+   * different ctime with a statx that uses AT_STATX_DONT_SYNC
    */
   sleep(1);
   stx.stx_mode = 0644;
   ASSERT_EQ(ceph_ll_setattr(cmount1, file1, &stx, CEPH_SETATTR_MODE, perms1), 0);
 
-  ASSERT_EQ(ceph_ll_getattr(cmount2, file2, &stx, CEPH_STATX_CTIME, AT_NO_ATTR_SYNC, perms2), 0);
+  ASSERT_EQ(ceph_ll_getattr(cmount2, file2, &stx, CEPH_STATX_CTIME, AT_STATX_DONT_SYNC, perms2), 0);
   ASSERT_TRUE(stx.stx_mask & CEPH_STATX_CTIME);
   ASSERT_TRUE(stx.stx_ctime.tv_sec == old_ctime.tv_sec &&
 	      stx.stx_ctime.tv_nsec == old_ctime.tv_nsec);
@@ -1786,40 +1951,139 @@ TEST(LibCephFS, ChangeAttr) {
   ceph_shutdown(cmount);
 }
 
-TEST(LibCephFS, DirChangeAttr) {
+TEST(LibCephFS, DirChangeAttrCreateFile) {
   struct ceph_mount_info *cmount;
   ASSERT_EQ(ceph_create(&cmount, NULL), 0);
   ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
   ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
   ASSERT_EQ(ceph_mount(cmount, "/"), 0);
 
-  char dirname[32], filename[56];
-  sprintf(dirname, "/dirchange%x", getpid());
-  sprintf(filename, "%s/foo", dirname);
+  char dirpath[32], filepath[56];
+  sprintf(dirpath, "/dirchange%x", getpid());
+  sprintf(filepath, "%s/foo", dirpath);
 
-  ASSERT_EQ(ceph_mkdir(cmount, dirname, 0755), 0);
+  ASSERT_EQ(ceph_mkdir(cmount, dirpath, 0755), 0);
 
   struct ceph_statx	stx;
-  ASSERT_EQ(ceph_statx(cmount, dirname, &stx, CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
   ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
 
   uint64_t old_change_attr = stx.stx_version;
 
-  int fd = ceph_open(cmount, filename, O_RDWR|O_CREAT|O_EXCL, 0666);
+  /* Important: Follow an operation that changes the directory's ctime (setxattr)
+   * with one that changes the directory's mtime and ctime (create).
+   * Check that directory's change_attr is updated everytime ctime changes.
+   */
+
+  /* set xattr on dir, and check whether dir's change_attr is incremented */
+  ASSERT_EQ(ceph_setxattr(cmount, dirpath, "user.name", (void*)"bob", 3, XATTR_CREATE), 0);
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
+  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
+  ASSERT_GT(stx.stx_version, old_change_attr);
+  old_change_attr = stx.stx_version;
+
+  /* create a file within dir, and check whether dir's change_attr is incremented */
+  int fd = ceph_open(cmount, filepath, O_RDWR|O_CREAT|O_EXCL, 0666);
+  ASSERT_LT(0, fd);
+  ceph_close(cmount, fd);
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
+  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
+  ASSERT_GT(stx.stx_version, old_change_attr);
+
+  ASSERT_EQ(0, ceph_unlink(cmount, filepath));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dirpath));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, DirChangeAttrRenameFile) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dirpath[32], filepath[56], newfilepath[56];
+  sprintf(dirpath, "/dirchange%x", getpid());
+  sprintf(filepath, "%s/foo", dirpath);
+
+  ASSERT_EQ(ceph_mkdir(cmount, dirpath, 0755), 0);
+
+  int fd = ceph_open(cmount, filepath, O_RDWR|O_CREAT|O_EXCL, 0666);
   ASSERT_LT(0, fd);
   ceph_close(cmount, fd);
 
-  ASSERT_EQ(ceph_statx(cmount, dirname, &stx, CEPH_STATX_VERSION, 0), 0);
+  /* Important: Follow an operation that changes the directory's ctime (setattr)
+   * with one that changes the directory's mtime and ctime (rename).
+   * Check that directory's change_attr is updated everytime ctime changes.
+   */
+  struct ceph_statx	stx;
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
   ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
-  ASSERT_NE(stx.stx_version, old_change_attr);
 
+  uint64_t old_change_attr = stx.stx_version;
+
+  /* chmod dir, and check whether dir's change_attr is incremented */
+  ASSERT_EQ(ceph_chmod(cmount, dirpath, 0777), 0);
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
+  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
+  ASSERT_GT(stx.stx_version, old_change_attr);
   old_change_attr = stx.stx_version;
 
-  ASSERT_EQ(ceph_unlink(cmount, filename), 0);
-  ASSERT_EQ(ceph_statx(cmount, dirname, &stx, CEPH_STATX_VERSION, 0), 0);
+  /* rename a file within dir, and check whether dir's change_attr is incremented */
+  sprintf(newfilepath, "%s/bar", dirpath);
+  ASSERT_EQ(ceph_rename(cmount, filepath, newfilepath), 0);
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
   ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
-  ASSERT_NE(stx.stx_version, old_change_attr);
+  ASSERT_GT(stx.stx_version, old_change_attr);
 
+  ASSERT_EQ(0, ceph_unlink(cmount, newfilepath));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dirpath));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, DirChangeAttrRemoveFile) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dirpath[32], filepath[56];
+  sprintf(dirpath, "/dirchange%x", getpid());
+  sprintf(filepath, "%s/foo", dirpath);
+
+  ASSERT_EQ(ceph_mkdir(cmount, dirpath, 0755), 0);
+
+  ASSERT_EQ(ceph_setxattr(cmount, dirpath, "user.name", (void*)"bob", 3, XATTR_CREATE), 0);
+
+  int fd = ceph_open(cmount, filepath, O_RDWR|O_CREAT|O_EXCL, 0666);
+  ASSERT_LT(0, fd);
+  ceph_close(cmount, fd);
+
+  /* Important: Follow an operation that changes the directory's ctime (removexattr)
+   * with one that changes the directory's mtime and ctime (remove a file).
+   * Check that directory's change_attr is updated everytime ctime changes.
+   */
+  struct ceph_statx	stx;
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
+  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
+
+  uint64_t old_change_attr = stx.stx_version;
+
+  /* remove xattr, and check whether dir's change_attr is incremented */
+  ASSERT_EQ(ceph_removexattr(cmount, dirpath, "user.name"), 0);
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
+  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
+  ASSERT_GT(stx.stx_version, old_change_attr);
+  old_change_attr = stx.stx_version;
+
+  /* remove a file within dir, and check whether dir's change_attr is incremented */
+  ASSERT_EQ(0, ceph_unlink(cmount, filepath));
+  ASSERT_EQ(ceph_statx(cmount, dirpath, &stx, CEPH_STATX_VERSION, 0), 0);
+  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_VERSION);
+  ASSERT_GT(stx.stx_version, old_change_attr);
+
+  ASSERT_EQ(0, ceph_rmdir(cmount, dirpath));
   ceph_shutdown(cmount);
 }
 
@@ -1848,130 +2112,36 @@ TEST(LibCephFS, SetSize) {
   ceph_shutdown(cmount);
 }
 
-TEST(LibCephFS, ClearSetuid) {
-  struct ceph_mount_info *cmount;
-  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
-  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
-  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
-  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
-
-  Inode *root;
-  ASSERT_EQ(ceph_ll_lookup_root(cmount, &root), 0);
-
-  char filename[32];
-  sprintf(filename, "clearsetuid%x", getpid());
-
-  Fh *fh;
-  Inode *in;
-  struct ceph_statx stx;
-  const mode_t after_mode = S_IRWXU;
-  const mode_t before_mode = S_IRWXU | S_ISUID | S_ISGID;
-  const unsigned want = CEPH_STATX_UID|CEPH_STATX_GID|CEPH_STATX_MODE;
-  UserPerm *usercred = ceph_mount_perms(cmount);
-
-  ceph_ll_unlink(cmount, root, filename, usercred);
-  ASSERT_EQ(ceph_ll_create(cmount, root, filename, before_mode,
-			   O_RDWR|O_CREAT|O_EXCL, &in, &fh, &stx, want, 0,
-			   usercred), 0);
-
-  ASSERT_EQ(stx.stx_mode & (mode_t)ALLPERMS, before_mode);
-
-  // write
-  ASSERT_EQ(ceph_ll_write(cmount, fh, 0, 3, "foo"), 3);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, usercred), 0);
-  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_MODE);
-  ASSERT_EQ(stx.stx_mode & (mode_t)ALLPERMS, after_mode);
-
-  // reset mode
-  stx.stx_mode = before_mode;
-  ASSERT_EQ(ceph_ll_setattr(cmount, in, &stx, CEPH_STATX_MODE, usercred), 0);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, usercred), 0);
-  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_MODE);
-  ASSERT_EQ(stx.stx_mode & (mode_t)ALLPERMS, before_mode);
-
-  // truncate
-  stx.stx_size = 1;
-  ASSERT_EQ(ceph_ll_setattr(cmount, in, &stx, CEPH_SETATTR_SIZE, usercred), 0);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, usercred), 0);
-  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_MODE);
-  ASSERT_EQ(stx.stx_mode & (mode_t)ALLPERMS, after_mode);
-
-  // reset mode
-  stx.stx_mode = before_mode;
-  ASSERT_EQ(ceph_ll_setattr(cmount, in, &stx, CEPH_STATX_MODE, usercred), 0);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, usercred), 0);
-  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_MODE);
-  ASSERT_EQ(stx.stx_mode & (mode_t)ALLPERMS, before_mode);
-
-  // chown  -- for this we need to be "root"
-  UserPerm *rootcred = ceph_userperm_new(0, 0, 0, NULL);
-  ASSERT_TRUE(rootcred);
-  stx.stx_uid++;
-  stx.stx_gid++;
-  ASSERT_EQ(ceph_ll_setattr(cmount, in, &stx, CEPH_SETATTR_UID|CEPH_SETATTR_GID, rootcred), 0);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, usercred), 0);
-  ASSERT_TRUE(stx.stx_mask & CEPH_STATX_MODE);
-  ASSERT_EQ(stx.stx_mode & (mode_t)ALLPERMS, after_mode);
-
-  /* test chown with supplementary groups, and chown with/without exe bit */
-  uid_t u = 65534;
-  gid_t g = 65534;
-  gid_t gids[] = {65533,65532};
-  UserPerm *altcred = ceph_userperm_new(u, g, sizeof gids / sizeof gids[0], gids);
-  stx.stx_uid = u;
-  stx.stx_gid = g;
-  mode_t m = S_ISGID|S_ISUID|S_IRUSR|S_IWUSR;
-  stx.stx_mode = m;
-  ASSERT_EQ(ceph_ll_setattr(cmount, in, &stx, CEPH_STATX_MODE|CEPH_SETATTR_UID|CEPH_SETATTR_GID, rootcred), 0);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, altcred), 0);
-  ASSERT_EQ(stx.stx_mode&(mode_t)ALLPERMS, m);
-  /* not dropped without exe bit */
-  stx.stx_gid = gids[0];
-  ASSERT_EQ(ceph_ll_setattr(cmount, in, &stx, CEPH_SETATTR_GID, altcred), 0);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, altcred), 0);
-  ASSERT_EQ(stx.stx_mode&(mode_t)ALLPERMS, m);
-  /* now check dropped with exe bit */
-  m = S_ISGID|S_ISUID|S_IRWXU;
-  stx.stx_mode = m;
-  ASSERT_EQ(ceph_ll_setattr(cmount, in, &stx, CEPH_STATX_MODE, altcred), 0);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, altcred), 0);
-  ASSERT_EQ(stx.stx_mode&(mode_t)ALLPERMS, m);
-  stx.stx_gid = gids[1];
-  ASSERT_EQ(ceph_ll_setattr(cmount, in, &stx, CEPH_SETATTR_GID, altcred), 0);
-  ASSERT_EQ(ceph_ll_getattr(cmount, in, &stx, CEPH_STATX_MODE, 0, altcred), 0);
-  ASSERT_EQ(stx.stx_mode&(mode_t)ALLPERMS, m&(S_IRWXU|S_IRWXG|S_IRWXO));
-  ceph_userperm_destroy(altcred);
-
-  ASSERT_EQ(ceph_ll_close(cmount, fh), 0);
-  ceph_shutdown(cmount);
-}
-
 TEST(LibCephFS, OperationsOnRoot)
 {
+  UserPerm *rootcred = ceph_userperm_new(0, 0, 0, NULL);
+  ASSERT_TRUE(rootcred);
   struct ceph_mount_info *cmount;
-  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
-  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_create(&cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_read_file(cmount, NULL));
   ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
-  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+  ASSERT_EQ(0, ceph_init(cmount));
+  ASSERT_EQ(0, ceph_mount_perms_set(cmount, rootcred));
+  ASSERT_EQ(0, ceph_mount(cmount, "/"));
 
   char dirname[32];
   sprintf(dirname, "/somedir%x", getpid());
 
   ASSERT_EQ(ceph_mkdir(cmount, dirname, 0755), 0);
 
-  ASSERT_EQ(ceph_rmdir(cmount, "/"), -EBUSY);
+  ASSERT_EQ(ceph_rmdir(cmount, "/"), -EINVAL);
 
   ASSERT_EQ(ceph_link(cmount, "/", "/"), -EEXIST);
   ASSERT_EQ(ceph_link(cmount, dirname, "/"), -EEXIST);
   ASSERT_EQ(ceph_link(cmount, "nonExisitingDir", "/"), -ENOENT);
 
-  ASSERT_EQ(ceph_unlink(cmount, "/"), -EISDIR);
+  ASSERT_EQ(ceph_unlink(cmount, "/"), -EINVAL);
 
-  ASSERT_EQ(ceph_rename(cmount, "/", "/"), -EBUSY);
-  ASSERT_EQ(ceph_rename(cmount, dirname, "/"), -EBUSY);
-  ASSERT_EQ(ceph_rename(cmount, "nonExistingDir", "/"), -EBUSY);
-  ASSERT_EQ(ceph_rename(cmount, "/", dirname), -EBUSY);
-  ASSERT_EQ(ceph_rename(cmount, "/", "nonExistingDir"), -EBUSY);
+  ASSERT_EQ(ceph_rename(cmount, "/", "/"), -EINVAL);
+  ASSERT_EQ(ceph_rename(cmount, dirname, "/"), -EINVAL);
+  ASSERT_EQ(ceph_rename(cmount, "nonExistingDir", "/"), -ENOENT);
+  ASSERT_EQ(ceph_rename(cmount, "/", dirname), -EINVAL);
+  ASSERT_EQ(ceph_rename(cmount, "/", "nonExistingDir"), -EINVAL);
 
   ASSERT_EQ(ceph_mkdir(cmount, "/", 0777), -EEXIST);
 
@@ -1982,8 +2152,11 @@ TEST(LibCephFS, OperationsOnRoot)
   ASSERT_EQ(ceph_symlink(cmount, "nonExistingDir", "/"), -EEXIST);
 
   ceph_shutdown(cmount);
+  ceph_userperm_destroy(rootcred);
 }
 
+// no rlimits on Windows
+#ifndef _WIN32
 static void shutdown_racer_func()
 {
   const int niter = 32;
@@ -2002,7 +2175,7 @@ static void shutdown_racer_func()
 // See tracker #20988
 TEST(LibCephFS, ShutdownRace)
 {
-  const int nthreads = 128;
+  const int nthreads = 32;
   std::thread threads[nthreads];
 
   // Need a bunch of fd's for this test
@@ -2010,6 +2183,10 @@ TEST(LibCephFS, ShutdownRace)
   ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &rold), 0);
   rnew = rold;
   rnew.rlim_cur = rnew.rlim_max;
+
+  cout << "Setting RLIMIT_NOFILE from " << rold.rlim_cur <<
+	  " to " << rnew.rlim_cur << std::endl;
+
   ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &rnew), 0);
 
   for (int i = 0; i < nthreads; ++i)
@@ -2017,7 +2194,117 @@ TEST(LibCephFS, ShutdownRace)
 
   for (int i = 0; i < nthreads; ++i)
     threads[i].join();
-  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &rold), 0);
+  /*
+   * Let's just ignore restoring the open files limit,
+   * the kernel will defer releasing the file descriptors
+   * and then the process will be possibly reachthe open
+   * files limit. More detail, please see tracer#43039
+   */
+//  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &rold), 0);
+}
+#endif
+
+
+TEST(LibCephFS, CreateParallel)
+{
+  char fname[4096] = "dir/file_parallel";
+  std::mutex lock; // for memory barrier
+  std::array<int, 256> fds;
+  std::array<std::thread, fds.size()> threads;
+  std::fill(fds.begin(), fds.end(), -1);
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(0, ceph_create(&cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_read_file(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, "/"));
+
+  ASSERT_EQ(0, ceph_mkdirs(cmount, "dir/dummy", 0777));
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_mount(cmount, "/"));
+
+  {
+    struct stat buf;
+    ASSERT_EQ(0, ceph_stat(cmount, "dir", &buf));
+  }
+
+  for (size_t i = 0; i < fds.size(); ++i) {
+    auto l = [cmount,&fname,&fds,&lock](int i) {
+      int fd = ceph_open(cmount, fname, O_CREAT|O_WRONLY, 0777);
+      std::lock_guard locker(lock);
+      fds[i] = fd;
+    };
+    threads[i] = std::thread(std::move(l), i);
+  }
+
+  for (size_t i = 0; i < fds.size(); ++i) {
+    threads[i].join();
+  }
+  std::lock_guard locker(lock);
+  for (size_t i = 0; i < fds.size(); ++i) {
+    ASSERT_GE(fds[i], 0);
+  }
+
+  ASSERT_EQ(0, ceph_unlink(cmount, fname));
+  ASSERT_EQ(0, ceph_rmdir(cmount, "dir/dummy"));
+  ASSERT_EQ(0, ceph_rmdir(cmount, "dir"));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, CreateExclParallel)
+{
+  char fname[4096] = "dir/file_parallel";
+  std::mutex lock; // for memory barrier
+  std::array<int, 256> fds;
+  std::array<std::thread, fds.size()> threads;
+  std::fill(fds.begin(), fds.end(), -1);
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(0, ceph_create(&cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_read_file(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, "/"));
+
+  ASSERT_EQ(0, ceph_mkdirs(cmount, "dir/dummy", 0777));
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_mount(cmount, "/"));
+
+  {
+    struct stat buf;
+    ASSERT_EQ(0, ceph_stat(cmount, "dir", &buf));
+  }
+
+  for (size_t i = 0; i < fds.size(); ++i) {
+    auto l = [cmount,&fname,&fds,&lock](int i) {
+      int fd = ceph_open(cmount, fname, O_CREAT|O_EXCL|O_WRONLY, 0777);
+      std::lock_guard locker(lock);
+      fds[i] = fd;
+    };
+    threads[i] = std::thread(std::move(l), i);
+  }
+
+  for (size_t i = 0; i < fds.size(); ++i) {
+    threads[i].join();
+  }
+  std::lock_guard locker(lock);
+  int found = -1;
+  for (size_t i = 0; i < fds.size(); ++i) {
+    if (fds[i] >= 0) {
+      ASSERT_EQ(found, -1);
+      found = i;
+    } else {
+      ASSERT_EQ(fds[i], -EEXIST);
+    }
+  }
+
+  ASSERT_EQ(0, ceph_unlink(cmount, fname));
+  ASSERT_EQ(0, ceph_rmdir(cmount, "dir/dummy"));
+  ASSERT_EQ(0, ceph_rmdir(cmount, "dir"));
+
+  ceph_shutdown(cmount);
 }
 
 static void get_current_time_utimbuf(struct utimbuf *utb)
@@ -2196,6 +2483,32 @@ TEST(LibCephFS, OperationsOnDotDot) {
   ceph_shutdown(cmount);
 }
 
+TEST(LibCephFS, Caps_vxattr) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char test_caps_vxattr_file[256];
+  char gxattrv[128];
+  int xbuflen = sizeof(gxattrv);
+  pid_t mypid = getpid();
+
+  sprintf(test_caps_vxattr_file, "test_caps_vxattr_%d", mypid);
+  int fd = ceph_open(cmount, test_caps_vxattr_file, O_CREAT, 0666);
+  ASSERT_GT(fd, 0);
+  ceph_close(cmount, fd);
+
+  int alen = ceph_getxattr(cmount, test_caps_vxattr_file, "ceph.caps", (void *)gxattrv, xbuflen);
+  ASSERT_GT(alen, 0);
+  gxattrv[alen] = '\0';
+
+  char caps_regex[] = "pA[sx]*L[sx]*X[sx]*F[sxcrwbal]*/0x[0-9a-fA-f]+";
+  ASSERT_TRUE(regex_match(gxattrv, regex(caps_regex)) == 1);
+  ceph_shutdown(cmount);
+}
+
 TEST(LibCephFS, SnapXattrs) {
   struct ceph_mount_info *cmount;
   ASSERT_EQ(ceph_create(&cmount, NULL), 0);
@@ -2223,7 +2536,9 @@ TEST(LibCephFS, SnapXattrs) {
   ASSERT_LT(0, alen);
   ASSERT_LT(alen, xbuflen);
   gxattrv[alen] = '\0';
-  char *s = strchrnul(gxattrv, '.');
+  char *s = strchr(gxattrv, '.');
+  char *q = NULL;
+  ASSERT_NE(q, s);
   ASSERT_LT(s, gxattrv + alen);
   ASSERT_EQ('.', *s);
   *s = '\0';
@@ -2250,12 +2565,16 @@ TEST(LibCephFS, SnapXattrs) {
   ASSERT_LT(0, alen);
   ASSERT_LT(alen, xbuflen);
   gxattrv2[alen] = '\0';
-  s = strchrnul(gxattrv2, '.');
+  s = strchr(gxattrv2, '.');
+  ASSERT_NE(q, s);
   ASSERT_LT(s, gxattrv2 + alen);
   ASSERT_EQ('.', *s);
   *s = '\0';
   utime_t new_btime = utime_t(strtoull(gxattrv2, NULL, 10), strtoull(s + 1, NULL, 10));
+  #ifndef _WIN32
+  // This assertion sometimes fails on Windows, possibly due to the clock precision.
   ASSERT_LT(btime, new_btime);
+  #endif
 
   // listxattr() shouldn't return snap.btime vxattr
   char xattrlist[512];
@@ -2308,5 +2627,1476 @@ TEST(LibCephFS, Lseek) {
 #endif
 
   ASSERT_EQ(0, ceph_close(cmount, fd));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SnapInfoOnNonSnapshot) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  struct snap_info info;
+  ASSERT_EQ(-EINVAL, ceph_get_snap_info(cmount, "/", &info));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, EmptySnapInfo) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_path[64];
+  char snap_path[PATH_MAX];
+  sprintf(dir_path, "/dir0_%d", getpid());
+  sprintf(snap_path, "%s/.snap/snap0_%d", dir_path, getpid());
+
+  ASSERT_EQ(0, ceph_mkdir(cmount, dir_path, 0755));
+  // snapshot without custom metadata
+  ASSERT_EQ(0, ceph_mkdir(cmount, snap_path, 0755));
+
+  struct snap_info info;
+  ASSERT_EQ(0, ceph_get_snap_info(cmount, snap_path, &info));
+  ASSERT_GT(info.id, 0);
+  ASSERT_EQ(info.nr_snap_metadata, 0);
+
+  ASSERT_EQ(0, ceph_rmdir(cmount, snap_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SnapInfo) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_path[64];
+  char snap_name[64];
+  char snap_path[PATH_MAX];
+  sprintf(dir_path, "/dir0_%d", getpid());
+  sprintf(snap_name, "snap0_%d", getpid());
+  sprintf(snap_path, "%s/.snap/%s", dir_path, snap_name);
+
+  ASSERT_EQ(0, ceph_mkdir(cmount, dir_path, 0755));
+  // snapshot with custom metadata
+  struct snap_metadata snap_meta[] = {{"foo", "bar"},{"this", "that"},{"abcdefg", "12345"}};
+  ASSERT_EQ(0, ceph_mksnap(cmount, dir_path, snap_name, 0755, snap_meta, std::size(snap_meta)));
+
+  struct snap_info info;
+  ASSERT_EQ(0, ceph_get_snap_info(cmount, snap_path, &info));
+  ASSERT_GT(info.id, 0);
+  ASSERT_EQ(info.nr_snap_metadata, std::size(snap_meta));
+  for (size_t i = 0; i < info.nr_snap_metadata; ++i) {
+    auto &k1 = info.snap_metadata[i].key;
+    auto &v1 = info.snap_metadata[i].value;
+    bool found = false;
+    for (size_t j = 0; j < info.nr_snap_metadata; ++j) {
+      auto &k2 = snap_meta[j].key;
+      auto &v2 = snap_meta[j].value;
+      if (strncmp(k1, k2, strlen(k1)) == 0 && strncmp(v1, v2, strlen(v1)) == 0) {
+        found = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(found);
+  }
+  ceph_free_snap_info_buffer(&info);
+
+  ASSERT_EQ(0, ceph_rmsnap(cmount, dir_path, snap_name));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, LookupInoMDSDir) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  Inode *inode;
+  auto ino = inodeno_t(0x100); /* rank 0 ~mdsdir */
+  ASSERT_EQ(-ESTALE, ceph_ll_lookup_inode(cmount, ino, &inode));
+  ino = inodeno_t(0x600); /* rank 0 first stray dir */
+  ASSERT_EQ(-ESTALE, ceph_ll_lookup_inode(cmount, ino, &inode));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, LookupVino) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_path[64];
+  char snap_name[64];
+  char snapdir_path[128];
+  char snap_path[256];
+  char file_path[PATH_MAX];
+  char snap_file[PATH_MAX];
+  sprintf(dir_path, "/dir0_%d", getpid());
+  sprintf(snap_name, "snap0_%d", getpid());
+  sprintf(file_path, "%s/file_%d", dir_path, getpid());
+  sprintf(snapdir_path, "%s/.snap", dir_path);
+  sprintf(snap_path, "%s/%s", snapdir_path, snap_name);
+  sprintf(snap_file, "%s/file_%d", snap_path, getpid());
+
+  ASSERT_EQ(0, ceph_mkdir(cmount, dir_path, 0755));
+  int fd = ceph_open(cmount, file_path, O_WRONLY|O_CREAT, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+  ASSERT_EQ(0, ceph_mksnap(cmount, dir_path, snap_name, 0755, nullptr, 0));
+
+  // record vinos for all of them
+  struct ceph_statx stx;
+  ASSERT_EQ(0, ceph_statx(cmount, dir_path, &stx, CEPH_STATX_INO, 0));
+  vinodeno_t dir_vino(stx.stx_ino, stx.stx_dev);
+
+  ASSERT_EQ(0, ceph_statx(cmount, file_path, &stx, CEPH_STATX_INO, 0));
+  vinodeno_t file_vino(stx.stx_ino, stx.stx_dev);
+
+  ASSERT_EQ(0, ceph_statx(cmount, snapdir_path, &stx, CEPH_STATX_INO, 0));
+  vinodeno_t snapdir_vino(stx.stx_ino, stx.stx_dev);
+
+  ASSERT_EQ(0, ceph_statx(cmount, snap_path, &stx, CEPH_STATX_INO, 0));
+  vinodeno_t snap_vino(stx.stx_ino, stx.stx_dev);
+
+  ASSERT_EQ(0, ceph_statx(cmount, snap_file, &stx, CEPH_STATX_INO, 0));
+  vinodeno_t snap_file_vino(stx.stx_ino, stx.stx_dev);
+
+  // Remount
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_create(&cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_read_file(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  // Find them all
+  Inode *inode;
+  ASSERT_EQ(0, ceph_ll_lookup_vino(cmount, dir_vino, &inode));
+  ceph_ll_put(cmount, inode);
+  ASSERT_EQ(0, ceph_ll_lookup_vino(cmount, file_vino, &inode));
+  ceph_ll_put(cmount, inode);
+  ASSERT_EQ(0, ceph_ll_lookup_vino(cmount, snapdir_vino, &inode));
+  ceph_ll_put(cmount, inode);
+  ASSERT_EQ(0, ceph_ll_lookup_vino(cmount, snap_vino, &inode));
+  ceph_ll_put(cmount, inode);
+  ASSERT_EQ(0, ceph_ll_lookup_vino(cmount, snap_file_vino, &inode));
+  ceph_ll_put(cmount, inode);
+
+  // cleanup
+  ASSERT_EQ(0, ceph_rmsnap(cmount, dir_path, snap_name));
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Openat) {
+  pid_t mypid = getpid();
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(0, ceph_create(&cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_read_file(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, "/"));
+
+  char c_rel_dir[64];
+  char c_dir[128];
+  sprintf(c_rel_dir, "open_test_%d", mypid);
+  sprintf(c_dir, "/%s", c_rel_dir);
+  ASSERT_EQ(0, ceph_mkdir(cmount, c_dir, 0777));
+
+  int root_fd = ceph_open(cmount, "/", O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, root_fd);
+
+  int dir_fd = ceph_openat(cmount, root_fd, c_rel_dir, O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, dir_fd);
+
+  struct ceph_statx stx;
+  ASSERT_EQ(ceph_statxat(cmount, root_fd, c_rel_dir, &stx, 0, 0), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFDIR);
+
+  char c_rel_path[64];
+  char c_path[256];
+  sprintf(c_rel_path, "created_file_%d", mypid);
+  sprintf(c_path, "%s/created_file_%d", c_dir, mypid);
+  int file_fd = ceph_openat(cmount, dir_fd, c_rel_path, O_RDONLY | O_CREAT, 0666);
+  ASSERT_LE(0, file_fd);
+
+  ASSERT_EQ(ceph_statxat(cmount, dir_fd, c_rel_path, &stx, 0, 0), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFREG);
+
+  ASSERT_EQ(0, ceph_close(cmount, file_fd));
+  ASSERT_EQ(0, ceph_close(cmount, dir_fd));
+  ASSERT_EQ(0, ceph_close(cmount, root_fd));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, c_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, c_dir));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Statxat) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_name[64];
+  char rel_file_name_1[128];
+  char rel_file_name_2[256];
+
+  char dir_path[512];
+  char file_path[1024];
+
+  // relative paths for *at() calls
+  sprintf(dir_name, "dir0_%d", getpid());
+  sprintf(rel_file_name_1, "file_%d", getpid());
+  sprintf(rel_file_name_2, "%s/%s", dir_name, rel_file_name_1);
+
+  sprintf(dir_path, "/%s", dir_name);
+  sprintf(file_path, "%s/%s", dir_path, rel_file_name_1);
+
+  ASSERT_EQ(0, ceph_mkdir(cmount, dir_path, 0755));
+  int fd = ceph_open(cmount, file_path, O_WRONLY|O_CREAT, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  struct ceph_statx stx;
+
+  // test relative to root
+  fd = ceph_open(cmount, "/", O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(ceph_statxat(cmount, fd, dir_name, &stx, 0, 0), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFDIR);
+  ASSERT_EQ(ceph_statxat(cmount, fd, rel_file_name_2, &stx, 0, 0), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFREG);
+  // test relative to root with empty relpath
+#if defined(__linux__) && defined(AT_EMPTY_PATH)
+  int dir_fd = ceph_openat(cmount, fd, dir_name, O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, dir_fd);
+  ASSERT_EQ(ceph_statxat(cmount, dir_fd, "", &stx, 0, AT_EMPTY_PATH), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFDIR);
+  ASSERT_EQ(0, ceph_close(cmount, dir_fd));
+  int file_fd = ceph_openat(cmount, fd, rel_file_name_2, O_RDONLY, 0);
+  ASSERT_LE(0, file_fd);
+  ASSERT_EQ(ceph_statxat(cmount, file_fd, "", &stx, 0, AT_EMPTY_PATH), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFREG);
+  ASSERT_EQ(0, ceph_close(cmount, file_fd));
+#endif
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  // test relative to dir
+  fd = ceph_open(cmount, dir_path, O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(ceph_statxat(cmount, fd, rel_file_name_1, &stx, 0, 0), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFREG);
+  // test relative to dir with empty relpath
+#if defined(__linux__) && defined(AT_EMPTY_PATH)
+  int rel_file_fd = ceph_openat(cmount, fd, rel_file_name_1, O_RDONLY, 0);
+  ASSERT_LE(0, rel_file_fd);
+  ASSERT_EQ(ceph_statxat(cmount, rel_file_fd, "", &stx, 0, AT_EMPTY_PATH), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFREG);
+  ASSERT_EQ(0, ceph_close(cmount, rel_file_fd));
+#endif
+
+  // delete the dirtree, recreate and verify
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ASSERT_EQ(0, ceph_mkdir(cmount, dir_path, 0755));
+  int fd1 = ceph_open(cmount, file_path, O_WRONLY|O_CREAT, 0666);
+  ASSERT_LE(0, fd1);
+  ASSERT_EQ(0, ceph_close(cmount, fd1));
+  ASSERT_EQ(ceph_statxat(cmount, fd, rel_file_name_1, &stx, 0, 0), -ENOENT);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, StatxatATFDCWD) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_name[64];
+  char rel_file_name_1[128];
+
+  char dir_path[512];
+  char file_path[1024];
+
+  // relative paths for *at() calls
+  sprintf(dir_name, "dir0_%d", getpid());
+  sprintf(rel_file_name_1, "file_%d", getpid());
+
+  sprintf(dir_path, "/%s", dir_name);
+  sprintf(file_path, "%s/%s", dir_path, rel_file_name_1);
+
+  ASSERT_EQ(0, ceph_mkdir(cmount, dir_path, 0755));
+  int fd = ceph_open(cmount, file_path, O_WRONLY|O_CREAT, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  struct ceph_statx stx;
+  // chdir and test with CEPHFS_AT_FDCWD
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path));
+  ASSERT_EQ(ceph_statxat(cmount, CEPHFS_AT_FDCWD, rel_file_name_1, &stx, 0, 0), 0);
+  ASSERT_EQ(stx.stx_mode & S_IFMT, S_IFREG);
+
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Fdopendir) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char foostr[256];
+  sprintf(foostr, "/dir_ls%d", mypid);
+  ASSERT_EQ(ceph_mkdir(cmount, foostr, 0777), 0);
+
+  char bazstr[512];
+  sprintf(bazstr, "%s/elif", foostr);
+  int fd  = ceph_open(cmount, bazstr, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  fd = ceph_open(cmount, foostr, O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  struct ceph_dir_result *ls_dir = NULL;
+  ASSERT_EQ(ceph_fdopendir(cmount, fd, &ls_dir), 0);
+
+  // not guaranteed to get . and .. first, but its a safe assumption in this case
+  struct dirent *result = ceph_readdir(cmount, ls_dir);
+  ASSERT_TRUE(result != NULL);
+  ASSERT_STREQ(result->d_name, ".");
+  result = ceph_readdir(cmount, ls_dir);
+  ASSERT_TRUE(result != NULL);
+  ASSERT_STREQ(result->d_name, "..");
+  result = ceph_readdir(cmount, ls_dir);
+  ASSERT_TRUE(result != NULL);
+  ASSERT_STREQ(result->d_name, "elif");
+
+  ASSERT_TRUE(ceph_readdir(cmount, ls_dir) == NULL);
+
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+  ASSERT_EQ(0, ceph_closedir(cmount, ls_dir));
+  ASSERT_EQ(0, ceph_unlink(cmount, bazstr));
+  ASSERT_EQ(0, ceph_rmdir(cmount, foostr));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, FdopendirATFDCWD) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char foostr[256];
+  sprintf(foostr, "/dir_ls%d", mypid);
+  ASSERT_EQ(ceph_mkdir(cmount, foostr, 0777), 0);
+
+  char bazstr[512];
+  sprintf(bazstr, "%s/elif", foostr);
+  int fd  = ceph_open(cmount, bazstr, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  ASSERT_EQ(0, ceph_chdir(cmount, foostr));
+  struct ceph_dir_result *ls_dir = NULL;
+  ASSERT_EQ(ceph_fdopendir(cmount, CEPHFS_AT_FDCWD, &ls_dir), 0);
+
+  // not guaranteed to get . and .. first, but its a safe assumption in this case
+  struct dirent *result = ceph_readdir(cmount, ls_dir);
+  ASSERT_TRUE(result != NULL);
+  ASSERT_STREQ(result->d_name, ".");
+  result = ceph_readdir(cmount, ls_dir);
+  ASSERT_TRUE(result != NULL);
+  ASSERT_STREQ(result->d_name, "..");
+  result = ceph_readdir(cmount, ls_dir);
+  ASSERT_TRUE(result != NULL);
+  ASSERT_STREQ(result->d_name, "elif");
+
+  ASSERT_TRUE(ceph_readdir(cmount, ls_dir) == NULL);
+
+  ASSERT_EQ(0, ceph_closedir(cmount, ls_dir));
+  ASSERT_EQ(0, ceph_unlink(cmount, bazstr));
+  ASSERT_EQ(0, ceph_rmdir(cmount, foostr));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, FdopendirReaddirTestWithDelete) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char foostr[256];
+  sprintf(foostr, "/dir_ls%d", mypid);
+  ASSERT_EQ(ceph_mkdir(cmount, foostr, 0777), 0);
+
+  char bazstr[512];
+  sprintf(bazstr, "%s/elif", foostr);
+  int fd  = ceph_open(cmount, bazstr, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  fd = ceph_open(cmount, foostr, O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  struct ceph_dir_result *ls_dir = NULL;
+  ASSERT_EQ(ceph_fdopendir(cmount, fd, &ls_dir), 0);
+
+  ASSERT_EQ(0, ceph_unlink(cmount, bazstr));
+  ASSERT_EQ(0, ceph_rmdir(cmount, foostr));
+
+  // not guaranteed to get . and .. first, but its a safe assumption
+  // in this case. also, note that we may or may not get other
+  // entries.
+  struct dirent *result = ceph_readdir(cmount, ls_dir);
+  ASSERT_TRUE(result != NULL);
+  ASSERT_STREQ(result->d_name, ".");
+  result = ceph_readdir(cmount, ls_dir);
+  ASSERT_TRUE(result != NULL);
+  ASSERT_STREQ(result->d_name, "..");
+
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+  ASSERT_EQ(0, ceph_closedir(cmount, ls_dir));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, FdopendirOnNonDir) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char foostr[256];
+  sprintf(foostr, "/dir_ls%d", mypid);
+  ASSERT_EQ(ceph_mkdir(cmount, foostr, 0777), 0);
+
+  char bazstr[512];
+  sprintf(bazstr, "%s/file", foostr);
+  int fd  = ceph_open(cmount, bazstr, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+
+  struct ceph_dir_result *ls_dir = NULL;
+  ASSERT_EQ(ceph_fdopendir(cmount, fd, &ls_dir), -ENOTDIR);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, bazstr));
+  ASSERT_EQ(0, ceph_rmdir(cmount, foostr));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Mkdirat) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path1[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path1, "/%s", dir_name);
+
+  char dir_path2[512];
+  char rel_dir_path2[512];
+  sprintf(dir_path2, "%s/dir_%d", dir_path1, mypid);
+  sprintf(rel_dir_path2, "%s/dir_%d", dir_name, mypid);
+
+  int fd = ceph_open(cmount, "/", O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+
+  ASSERT_EQ(0, ceph_mkdirat(cmount, fd, dir_name, 0777));
+  ASSERT_EQ(0, ceph_mkdirat(cmount, fd, rel_dir_path2, 0666));
+
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path2));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path1));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, MkdiratATFDCWD) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path1[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path1, "/%s", dir_name);
+
+  char dir_path2[512];
+  sprintf(dir_path2, "%s/dir_%d", dir_path1, mypid);
+
+  ASSERT_EQ(0, ceph_mkdirat(cmount, CEPHFS_AT_FDCWD, dir_name, 0777));
+
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path1));
+  ASSERT_EQ(0, ceph_mkdirat(cmount, CEPHFS_AT_FDCWD, dir_name, 0666));
+
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path2));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path1));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Readlinkat) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512];
+  sprintf(rel_file_path, "%s/elif", dir_name);
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd  = ceph_open(cmount, file_path, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  char link_path[128];
+  char rel_link_path[64];
+  sprintf(rel_link_path, "linkfile_%d", mypid);
+  sprintf(link_path, "/%s", rel_link_path);
+  ASSERT_EQ(0, ceph_symlink(cmount, rel_file_path, link_path));
+
+  fd = ceph_open(cmount, "/", O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  size_t target_len = strlen(rel_file_path);
+  char target[target_len+1];
+  ASSERT_EQ(target_len, ceph_readlinkat(cmount, fd, rel_link_path, target, target_len));
+  target[target_len] = '\0';
+  ASSERT_EQ(0, memcmp(target, rel_file_path, target_len));
+
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+#if defined(__linux__) && defined(O_PATH)
+  // test readlinkat with empty pathname relative to O_PATH|O_NOFOLLOW fd
+  fd = ceph_open(cmount, link_path, O_PATH | O_NOFOLLOW, 0);
+  ASSERT_LE(0, fd);
+  size_t link_target_len = strlen(rel_file_path);
+  char link_target[link_target_len+1];
+  ASSERT_EQ(link_target_len, ceph_readlinkat(cmount, fd, "", link_target, link_target_len));
+  link_target[link_target_len] = '\0';
+  ASSERT_EQ(0, memcmp(link_target, rel_file_path, link_target_len));
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+#endif /* __linux */
+
+  ASSERT_EQ(0, ceph_unlink(cmount, link_path));
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, ReadlinkatATFDCWD) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "./elif";
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd  = ceph_open(cmount, file_path, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  char link_path[PATH_MAX];
+  char rel_link_path[1024];
+  sprintf(rel_link_path, "./linkfile_%d", mypid);
+  sprintf(link_path, "%s/%s", dir_path, rel_link_path);
+  ASSERT_EQ(0, ceph_symlink(cmount, rel_file_path, link_path));
+
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path));
+  size_t target_len = strlen(rel_file_path);
+  char target[target_len+1];
+  ASSERT_EQ(target_len, ceph_readlinkat(cmount, CEPHFS_AT_FDCWD, rel_link_path, target, target_len));
+  target[target_len] = '\0';
+  ASSERT_EQ(0, memcmp(target, rel_file_path, target_len));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, link_path));
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Symlinkat) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512];
+  sprintf(rel_file_path, "%s/elif", dir_name);
+  sprintf(file_path, "%s/elif", dir_path);
+
+  int fd  = ceph_open(cmount, file_path, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  char link_path[128];
+  char rel_link_path[64];
+  sprintf(rel_link_path, "linkfile_%d", mypid);
+  sprintf(link_path, "/%s", rel_link_path);
+
+  fd = ceph_open(cmount, "/", O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_symlinkat(cmount, rel_file_path, fd, rel_link_path));
+
+  size_t target_len = strlen(rel_file_path);
+  char target[target_len+1];
+  ASSERT_EQ(target_len, ceph_readlinkat(cmount, fd, rel_link_path, target, target_len));
+  target[target_len] = '\0';
+  ASSERT_EQ(0, memcmp(target, rel_file_path, target_len));
+
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+  ASSERT_EQ(0, ceph_unlink(cmount, link_path));
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SymlinkatATFDCWD) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "./elif";
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd  = ceph_open(cmount, file_path, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  char link_path[PATH_MAX];
+  char rel_link_path[1024];
+  sprintf(rel_link_path, "./linkfile_%d", mypid);
+  sprintf(link_path, "%s/%s", dir_path, rel_link_path);
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path));
+  ASSERT_EQ(0, ceph_symlinkat(cmount, rel_file_path, CEPHFS_AT_FDCWD, rel_link_path));
+
+  size_t target_len = strlen(rel_file_path);
+  char target[target_len+1];
+  ASSERT_EQ(target_len, ceph_readlinkat(cmount, CEPHFS_AT_FDCWD, rel_link_path, target, target_len));
+  target[target_len] = '\0';
+  ASSERT_EQ(0, memcmp(target, rel_file_path, target_len));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, link_path));
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Unlinkat) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "elif";
+  sprintf(file_path, "%s/elif", dir_path);
+
+  int fd  = ceph_open(cmount, file_path, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  fd = ceph_open(cmount, dir_path, O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(-ENOTDIR, ceph_unlinkat(cmount, fd, rel_file_path, AT_REMOVEDIR));
+  ASSERT_EQ(0, ceph_unlinkat(cmount, fd, rel_file_path, 0));
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  fd = ceph_open(cmount, "/", O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_EQ(-EISDIR, ceph_unlinkat(cmount, fd, dir_name, 0));
+  ASSERT_EQ(0, ceph_unlinkat(cmount, fd, dir_name, AT_REMOVEDIR));
+  ASSERT_LE(0, fd);
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, UnlinkatATFDCWD) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "elif";
+  sprintf(file_path, "%s/elif", dir_path);
+
+  int fd  = ceph_open(cmount, file_path, O_CREAT|O_RDONLY, 0666);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path));
+  ASSERT_EQ(-ENOTDIR, ceph_unlinkat(cmount, CEPHFS_AT_FDCWD, rel_file_path, AT_REMOVEDIR));
+  ASSERT_EQ(0, ceph_unlinkat(cmount, CEPHFS_AT_FDCWD, rel_file_path, 0));
+
+  ASSERT_EQ(0, ceph_chdir(cmount, "/"));
+  ASSERT_EQ(-EISDIR, ceph_unlinkat(cmount, CEPHFS_AT_FDCWD, dir_name, 0));
+  ASSERT_EQ(0, ceph_unlinkat(cmount, CEPHFS_AT_FDCWD, dir_name, AT_REMOVEDIR));
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Chownat) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "elif";
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd = ceph_open(cmount, file_path, O_CREAT|O_RDWR, 0666);
+  ASSERT_LE(0, fd);
+
+  // set perms to readable and writeable only by owner
+  ASSERT_EQ(ceph_fchmod(cmount, fd, 0600), 0);
+  ceph_close(cmount, fd);
+
+  fd = ceph_open(cmount, dir_path, O_DIRECTORY | O_RDONLY, 0);
+  // change ownership to nobody -- we assume nobody exists and id is always 65534
+  ASSERT_EQ(ceph_conf_set(cmount, "client_permissions", "0"), 0);
+  ASSERT_EQ(ceph_chownat(cmount, fd, rel_file_path, 65534, 65534, 0), 0);
+  // change relative fd ownership with AT_EMPTY_PATH
+#if defined(__linux__) && defined(AT_EMPTY_PATH)
+  int file_fd = ceph_openat(cmount, fd, rel_file_path, O_RDONLY, 0);
+  ASSERT_LE(0, file_fd);
+  ASSERT_EQ(ceph_chownat(cmount, file_fd, "", 65534, 65534, AT_EMPTY_PATH), 0);
+  ceph_close(cmount, file_fd);
+#endif
+  ASSERT_EQ(ceph_conf_set(cmount, "client_permissions", "1"), 0);
+  ceph_close(cmount, fd);
+
+  // "nobody" will be ignored on Windows
+  #ifndef _WIN32
+  fd = ceph_open(cmount, file_path, O_RDWR, 0);
+  ASSERT_EQ(fd, -EACCES);
+  #endif
+
+  ASSERT_EQ(ceph_conf_set(cmount, "client_permissions", "0"), 0);
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(ceph_conf_set(cmount, "client_permissions", "1"), 0);
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, ChownatATFDCWD) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "elif";
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd = ceph_open(cmount, file_path, O_CREAT|O_RDWR, 0666);
+  ASSERT_LE(0, fd);
+
+  // set perms to readable and writeable only by owner
+  ASSERT_EQ(ceph_fchmod(cmount, fd, 0600), 0);
+  ceph_close(cmount, fd);
+
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path));
+  // change ownership to nobody -- we assume nobody exists and id is always 65534
+  ASSERT_EQ(ceph_conf_set(cmount, "client_permissions", "0"), 0);
+  ASSERT_EQ(ceph_chownat(cmount, CEPHFS_AT_FDCWD, rel_file_path, 65534, 65534, 0), 0);
+  ASSERT_EQ(ceph_conf_set(cmount, "client_permissions", "1"), 0);
+
+  // "nobody" will be ignored on Windows
+  #ifndef _WIN32
+  fd = ceph_open(cmount, file_path, O_RDWR, 0);
+  ASSERT_EQ(fd, -EACCES);
+  #endif
+
+  ASSERT_EQ(ceph_conf_set(cmount, "client_permissions", "0"), 0);
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(ceph_conf_set(cmount, "client_permissions", "1"), 0);
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Chmodat) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "elif";
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd = ceph_open(cmount, file_path, O_CREAT|O_RDWR, 0666);
+  ASSERT_LE(0, fd);
+  const char *bytes = "foobarbaz";
+  ASSERT_EQ(ceph_write(cmount, fd, bytes, strlen(bytes), 0), (int)strlen(bytes));
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  fd = ceph_open(cmount, dir_path, O_DIRECTORY | O_RDONLY, 0);
+
+  // set perms to read but can't write
+  ASSERT_EQ(ceph_chmodat(cmount, fd, rel_file_path, 0400, 0), 0);
+  ASSERT_EQ(ceph_open(cmount, file_path, O_RDWR, 0), -EACCES);
+
+  // reset back to writeable
+  ASSERT_EQ(ceph_chmodat(cmount, fd, rel_file_path, 0600, 0), 0);
+  int fd2 = ceph_open(cmount, file_path, O_RDWR, 0);
+  ASSERT_LE(0, fd2);
+
+  ASSERT_EQ(0, ceph_close(cmount, fd2));
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, ChmodatATFDCWD) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "elif";
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd = ceph_open(cmount, file_path, O_CREAT|O_RDWR, 0666);
+  ASSERT_LE(0, fd);
+  const char *bytes = "foobarbaz";
+  ASSERT_EQ(ceph_write(cmount, fd, bytes, strlen(bytes), 0), (int)strlen(bytes));
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  // set perms to read but can't write
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path));
+  ASSERT_EQ(ceph_chmodat(cmount, CEPHFS_AT_FDCWD, rel_file_path, 0400, 0), 0);
+  ASSERT_EQ(ceph_open(cmount, file_path, O_RDWR, 0), -EACCES);
+
+  // reset back to writeable
+  ASSERT_EQ(ceph_chmodat(cmount, CEPHFS_AT_FDCWD, rel_file_path, 0600, 0), 0);
+  int fd2 = ceph_open(cmount, file_path, O_RDWR, 0);
+  ASSERT_LE(0, fd2);
+  ASSERT_EQ(0, ceph_close(cmount, fd2));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, Utimensat) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "elif";
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd = ceph_open(cmount, file_path, O_CREAT|O_RDWR, 0666);
+  ASSERT_LE(0, fd);
+
+  struct timespec times[2];
+  get_current_time_timespec(times);
+
+  fd = ceph_open(cmount, dir_path, O_DIRECTORY | O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  EXPECT_EQ(0, ceph_utimensat(cmount, fd, rel_file_path, times, 0));
+  ceph_close(cmount, fd);
+
+  struct ceph_statx stx;
+  ASSERT_EQ(ceph_statx(cmount, file_path, &stx,
+                       CEPH_STATX_MTIME|CEPH_STATX_ATIME, 0), 0);
+  ASSERT_EQ(utime_t(stx.stx_atime), utime_t(times[0]));
+  ASSERT_EQ(utime_t(stx.stx_mtime), utime_t(times[1]));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, UtimensatATFDCWD) {
+  pid_t mypid = getpid();
+
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  char file_path[512];
+  char rel_file_path[512] = "elif";
+  sprintf(file_path, "%s/elif", dir_path);
+  int fd = ceph_open(cmount, file_path, O_CREAT|O_RDWR, 0666);
+  ASSERT_LE(0, fd);
+
+  struct timespec times[2];
+  get_current_time_timespec(times);
+
+  ASSERT_EQ(0, ceph_chdir(cmount, dir_path));
+  EXPECT_EQ(0, ceph_utimensat(cmount, CEPHFS_AT_FDCWD, rel_file_path, times, 0));
+
+  struct ceph_statx stx;
+  ASSERT_EQ(ceph_statx(cmount, file_path, &stx,
+                       CEPH_STATX_MTIME|CEPH_STATX_ATIME, 0), 0);
+  ASSERT_EQ(utime_t(stx.stx_atime), utime_t(times[0]));
+  ASSERT_EQ(utime_t(stx.stx_mtime), utime_t(times[1]));
+
+  ASSERT_EQ(0, ceph_unlink(cmount, file_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, LookupMdsPrivateInos) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  Inode *inode;
+  for (int ino = 0; ino < MDS_INO_SYSTEM_BASE; ino++) {
+    if (MDS_IS_PRIVATE_INO(ino)) {
+      ASSERT_EQ(-ESTALE, ceph_ll_lookup_inode(cmount, ino, &inode));
+    } else if (ino == CEPH_INO_ROOT || ino == CEPH_INO_GLOBAL_SNAPREALM) {
+      ASSERT_EQ(0, ceph_ll_lookup_inode(cmount, ino, &inode));
+      ceph_ll_put(cmount, inode);
+    } else if (ino == CEPH_INO_LOST_AND_FOUND) {
+      // the ino 3 will only exists after the recovery tool ran, so
+      // it may return -ESTALE with a fresh fs cluster
+      int r = ceph_ll_lookup_inode(cmount, ino, &inode);
+      if (r == 0) {
+        ceph_ll_put(cmount, inode);
+      } else {
+        ASSERT_TRUE(r == -ESTALE);
+      }
+    } else {
+      // currently the ino 0 and 4~99 is not useded yet.
+      ASSERT_EQ(-ESTALE, ceph_ll_lookup_inode(cmount, ino, &inode));
+    }
+  }
+
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SetMountTimeoutPostMount) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  ASSERT_EQ(-EINVAL, ceph_set_mount_timeout(cmount, 5));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SetMountTimeout) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_set_mount_timeout(cmount, 5));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SnapdirAttrs) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  char snap_dir_path[512];
+
+  pid_t mypid = getpid();
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  sprintf(snap_dir_path, "%s/.snap", dir_path);
+
+  Inode *dir, *root;
+  struct ceph_statx stx_dir;
+  struct ceph_statx stx_snap_dir;
+  struct ceph_statx stx_root_snap_dir;
+  UserPerm *perms = ceph_mount_perms(cmount);
+
+  ASSERT_EQ(ceph_ll_lookup_root(cmount, &root), 0);
+  ASSERT_EQ(ceph_ll_mkdir(cmount, root, dir_name, 0755, &dir, &stx_dir, 0, 0, perms), 0);
+
+  ASSERT_EQ(ceph_statx(cmount, dir_path, &stx_dir,
+                       CEPH_STATX_MTIME|CEPH_STATX_ATIME|CEPH_STATX_MODE|CEPH_STATX_MODE|CEPH_STATX_GID|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir,
+                       CEPH_STATX_MTIME|CEPH_STATX_ATIME|CEPH_STATX_MODE|CEPH_STATX_MODE|CEPH_STATX_GID|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, "/.snap", &stx_root_snap_dir,
+                       CEPH_STATX_MTIME|CEPH_STATX_ATIME|CEPH_STATX_MODE|CEPH_STATX_MODE|CEPH_STATX_GID|CEPH_STATX_VERSION, 0), 0);
+
+  // these should match the parent directories attrs
+  ASSERT_EQ(stx_dir.stx_mode, stx_snap_dir.stx_mode);
+  ASSERT_EQ(stx_dir.stx_uid, stx_snap_dir.stx_uid);
+  ASSERT_EQ(stx_dir.stx_gid, stx_snap_dir.stx_gid);
+  ASSERT_EQ(utime_t(stx_dir.stx_atime), utime_t(stx_snap_dir.stx_atime));
+  // these should match the closest snaprealm ancestor (root in this
+  // case) attrs
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_mtime), utime_t(stx_snap_dir.stx_mtime));
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_ctime), utime_t(stx_snap_dir.stx_ctime));
+  ASSERT_EQ(stx_root_snap_dir.stx_version, stx_snap_dir.stx_version);
+
+  // chown  -- for this we need to be "root"
+  UserPerm *rootcred = ceph_userperm_new(0, 0, 0, NULL);
+  ASSERT_TRUE(rootcred);
+  stx_dir.stx_uid++;
+  stx_dir.stx_gid++;
+  ASSERT_EQ(ceph_ll_setattr(cmount, dir, &stx_dir, CEPH_SETATTR_UID|CEPH_SETATTR_GID, rootcred), 0);
+
+  memset(&stx_dir, 0, sizeof(stx_dir));
+  memset(&stx_snap_dir, 0, sizeof(stx_snap_dir));
+
+  ASSERT_EQ(ceph_statx(cmount, dir_path, &stx_dir,
+                       CEPH_STATX_MTIME|CEPH_STATX_ATIME|CEPH_STATX_MODE|CEPH_STATX_MODE|CEPH_STATX_GID|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir,
+                       CEPH_STATX_MTIME|CEPH_STATX_ATIME|CEPH_STATX_MODE|CEPH_STATX_MODE|CEPH_STATX_GID|CEPH_STATX_VERSION, 0), 0);
+
+  ASSERT_EQ(stx_dir.stx_mode, stx_snap_dir.stx_mode);
+  ASSERT_EQ(stx_dir.stx_uid, stx_snap_dir.stx_uid);
+  ASSERT_EQ(stx_dir.stx_gid, stx_snap_dir.stx_gid);
+  ASSERT_EQ(utime_t(stx_dir.stx_atime), utime_t(stx_snap_dir.stx_atime));
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_mtime), utime_t(stx_snap_dir.stx_mtime));
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_ctime), utime_t(stx_snap_dir.stx_ctime));
+  ASSERT_EQ(stx_root_snap_dir.stx_version, stx_snap_dir.stx_version);
+
+  ASSERT_EQ(ceph_ll_rmdir(cmount, root, dir_name, rootcred), 0);
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SnapDirLookup) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  auto top = generate_random_string();
+  ASSERT_EQ(ceph_mkdir(cmount, top.c_str(), 0777), 0);
+  ASSERT_EQ(0, ceph_chdir(cmount, top.c_str()));
+
+  ASSERT_EQ(ceph_mkdir(cmount, "foo", 0777), 0);
+  ASSERT_EQ(ceph_mkdir(cmount, "foo/bar", 0777), 0);
+  ASSERT_EQ(ceph_mkdir(cmount, "foo/.snap/snap", 0777), 0);
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+  ASSERT_EQ(0, ceph_chdir(cmount, top.c_str()));
+  ASSERT_EQ(0, ceph_chdir(cmount, "foo/"));
+
+  {
+    struct ceph_dir_result *cdr = NULL;
+    struct dirent* de = nullptr;
+    ASSERT_EQ(0, ceph_opendir(cmount, ".", &cdr));
+    while((de = ceph_readdir(cmount, cdr))) {
+      continue;
+    }
+    ASSERT_EQ(0, ceph_closedir(cmount, cdr));
+  }
+
+  {
+    struct stat buf;
+    ASSERT_EQ(0, ceph_stat(cmount, "bar", &buf));
+  }
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+  ASSERT_EQ(0, ceph_chdir(cmount, top.c_str()));
+  ASSERT_EQ(0, ceph_chdir(cmount, "foo/"));
+
+  {
+    struct ceph_dir_result *cdr = NULL;
+    struct dirent* de = nullptr;
+    ASSERT_EQ(0, ceph_opendir(cmount, ".snap/", &cdr));
+    while((de = ceph_readdir(cmount, cdr))) {
+      continue;
+    }
+    ASSERT_EQ(0, ceph_closedir(cmount, cdr));
+  }
+
+
+  {
+    struct stat buf;
+    ASSERT_EQ(0, ceph_stat(cmount, ".snap/snap/bar", &buf));
+  }
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+  ASSERT_EQ(0, ceph_chdir(cmount, top.c_str()));
+  ASSERT_EQ(0, ceph_chdir(cmount, "foo/"));
+
+  {
+    struct ceph_dir_result *cdr = NULL;
+    struct dirent* de = nullptr;
+    ASSERT_EQ(0, ceph_opendir(cmount, ".snap/snap/", &cdr));
+    while((de = ceph_readdir(cmount, cdr))) {
+      continue;
+    }
+    ASSERT_EQ(0, ceph_closedir(cmount, cdr));
+  }
+
+  {
+    struct stat buf;
+    ASSERT_EQ(0, ceph_stat(cmount, ".snap/snap/bar", &buf));
+  }
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+  ASSERT_EQ(0, ceph_chdir(cmount, top.c_str()));
+
+  ASSERT_EQ(ceph_rmdir(cmount, "foo/.snap/snap"), 0);
+  ASSERT_EQ(ceph_rmdir(cmount, "foo/bar"), 0);
+  ASSERT_EQ(ceph_rmdir(cmount, "foo"), 0);
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SnapdirAttrsOnSnapCreate) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  char snap_dir_path[512];
+
+  pid_t mypid = getpid();
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  sprintf(snap_dir_path, "%s/.snap", dir_path);
+
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  struct ceph_statx stx_dir;
+  struct ceph_statx stx_snap_dir;
+  struct ceph_statx stx_root_snap_dir;
+  ASSERT_EQ(ceph_statx(cmount, dir_path, &stx_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, "/.snap", &stx_root_snap_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_mtime), utime_t(stx_snap_dir.stx_mtime));
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_ctime), utime_t(stx_snap_dir.stx_ctime));
+  ASSERT_EQ(stx_root_snap_dir.stx_version, stx_snap_dir.stx_version);
+
+  char snap_path[1024];
+  sprintf(snap_path, "%s/snap_a", snap_dir_path);
+  ASSERT_EQ(ceph_mkdir(cmount, snap_path, 0777), 0);
+
+  struct ceph_statx stx_snap_dir_1;
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir_1, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_LT(utime_t(stx_root_snap_dir.stx_mtime), utime_t(stx_snap_dir_1.stx_mtime));
+  ASSERT_LT(utime_t(stx_root_snap_dir.stx_ctime), utime_t(stx_snap_dir_1.stx_ctime));
+  ASSERT_LT(stx_root_snap_dir.stx_version, stx_snap_dir_1.stx_version);
+
+  ASSERT_EQ(0, ceph_rmdir(cmount, snap_path));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+
+TEST(LibCephFS, SnapdirAttrsOnSnapDelete) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  char snap_dir_path[512];
+
+  pid_t mypid = getpid();
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  sprintf(snap_dir_path, "%s/.snap", dir_path);
+
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  struct ceph_statx stx_dir;
+  struct ceph_statx stx_snap_dir;
+  struct ceph_statx stx_root_snap_dir;
+  ASSERT_EQ(ceph_statx(cmount, dir_path, &stx_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, "/.snap", &stx_root_snap_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_mtime), utime_t(stx_snap_dir.stx_mtime));
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_ctime), utime_t(stx_snap_dir.stx_mtime));
+  ASSERT_EQ(stx_root_snap_dir.stx_version, stx_snap_dir.stx_version);
+
+  char snap_path[1024];
+  sprintf(snap_path, "%s/snap_a", snap_dir_path);
+  ASSERT_EQ(ceph_mkdir(cmount, snap_path, 0777), 0);
+
+  struct ceph_statx stx_snap_dir_1;
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir_1, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_LT(utime_t(stx_root_snap_dir.stx_mtime), utime_t(stx_snap_dir_1.stx_mtime));
+  ASSERT_LT(utime_t(stx_root_snap_dir.stx_ctime), utime_t(stx_snap_dir_1.stx_ctime));
+  ASSERT_LT(stx_root_snap_dir.stx_version, stx_snap_dir_1.stx_version);
+
+  ASSERT_EQ(0, ceph_rmdir(cmount, snap_path));
+
+  struct ceph_statx stx_snap_dir_2;
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir_2, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  // Flaky assertion on Windows, potentially due to timestamp precision.
+  #ifndef _WIN32
+  ASSERT_LT(utime_t(stx_snap_dir_1.stx_mtime), utime_t(stx_snap_dir_2.stx_mtime));
+  ASSERT_LT(utime_t(stx_snap_dir_1.stx_ctime), utime_t(stx_snap_dir_2.stx_ctime));
+  #endif
+  ASSERT_LT(stx_snap_dir_1.stx_version, stx_snap_dir_2.stx_version);
+
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SnapdirAttrsOnSnapRename) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  char dir_name[128];
+  char dir_path[256];
+  char snap_dir_path[512];
+
+  pid_t mypid = getpid();
+  sprintf(dir_name, "dir_%d", mypid);
+  sprintf(dir_path, "/%s", dir_name);
+  sprintf(snap_dir_path, "%s/.snap", dir_path);
+
+  ASSERT_EQ(ceph_mkdir(cmount, dir_path, 0777), 0);
+
+  struct ceph_statx stx_dir;
+  struct ceph_statx stx_snap_dir;
+  struct ceph_statx stx_root_snap_dir;
+  ASSERT_EQ(ceph_statx(cmount, dir_path, &stx_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(ceph_statx(cmount, "/.snap", &stx_root_snap_dir, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_mtime), utime_t(stx_snap_dir.stx_mtime));
+  ASSERT_EQ(utime_t(stx_root_snap_dir.stx_ctime), utime_t(stx_snap_dir.stx_ctime));
+  ASSERT_EQ(stx_root_snap_dir.stx_version, stx_snap_dir.stx_version);
+
+  char snap_path[1024];
+  sprintf(snap_path, "%s/snap_a", snap_dir_path);
+  ASSERT_EQ(ceph_mkdir(cmount, snap_path, 0777), 0);
+
+  struct ceph_statx stx_snap_dir_1;
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir_1, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  ASSERT_LT(utime_t(stx_root_snap_dir.stx_mtime), utime_t(stx_snap_dir_1.stx_mtime));
+  ASSERT_LT(utime_t(stx_root_snap_dir.stx_ctime), utime_t(stx_snap_dir_1.stx_ctime));
+  ASSERT_LT(stx_root_snap_dir.stx_version, stx_snap_dir_1.stx_version);
+
+  char snap_path_r[1024];
+  sprintf(snap_path_r, "%s/snap_b", snap_dir_path);
+  ASSERT_EQ(ceph_rename(cmount, snap_path, snap_path_r), 0);
+
+  struct ceph_statx stx_snap_dir_2;
+  ASSERT_EQ(ceph_statx(cmount, snap_dir_path, &stx_snap_dir_2, CEPH_STATX_MTIME|CEPH_STATX_CTIME|CEPH_STATX_VERSION, 0), 0);
+  // Flaky assertion on Windows, potentially due to timestamp precision.
+  #ifndef _WIN32
+  ASSERT_LT(utime_t(stx_snap_dir_1.stx_mtime), utime_t(stx_snap_dir_2.stx_mtime));
+  ASSERT_LT(utime_t(stx_snap_dir_1.stx_ctime), utime_t(stx_snap_dir_2.stx_ctime));
+  #endif
+  ASSERT_LT(stx_snap_dir_1.stx_version, stx_snap_dir_2.stx_version);
+
+  ASSERT_EQ(0, ceph_rmdir(cmount, snap_path_r));
+  ASSERT_EQ(0, ceph_rmdir(cmount, dir_path));
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, SubdirLookupAfterReaddir_ll) {
+  struct ceph_mount_info *cmount;
+  Inode *root, *subdir = NULL;
+  struct ceph_statx stx;
+
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  ceph_rmdir(cmount, "foo/bar");
+  ceph_rmdir(cmount, "foo");
+
+  ASSERT_EQ(ceph_mkdir(cmount, "foo", 0777), 0);
+  ASSERT_EQ(ceph_mkdir(cmount, "foo/bar", 0777), 0);
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  UserPerm *perms = ceph_mount_perms(cmount);
+
+  {
+    ASSERT_EQ(0, ceph_ll_walk(cmount, ".", &root, &stx, CEPH_STATX_INO, 0, perms));
+    ASSERT_EQ(0, ceph_ll_lookup(cmount, root, "foo/bar", &subdir, &stx, CEPH_STATX_INO, 0, perms));
+  }
+
+  {
+    struct ceph_dir_result *cdr = NULL;
+    struct dirent *de = NULL;
+    ASSERT_EQ(0, ceph_ll_opendir(cmount, root, &cdr, perms));
+    while((de = ceph_readdir(cmount, cdr))) {
+      continue;
+    }
+    ASSERT_EQ(0, ceph_ll_releasedir(cmount, cdr));
+  }
+
+  {
+    ASSERT_EQ(0, ceph_ll_lookup(cmount, root, "foo/bar", &subdir, &stx, CEPH_STATX_INO, 0, perms));
+  }
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
   ceph_shutdown(cmount);
 }

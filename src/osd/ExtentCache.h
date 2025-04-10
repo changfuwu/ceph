@@ -12,8 +12,7 @@
  *
  */
 
-#ifndef EXTENT_CACHE_H
-#define EXTENT_CACHE_H
+#pragma once
 
 #include <map>
 #include <list>
@@ -108,8 +107,7 @@ struct bl_split_merge {
     return true;
   }
   ceph::buffer::list merge(ceph::buffer::list &&left, ceph::buffer::list &&right) const {
-    ceph::buffer::list bl;
-    bl.claim(left);
+    ceph::buffer::list bl{std::move(left)};
     bl.claim_append(right);
     return bl;
   }
@@ -364,7 +362,7 @@ private:
       extent,
       boost::intrusive::list_member_hook<>,
       &extent::pin_list_member>;
-    using list = boost::intrusive::list<extent, list_member_options>;
+    using list = boost::intrusive::list<extent, boost::intrusive::constant_time_size<false>, list_member_options>;
     list pin_list;
     ~pin_state() {
       ceph_assert(pin_list.empty());
@@ -486,5 +484,3 @@ public:
 };
 
 std::ostream &operator <<(std::ostream &lhs, const ExtentCache &cache);
-
-#endif

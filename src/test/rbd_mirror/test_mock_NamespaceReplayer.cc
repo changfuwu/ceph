@@ -132,7 +132,7 @@ struct InstanceWatcher<librbd::MockTestImageCtx> {
   static InstanceWatcher* s_instance;
 
   static InstanceWatcher* create(
-      librados::IoCtx &ioctx, ContextWQ* work_queue,
+      librados::IoCtx &ioctx, librbd::AsioEngine& asio_engine,
       InstanceReplayer<librbd::MockTestImageCtx>* instance_replayer,
       Throttler<librbd::MockTestImageCtx> *image_sync_throttler) {
     ceph_assert(s_instance != nullptr);
@@ -213,7 +213,7 @@ struct PoolWatcher<librbd::MockTestImageCtx> {
     return s_instances[pool_id];
   }
 
-  MOCK_METHOD0(is_blacklisted, bool());
+  MOCK_METHOD0(is_blocklisted, bool());
 
   MOCK_METHOD0(get_image_count, uint64_t());
 
@@ -249,11 +249,12 @@ template <>
 struct Threads<librbd::MockTestImageCtx> {
   ceph::mutex &timer_lock;
   SafeTimer *timer;
-  ContextWQ *work_queue;
+  librbd::asio::ContextWQ *work_queue;
+  librbd::AsioEngine* asio_engine;
 
   Threads(Threads<librbd::ImageCtx> *threads)
     : timer_lock(threads->timer_lock), timer(threads->timer),
-      work_queue(threads->work_queue) {
+      work_queue(threads->work_queue), asio_engine(threads->asio_engine) {
   }
 };
 
@@ -408,7 +409,7 @@ TEST_F(TestMockNamespaceReplayer, Init_LocalMirrorStatusUpdaterError) {
   expect_mirror_status_updater_init(*mock_local_mirror_status_updater, -EINVAL);
 
   MockNamespaceReplayer namespace_replayer(
-      {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
+      {}, {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
       "local peer uuid", {"remote mirror uuid", ""}, m_mock_threads,
       nullptr, nullptr, nullptr, nullptr, nullptr);
 
@@ -431,7 +432,7 @@ TEST_F(TestMockNamespaceReplayer, Init_RemoteMirrorStatusUpdaterError) {
   expect_mirror_status_updater_shut_down(*mock_local_mirror_status_updater);
 
   MockNamespaceReplayer namespace_replayer(
-      {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
+      {}, {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
       "local peer uuid", {"remote mirror uuid", ""}, m_mock_threads,
       nullptr, nullptr, nullptr, nullptr, nullptr);
 
@@ -457,7 +458,7 @@ TEST_F(TestMockNamespaceReplayer, Init_InstanceReplayerError) {
   expect_mirror_status_updater_shut_down(*mock_local_mirror_status_updater);
 
   MockNamespaceReplayer namespace_replayer(
-      {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
+      {}, {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
       "local peer uuid", {"remote mirror uuid", ""}, m_mock_threads,
       nullptr, nullptr, nullptr, nullptr, nullptr);
 
@@ -488,7 +489,7 @@ TEST_F(TestMockNamespaceReplayer, Init_InstanceWatcherError) {
   expect_mirror_status_updater_shut_down(*mock_local_mirror_status_updater);
 
   MockNamespaceReplayer namespace_replayer(
-      {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
+      {}, {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
       "local peer uuid", {"remote mirror uuid", ""}, m_mock_threads,
       nullptr, nullptr, nullptr, nullptr, nullptr);
 
@@ -516,7 +517,7 @@ TEST_F(TestMockNamespaceReplayer, Init) {
 
   MockServiceDaemon mock_service_daemon;
   MockNamespaceReplayer namespace_replayer(
-      {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
+      {}, {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
       "local peer uuid", {"remote mirror uuid", ""}, m_mock_threads,
       nullptr, nullptr, &mock_service_daemon, nullptr, nullptr);
 
@@ -556,7 +557,7 @@ TEST_F(TestMockNamespaceReplayer, AcquireLeader) {
 
   MockServiceDaemon mock_service_daemon;
   MockNamespaceReplayer namespace_replayer(
-      {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
+      {}, {}, m_local_io_ctx, m_remote_io_ctx, "local mirror uuid",
       "local peer uuid", {"remote mirror uuid", ""}, m_mock_threads,
       nullptr, nullptr, &mock_service_daemon, nullptr, nullptr);
 

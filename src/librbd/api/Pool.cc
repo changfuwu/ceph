@@ -9,6 +9,7 @@
 #include "common/Throttle.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "osd/osd_types.h"
+#include "librbd/AsioEngine.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/Utils.h"
 #include "librbd/api/Config.h"
@@ -242,6 +243,14 @@ int Pool<I>::init(librados::IoCtx& io_ctx, bool force) {
 
   int r = io_ctx.application_enable(pg_pool_t::APPLICATION_NAME_RBD, force);
   if (r < 0) {
+    lderr(cct) << "failed to enable RBD application: " << cpp_strerror(r)
+               << dendl;
+    return r;
+  }
+
+  r = io_ctx.create(RBD_TRASH, false);
+  if (r < 0) {
+    lderr(cct) << "failed to create trash: " << cpp_strerror(r) << dendl;
     return r;
   }
 
@@ -251,12 +260,8 @@ int Pool<I>::init(librados::IoCtx& io_ctx, bool force) {
     return 0;
   }
 
-  ThreadPool *thread_pool;
-  ContextWQ *op_work_queue;
-  ImageCtx::get_thread_pool_instance(cct, &thread_pool, &op_work_queue);
-
   C_SaferCond ctx;
-  auto req = image::ValidatePoolRequest<I>::create(io_ctx, op_work_queue, &ctx);
+  auto req = image::ValidatePoolRequest<I>::create(io_ctx, &ctx);
   req->send();
 
   return ctx.wait();

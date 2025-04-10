@@ -6,7 +6,9 @@
 #include "librbd/ImageCtx.h"
 #include "librbd/ObjectMap.h"
 #include "cls/lock/cls_lock_client.h"
+
 #include <iostream>
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -121,7 +123,7 @@ bool SnapshotCreateRequest::send_add_snapshot() {
   m_state = STATE_ADD_SNAPSHOT;
 
   librados::ObjectWriteOperation op;
-  rados::cls::lock::assert_locked(&op, RBD_LOCK_NAME, LOCK_EXCLUSIVE, "", "");
+  rados::cls::lock::assert_locked(&op, RBD_LOCK_NAME, ClsLockType::EXCLUSIVE, "", "");
   cls_client::object_map_snap_add(&op);
 
   librados::AioCompletion *rados_completion = create_callback_completion();

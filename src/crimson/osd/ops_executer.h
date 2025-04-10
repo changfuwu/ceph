@@ -5,46 +5,63 @@
 
 #include <memory>
 #include <type_traits>
+#include <utility>
 #include <boost/intrusive_ptr.hpp>
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
-#include <boost/smart_ptr/local_shared_ptr.hpp>
+#include <fmt/os.h>
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/shared_ptr.hh>
 
 #include "common/dout.h"
-#include "crimson/net/Fwd.h"
+#include "common/map_cacher.hpp"
+#include "common/static_ptr.h"
+#include "messages/MOSDOp.h"
 #include "os/Transaction.h"
 #include "osd/osd_types.h"
-#include "crimson/osd/object_context.h"
 
+#include "crimson/common/coroutine.h"
 #include "crimson/common/errorator.h"
+#include "crimson/common/interruptible_future.h"
 #include "crimson/common/type_helpers.h"
 #include "crimson/osd/osd_operations/client_request.h"
 #include "crimson/osd/osd_operations/peering_event.h"
-#include "crimson/osd/shard_services.h"
-#include "crimson/osd/osdmap_gate.h"
-
-#include "crimson/osd/pg.h"
 #include "crimson/osd/pg_backend.h"
-#include "crimson/osd/exceptions.h"
+#include "crimson/osd/pg_interval_interrupt_condition.h"
+#include "crimson/osd/shard_services.h"
 
-#include "messages/MOSDOp.h"
-
-class PGLSFilter;
-class OSDOp;
+struct ObjectState;
+struct OSDOp;
+class OSDriver;
+class SnapMapper;
 
 namespace crimson::osd {
+class PG;
+
+// OpsExecuter -- a class for executing ops targeting a certain object.
 class OpsExecuter {
+  friend class SnapTrimObjSubEvent;
+
   using call_errorator = crimson::errorator<
     crimson::stateful_ec,
     crimson::ct_error::enoent,
+    crimson::ct_error::eexist,
+    crimson::ct_error::enospc,
+    crimson::ct_error::edquot,
+    crimson::ct_error::cmp_fail,
+    crimson::ct_error::eagain,
     crimson::ct_error::invarg,
+    crimson::ct_error::erange,
+    crimson::ct_error::ecanceled,
+    crimson::ct_error::enametoolong,
     crimson::ct_error::permission_denied,
     crimson::ct_error::operation_not_supported,
     crimson::ct_error::input_output_error,
-    crimson::ct_error::value_too_large>;
+    crimson::ct_error::value_too_large,
+    crimson::ct_error::file_too_large>;
   using read_errorator = PGBackend::read_errorator;
+  using write_ertr = PGBackend::write_ertr;
   using get_attr_errorator = PGBackend::get_attr_errorator;
   using watch_errorator = crimson::errorator<
     crimson::ct_error::enoent,
@@ -52,7 +69,88 @@ class OpsExecuter {
     crimson::ct_error::not_connected,
     crimson::ct_error::timed_out>;
 
+  using call_ierrorator =
+    ::crimson::interruptible::interruptible_errorator<
+      IOInterruptCondition, call_errorator>;
+  using read_ierrorator =
+    ::crimson::interruptible::interruptible_errorator<
+      IOInterruptCondition, read_errorator>;
+  using write_iertr =
+    ::crimson::interruptible::interruptible_errorator<
+      IOInterruptCondition, write_ertr>;
+  using get_attr_ierrorator =
+    ::crimson::interruptible::interruptible_errorator<
+      IOInterruptCondition, get_attr_errorator>;
+  using watch_ierrorator =
+    ::crimson::interruptible::interruptible_errorator<
+      IOInterruptCondition, watch_errorator>;
+
+  template <typename Errorator, typename T = void>
+  using interruptible_errorated_future =
+    ::crimson::interruptible::interruptible_errorated_future<
+      IOInterruptCondition, Errorator, T>;
+  using interruptor =
+    ::crimson::interruptible::interruptor<IOInterruptCondition>;
+  template <typename T = void>
+  using interruptible_future =
+    ::crimson::interruptible::interruptible_future<
+      IOInterruptCondition, T>;
+
 public:
+  // ExecutableMessage -- an interface class to allow using OpsExecuter
+  // with other message types than just the `MOSDOp`. The type erasure
+  // happens in the ctor of `OpsExecuter`.
+  struct ExecutableMessage {
+    virtual osd_reqid_t get_reqid() const = 0;
+    virtual utime_t get_mtime() const = 0;
+    virtual epoch_t get_map_epoch() const = 0;
+    virtual entity_inst_t get_orig_source_inst() const = 0;
+    virtual uint64_t get_features() const = 0;
+    virtual bool has_flag(uint32_t flag) const = 0;
+    virtual entity_name_t get_source() const = 0;
+    virtual snapid_t get_snapid() const = 0;
+  };
+
+  template <class ImplT>
+  class ExecutableMessagePimpl final : ExecutableMessage {
+    const ImplT* pimpl;
+    // In crimson, conn is independently maintained outside Message.
+    const crimson::net::ConnectionXcoreRef conn;
+  public:
+    ExecutableMessagePimpl(const ImplT* pimpl,
+                           const crimson::net::ConnectionXcoreRef conn)
+      : pimpl(pimpl), conn(conn) {
+    }
+
+    osd_reqid_t get_reqid() const final {
+      return pimpl->get_reqid();
+    }
+    bool has_flag(uint32_t flag) const final {
+      return pimpl->has_flag(flag);
+    }
+    utime_t get_mtime() const final {
+      return pimpl->get_mtime();
+    };
+    epoch_t get_map_epoch() const final {
+      return pimpl->get_map_epoch();
+    }
+    entity_inst_t get_orig_source_inst() const final {
+      // We can't get the origin source address from the message
+      // since (In Crimson) the connection is maintained
+      // outside of the Message.
+      return entity_inst_t(get_source(), conn->get_peer_addr());
+    }
+    entity_name_t get_source() const final {
+      return pimpl->get_source();
+    }
+    uint64_t get_features() const final {
+      return pimpl->get_features();
+    }
+    snapid_t get_snapid() const final {
+      return pimpl->get_snapid();
+    }
+  };
+
   // because OpsExecuter is pretty heavy-weight object we want to ensure
   // it's not copied nor even moved by accident. Performance is the sole
   // reason for prohibiting that.
@@ -62,34 +160,117 @@ public:
   using osd_op_errorator = crimson::compound_errorator_t<
     call_errorator,
     read_errorator,
+    write_ertr,
     get_attr_errorator,
     watch_errorator,
     PGBackend::stat_errorator>;
+  using osd_op_ierrorator =
+    ::crimson::interruptible::interruptible_errorator<
+      IOInterruptCondition, osd_op_errorator>;
 
+  object_stat_sum_t delta_stats;
+
+  size_t get_bytes_written() {
+    return txn.get_num_bytes();
+  }
 private:
-  // an operation can be divided into two stages: main and effect-exposing
-  // one. The former is performed immediately on call to `do_osd_op()` while
-  // the later on `submit_changes()` – after successfully processing main
-  // stages of all involved operations. When any stage fails, none of all
-  // scheduled effect-exposing stages will be executed.
-  // when operation requires this division, some variant of `with_effect()`
-  // should be used.
+  // with_effect can be used to schedule operations to be performed
+  // at commit time.  effects will be discarded if the operation does
+  // not commit.
   struct effect_t {
-    virtual osd_op_errorator::future<> execute() = 0;
+    // an effect can affect PG, i.e. create a watch timeout
+    virtual seastar::future<> execute(Ref<PG> pg) = 0;
     virtual ~effect_t() = default;
   };
 
+  Ref<PG> pg; // for the sake of object class
   ObjectContextRef obc;
-  const OpInfo* op_info;
-  PG& pg;
-  PGBackend& backend;
-  Ref<MOSDOp> msg;
-  bool user_modify = false;
+  const OpInfo& op_info;
+  using abstracted_msg_t =
+    ceph::static_ptr<ExecutableMessage,
+                     sizeof(ExecutableMessagePimpl<void>)>;
+  abstracted_msg_t msg;
+  crimson::net::ConnectionXcoreRef conn;
+  std::optional<osd_op_params_t> osd_op_params;
   ceph::os::Transaction txn;
 
   size_t num_read = 0;    ///< count read ops
   size_t num_write = 0;   ///< count update ops
 
+  SnapContext snapc; // writer snap context
+  struct CloningContext {
+    /// id of new clone, populated in prepare_cloning_ctx
+    hobject_t coid;
+    /// new snapset, populated in prepare_cloning_ctx
+    SnapSet new_snapset;
+    /// populated in complete_cloning_ctx
+    ObjectContextRef clone_obc;
+  };
+  std::unique_ptr<CloningContext> cloning_ctx;
+
+  /**
+   * prepare_cloning_ctx
+   *
+   * If snapc contains a snap which occurred logically after the last write
+   * seen by this object (see OpsExecuter::should_clone()), we first need
+   * make a clone of the object at its current state.  prepare_cloning_ctx
+   * primes txn with that clone operation and populates cloning_ctx with
+   * an obc for the clone and a new snapset reflecting the clone.
+   *
+   * complete_cloning_ctx later uses the information from cloning_ctx to
+   * generate a log entry and object_info versions for the clone.
+   *
+   * Note that this strategy differs from classic, which instead performs this
+   * work at the end and reorders the transaction.  See
+   * PrimaryLogPG::make_writeable
+   *
+   * @param snapc [in] snapc for this operation (from the client if from the
+   *                   client, from the pool otherwise)
+   * @param initial_obs [in] objectstate for the object at operation start
+   * @param initial_snapset [in] snapset for the object at operation start
+   * @param backend [in,out] interface for generating mutations
+   * @param txn [out] transaction for the operation
+   */
+  void prepare_cloning_ctx(
+    const SnapContext& snapc,
+    const ObjectState& initial_obs,
+    const SnapSet& initial_snapset,
+    PGBackend& backend,
+    ceph::os::Transaction& txn);
+
+  /// complete clone, populate clone_obc, return log entry
+  pg_log_entry_t complete_cloning_ctx();
+
+  /**
+   * should_clone
+   *
+   * Predicate returning whether a user write with snap context snapc
+   * contains a snap which occurred prior to the most recent write
+   * on the object reflected in initial_obc.
+   *
+   * @param initial_obc [in] obc for object to be mutated
+   * @param snapc [in] snapc for this operation (from the client if from the
+   *                   client, from the pool otherwise)
+   */
+  static bool should_clone(
+    const ObjectContext& initial_obc,
+    const SnapContext& snapc) {
+    // clone?
+    return initial_obc.obs.exists                       // both nominally and...
+      && !initial_obc.obs.oi.is_whiteout()              // ... logically exists
+      && snapc.snaps.size()                             // there are snaps
+      && snapc.snaps[0] > initial_obc.ssc->snapset.seq; // existing obj is old
+  }
+
+  /**
+  * update_clone_overlap
+  *
+  * We need to update the most recent snapshot and the overlapping
+  * part of the head object for each write operation.
+  */
+  void update_clone_overlap();
+
+private:
   // this gizmo could be wrapped in std::optional for the sake of lazy
   // initialization. we don't need it for ops that doesn't have effect
   // TODO: verify the init overhead of chunked_fifo
@@ -101,43 +282,52 @@ private:
     MainFunc&& main_func,
     EffectFunc&& effect_func);
 
-  call_errorator::future<> do_op_call(class OSDOp& osd_op);
-  watch_errorator::future<> do_op_watch(
-    class OSDOp& osd_op,
-    class ObjectState& os,
+  call_ierrorator::future<> do_op_call(OSDOp& osd_op);
+  watch_ierrorator::future<> do_op_watch(
+    OSDOp& osd_op,
+    ObjectState& os,
     ceph::os::Transaction& txn);
-  watch_errorator::future<> do_op_watch_subop_watch(
-    class OSDOp& osd_op,
-    class ObjectState& os,
+  watch_ierrorator::future<> do_op_watch_subop_watch(
+    OSDOp& osd_op,
+    ObjectState& os,
     ceph::os::Transaction& txn);
-  watch_errorator::future<> do_op_watch_subop_reconnect(
-    class OSDOp& osd_op,
-    class ObjectState& os,
+  watch_ierrorator::future<> do_op_watch_subop_reconnect(
+    OSDOp& osd_op,
+    ObjectState& os,
     ceph::os::Transaction& txn);
-  watch_errorator::future<> do_op_watch_subop_unwatch(
-    class OSDOp& osd_op,
-    class ObjectState& os,
+  watch_ierrorator::future<> do_op_watch_subop_unwatch(
+    OSDOp& osd_op,
+    ObjectState& os,
     ceph::os::Transaction& txn);
-  watch_errorator::future<> do_op_watch_subop_ping(
-    class OSDOp& osd_op,
-    class ObjectState& os,
+  watch_ierrorator::future<> do_op_watch_subop_ping(
+    OSDOp& osd_op,
+    ObjectState& os,
     ceph::os::Transaction& txn);
-  watch_errorator::future<> do_op_notify(
-    class OSDOp& osd_op,
-    const class ObjectState& os);
-  watch_errorator::future<> do_op_notify_ack(
-    class OSDOp& osd_op,
-    const class ObjectState& os);
+  watch_ierrorator::future<> do_op_list_watchers(
+    OSDOp& osd_op,
+    const ObjectState& os);
+  watch_ierrorator::future<> do_op_notify(
+    OSDOp& osd_op,
+    const ObjectState& os);
+  watch_ierrorator::future<> do_op_notify_ack(
+    OSDOp& osd_op,
+    const ObjectState& os);
+  call_errorator::future<> do_assert_ver(
+    OSDOp& osd_op,
+    const ObjectState& os);
 
-  hobject_t &get_target() const {
-    return obc->obs.oi.soid;
-  }
+  using list_snaps_ertr = read_errorator::extend<
+    crimson::ct_error::invarg>;
+  using list_snaps_iertr = ::crimson::interruptible::interruptible_errorator<
+    ::crimson::osd::IOInterruptCondition,
+    list_snaps_ertr>;
+  list_snaps_iertr::future<> do_list_snaps(
+    OSDOp& osd_op,
+    const ObjectState& os,
+    const SnapSet& ss);
 
   template <class Func>
-  auto do_const_op(Func&& f) {
-    // TODO: pass backend as read-only
-    return std::forward<Func>(f)(backend, std::as_const(obc->obs));
-  }
+  auto do_const_op(Func&& f);
 
   template <class Func>
   auto do_read_op(Func&& f) {
@@ -147,44 +337,124 @@ private:
   }
 
   template <class Func>
-  auto do_write_op(Func&& f, bool um) {
-    ++num_write;
-    user_modify = um;
-    return std::forward<Func>(f)(backend, obc->obs, txn);
+  auto do_snapset_op(Func&& f) {
+    ++num_read;
+    return std::invoke(
+      std::forward<Func>(f),
+      std::as_const(obc->obs),
+      std::as_const(obc->ssc->snapset));
   }
 
-  // PG operations are being provided with pg instead of os.
+  enum class modified_by {
+    user,
+    sys,
+  };
+
   template <class Func>
-  auto do_pg_op(Func&& f) {
-    return std::forward<Func>(f)(std::as_const(pg),
-                                 std::as_const(msg->get_hobj().nspace));
-  }
+  auto do_write_op(Func&& f, modified_by m = modified_by::user);
 
   decltype(auto) dont_do_legacy_op() {
     return crimson::ct_error::operation_not_supported::make();
   }
 
+  interruptible_errorated_future<osd_op_errorator>
+  do_execute_op(OSDOp& osd_op);
+
+  OpsExecuter(Ref<PG> pg,
+              ObjectContextRef obc,
+              const OpInfo& op_info,
+              abstracted_msg_t&& msg,
+              crimson::net::ConnectionXcoreRef conn,
+              const SnapContext& snapc);
+
 public:
-  OpsExecuter(ObjectContextRef obc, const OpInfo* op_info, PG& pg, Ref<MOSDOp> msg)
-    : obc(std::move(obc)),
-      op_info(op_info),
-      pg(pg),
-      backend(pg.get_backend()),
-      msg(std::move(msg)) {
+  template <class MsgT>
+  OpsExecuter(Ref<PG> pg,
+              ObjectContextRef obc,
+              const OpInfo& op_info,
+              const MsgT& msg,
+              crimson::net::ConnectionXcoreRef conn,
+              const SnapContext& snapc)
+    : OpsExecuter(
+        std::move(pg),
+        std::move(obc),
+        op_info,
+        abstracted_msg_t{
+          std::in_place_type_t<ExecutableMessagePimpl<MsgT>>{},
+          &msg,
+          conn},
+        conn,
+        snapc) {
   }
-  OpsExecuter(PG& pg, Ref<MOSDOp> msg)
-    : OpsExecuter{ObjectContextRef(), nullptr, pg, std::move(msg)}
-  {}
 
-  osd_op_errorator::future<> execute_osd_op(class OSDOp& osd_op);
-  seastar::future<> execute_pg_op(class OSDOp& osd_op);
+  ~OpsExecuter();
 
-  template <typename Func>
-  osd_op_errorator::future<> submit_changes(Func&& f) &&;
+  template <class Func>
+  struct RollbackHelper;
+
+  template <class Func>
+  RollbackHelper<Func> create_rollbacker(Func&& func);
+
+  interruptible_errorated_future<osd_op_errorator>
+  execute_op(OSDOp& osd_op);
+
+  using rep_op_fut_tuple =
+    std::tuple<interruptible_future<>, interruptible_future<>>;
+  using rep_op_fut_t =
+    interruptible_future<rep_op_fut_tuple>;
+  rep_op_fut_t flush_changes_and_submit(
+    const std::vector<OSDOp>& ops,
+    SnapMapper& snap_mapper,
+    OSDriver& osdriver);
+  pg_log_entry_t prepare_head_update(
+    const std::vector<OSDOp>& ops,
+    ceph::os::Transaction &txn);
+
+  void check_init_op_params(OpsExecuter::modified_by m) {
+    if (!osd_op_params) {
+      osd_op_params.emplace();
+      osd_op_params->req_id = msg->get_reqid();
+      osd_op_params->mtime = msg->get_mtime();
+      osd_op_params->user_modify = (m == modified_by::user);
+    }
+  }
+
+  ObjectContextRef get_obc() const {
+    return obc;
+  }
+
+  const object_info_t &get_object_info() const {
+    return obc->obs.oi;
+  }
+  const hobject_t &get_target() const {
+    return get_object_info().soid;
+  }
 
   const auto& get_message() const {
     return *msg;
   }
+
+  size_t get_processed_rw_ops_num() const {
+    return num_read + num_write;
+  }
+
+  uint32_t get_pool_stripe_width() const;
+
+  bool has_seen_write() const {
+    return num_write > 0;
+  }
+
+  object_stat_sum_t& get_stats(){
+    return delta_stats;
+  }
+
+  version_t get_last_user_version() const;
+
+  ObjectContextRef prepare_clone(
+    const hobject_t& coid,
+    const ObjectState& initial_obs);
+
+  void apply_stats();
 };
 
 template <class Context, class MainFunc, class EffectFunc>
@@ -196,9 +466,9 @@ auto OpsExecuter::with_effect_on_obc(
   using context_t = std::decay_t<Context>;
   // the language offers implicit conversion to pointer-to-function for
   // lambda only when it's closureless. We enforce this restriction due
-  // the fact that `submit_changes()` std::moves many executer's parts.
+  // the fact that `flush_changes()` std::moves many executer's parts.
   using allowed_effect_func_t =
-    seastar::future<> (*)(context_t&&, ObjectContextRef);
+    seastar::future<> (*)(context_t&&, ObjectContextRef, Ref<PG>);
   static_assert(std::is_convertible_v<EffectFunc, allowed_effect_func_t>,
                 "with_effect function is not allowed to capture");
   struct task_t final : effect_t {
@@ -211,8 +481,10 @@ auto OpsExecuter::with_effect_on_obc(
          effect_func(std::move(effect_func)),
          obc(std::move(obc)) {
     }
-    osd_op_errorator::future<> execute() final {
-      return std::move(effect_func)(std::move(ctx), std::move(obc));
+    seastar::future<> execute(Ref<PG> pg) final {
+      return std::move(effect_func)(std::move(ctx),
+                                    std::move(obc),
+                                    std::move(pg));
     }
   };
   auto task =
@@ -222,28 +494,64 @@ auto OpsExecuter::with_effect_on_obc(
   return std::forward<MainFunc>(main_func)(ctx_ref);
 }
 
-template <typename Func>
-OpsExecuter::osd_op_errorator::future<> OpsExecuter::submit_changes(Func&& f) && {
-  assert(obc);
-  osd_op_params_t osd_op_params(std::move(msg));
-  eversion_t at_version = pg.next_version();
+template <class Func>
+struct OpsExecuter::RollbackHelper {
+  void rollback_obc_if_modified();
+  OpsExecuter *ox;
+  Func func;
+};
 
-  osd_op_params.at_version = at_version;
-  osd_op_params.pg_trim_to = pg.get_pg_trim_to();
-  osd_op_params.min_last_complete_ondisk = pg.get_min_last_complete_ondisk();
-  osd_op_params.last_complete = pg.get_info().last_complete;
-  if (user_modify)
-    osd_op_params.user_at_version = at_version.version;
-
-  if (__builtin_expect(op_effects.empty(), true)) {
-    return std::forward<Func>(f)(std::move(txn), std::move(obc), std::move(osd_op_params));
-  }
-  return std::forward<Func>(f)(std::move(txn), std::move(obc), std::move(osd_op_params)).safe_then([this] {
-    // let's do the cleaning of `op_effects` in destructor
-    return crimson::do_for_each(op_effects, [] (auto& op_effect) {
-      return op_effect->execute();
-    });
-  });
+template <class Func>
+inline OpsExecuter::RollbackHelper<Func>
+OpsExecuter::create_rollbacker(Func&& func) {
+  return {this, std::forward<Func>(func)};
 }
+
+template <class Func>
+void OpsExecuter::RollbackHelper<Func>::rollback_obc_if_modified()
+{
+  // Oops, an operation had failed. do_osd_ops() altogether with
+  // OpsExecuter already dropped the ObjectStore::Transaction if
+  // there was any. However, this is not enough to completely
+  // rollback as we gave OpsExecuter the very single copy of `obc`
+  // we maintain and we did it for both reading and writing.
+  // Now all modifications must be reverted.
+  //
+  // The conditional's purpose is to efficiently handle hot errors
+  // which may appear as a result of e.g. CEPH_OSD_OP_CMPXATTR or
+  // CEPH_OSD_OP_OMAP_CMP. These are read-like ops and clients
+  // typically append them before any write. If OpsExecuter hasn't
+  // seen any modifying operation, `obc` is supposed to be kept
+  // unchanged.
+  assert(ox);
+  const auto need_rollback = ox->has_seen_write();
+  crimson::get_logger(ceph_subsys_osd).debug(
+    "{}: object {} got error, need_rollback={}",
+    __func__,
+    ox->obc->get_oid(),
+    need_rollback);
+  if (need_rollback) {
+    func(ox->obc);
+  }
+}
+
+// PgOpsExecuter -- a class for executing ops targeting a certain PG.
+class PgOpsExecuter {
+  template <typename T = void>
+  using interruptible_future =
+    ::crimson::interruptible::interruptible_future<
+      IOInterruptCondition, T>;
+
+public:
+  PgOpsExecuter(const PG& pg, const MOSDOp& msg)
+    : pg(pg), nspace(msg.get_hobj().nspace) {
+  }
+
+  interruptible_future<> execute_op(OSDOp& osd_op);
+
+private:
+  const PG& pg;
+  const std::string& nspace;
+};
 
 } // namespace crimson::osd

@@ -2,18 +2,18 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { ReactiveFormsModule, Validators } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { NgBootstrapFormValidationModule } from 'ng-bootstrap-form-validation';
-import { BsModalRef, ModalModule } from 'ngx-bootstrap/modal';
-
-import {
-  configureTestBed,
-  FixtureHelper,
-  FormHelper,
-  i18nProviders
-} from '../../../../testing/unit-test-helper';
-import { CdValidators } from '../../forms/cd-validators';
-import { SharedModule } from '../../shared.module';
+import { CdValidators } from '~/app/shared/forms/cd-validators';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed, FixtureHelper, FormHelper } from '~/testing/unit-test-helper';
 import { FormModalComponent } from './form-modal.component';
+import {
+  CheckboxModule,
+  ComboBoxModule,
+  InputModule,
+  ModalModule,
+  NumberModule,
+  SelectModule
+} from 'carbon-components-angular';
 
 describe('InputModalComponent', () => {
   let component: FormModalComponent;
@@ -53,13 +53,16 @@ describe('InputModalComponent', () => {
 
   configureTestBed({
     imports: [
-      ModalModule.forRoot(),
-      NgBootstrapFormValidationModule.forRoot(),
       RouterTestingModule,
       ReactiveFormsModule,
-      SharedModule
-    ],
-    providers: [i18nProviders, BsModalRef]
+      SharedModule,
+      InputModule,
+      CheckboxModule,
+      SelectModule,
+      ComboBoxModule,
+      NumberModule,
+      ModalModule
+    ]
   });
 
   beforeEach(() => {
@@ -76,11 +79,11 @@ describe('InputModalComponent', () => {
   });
 
   it('has the defined title', () => {
-    fh.expectTextToBe('.modal-title', 'Some title');
+    fh.expectTextToBe('.cds--modal-header__heading', 'Some title');
   });
 
   it('has the defined description', () => {
-    fh.expectTextToBe('.modal-body > p', 'Some description');
+    fh.expectTextToBe('[id=description]', 'Some description');
   });
 
   it('should display both inputs', () => {
@@ -89,7 +92,7 @@ describe('InputModalComponent', () => {
   });
 
   it('has one defined label field', () => {
-    fh.expectTextToBe('.cd-col-form-label', 'Optional');
+    fh.expectTextToBe('cds-number .cds--label', 'Optional');
   });
 
   it('has a predefined values for requiredField', () => {
@@ -111,7 +114,7 @@ describe('InputModalComponent', () => {
 
   it('tests required field message', () => {
     formHelper.setValue('requiredField', '', true);
-    fh.expectTextToBe('.cd-requiredField-form-group .invalid-feedback', 'This field is required.');
+    fh.expectTextToBe('.cds--form-requirement', 'This field is required.');
   });
 
   it('tests custom validator on number field', () => {
@@ -121,28 +124,19 @@ describe('InputModalComponent', () => {
 
   it('tests custom validator error message', () => {
     formHelper.setValue('optionalField', -1, true);
-    fh.expectTextToBe(
-      '.cd-optionalField-form-group .invalid-feedback',
-      'Value has to be above zero!'
-    );
+    fh.expectTextToBe('.cds--form-requirement', 'Value has to be above zero!');
   });
 
   it('tests default error message', () => {
     formHelper.setValue('optionalField', 11, true);
-    fh.expectTextToBe('.cd-optionalField-form-group .invalid-feedback', 'An error occurred.');
+    fh.expectTextToBe('.cds--form-requirement', 'An error occurred.');
   });
 
   it('tests binary error messages', () => {
     formHelper.setValue('dimlessBinary', '4 K', true);
-    fh.expectTextToBe(
-      '.cd-dimlessBinary-form-group .invalid-feedback',
-      'Size has to be at most 3 KiB or less'
-    );
+    fh.expectTextToBe('.cds--form-requirement', 'Size has to be at most 3 KiB or less');
     formHelper.setValue('dimlessBinary', '0.5 K', true);
-    fh.expectTextToBe(
-      '.cd-dimlessBinary-form-group .invalid-feedback',
-      'Size has to be at least 1 KiB or more'
-    );
+    fh.expectTextToBe('.cds--form-requirement', 'Size has to be at least 1 KiB or more');
   });
 
   it('shows result of dimlessBinary pipe', () => {

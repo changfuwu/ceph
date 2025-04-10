@@ -88,7 +88,7 @@ static void print_rule_name(ostream& out, int t, CrushWrapper &crush)
 static void print_fixedpoint(ostream& out, int i)
 {
   char s[20];
-  snprintf(s, sizeof(s), "%.3f", (float)i / (float)0x10000);
+  snprintf(s, sizeof(s), "%.5f", (float)i / (float)0x10000);
   out << s;
 }
 
@@ -321,6 +321,13 @@ int CrushCompiler::decompile(ostream &out)
   if (crush.get_allowed_bucket_algs() != CRUSH_LEGACY_ALLOWED_BUCKET_ALGS)
     out << "tunable allowed_bucket_algs " << crush.get_allowed_bucket_algs()
 	<< "\n";
+  if (crush.has_nondefault_tunables_msr()) {
+    out << "tunable msr_descents " << crush.get_msr_descents()
+	<< "\n";
+    out << "tunable msr_collision_tries "
+	<< crush.get_msr_collision_tries()
+	<< "\n";
+  }
 
   out << "\n# devices\n";
   for (int i=0; i<crush.get_max_devices(); i++) {
@@ -361,23 +368,23 @@ int CrushCompiler::decompile(ostream &out)
       print_rule_name(out, i, crush);
     out << " {\n";
     out << "\tid " << i << "\n";
-    if (i != crush.get_rule_mask_ruleset(i)) {
-      out << "\t# WARNING: ruleset " << crush.get_rule_mask_ruleset(i) << " != id " << i << "; this will not recompile to the same map\n";
-    }
 
-    switch (crush.get_rule_mask_type(i)) {
-    case CEPH_PG_TYPE_REPLICATED:
+    switch (crush.get_rule_type(i)) {
+    case CRUSH_RULE_TYPE_REPLICATED:
       out << "\ttype replicated\n";
       break;
-    case CEPH_PG_TYPE_ERASURE:
+    case CRUSH_RULE_TYPE_ERASURE:
       out << "\ttype erasure\n";
       break;
+    case CRUSH_RULE_TYPE_MSR_FIRSTN:
+      out << "\ttype msr_firstn\n";
+      break;
+    case CRUSH_RULE_TYPE_MSR_INDEP:
+      out << "\ttype msr_indep\n";
+      break;
     default:
-      out << "\ttype " << crush.get_rule_mask_type(i) << "\n";
+      out << "\ttype " << crush.get_rule_type(i) << "\n";
     }
-
-    out << "\tmin_size " << crush.get_rule_mask_min_size(i) << "\n";
-    out << "\tmax_size " << crush.get_rule_mask_max_size(i) << "\n";
 
     for (int j=0; j<crush.get_rule_len(i); j++) {
       switch (crush.get_rule_op(i, j)) {
@@ -428,6 +435,15 @@ int CrushCompiler::decompile(ostream &out)
 	out << "\tstep set_chooseleaf_stable " << crush.get_rule_arg1(i, j)
 	    << "\n";
 	break;
+      case CRUSH_RULE_SET_MSR_DESCENTS:
+	out << "\tstep set_msr_descents " << crush.get_rule_arg1(i, j)
+	    << "\n";
+	break;
+      case CRUSH_RULE_SET_MSR_COLLISION_TRIES:
+	out << "\tstep set_msr_collision_tries "
+	    << crush.get_rule_arg1(i, j)
+	    << "\n";
+	break;
       case CRUSH_RULE_CHOOSE_FIRSTN:
 	out << "\tstep choose firstn "
 	    << crush.get_rule_arg1(i, j) 
@@ -452,6 +468,13 @@ int CrushCompiler::decompile(ostream &out)
       case CRUSH_RULE_CHOOSELEAF_INDEP:
 	out << "\tstep chooseleaf indep "
 	    << crush.get_rule_arg1(i, j) 
+	    << " type ";
+	print_type_name(out, crush.get_rule_arg2(i, j), crush);
+	out << "\n";
+	break;
+      case CRUSH_RULE_CHOOSE_MSR:
+	out << "\tstep choosemsr "
+	    << crush.get_rule_arg1(i, j)
 	    << " type ";
 	print_type_name(out, crush.get_rule_arg2(i, j), crush);
 	out << "\n";
@@ -538,6 +561,10 @@ int CrushCompiler::parse_tunable(iter_t const& i)
     crush.set_straw_calc_version(val);
   else if (name == "allowed_bucket_algs")
     crush.set_allowed_bucket_algs(val);
+  else if (name == "msr_descents")
+    crush.set_msr_descents(val);
+  else if (name == "msr_collision_tries")
+    crush.set_msr_collision_tries(val);
   else {
     err << "tunable " << name << " not recognized" << std::endl;
     return -1;
@@ -787,23 +814,39 @@ int CrushCompiler::parse_rule(iter_t const& i)
   string tname = string_node(i->children[start+2]);
   int type;
   if (tname == "replicated")
-    type = CEPH_PG_TYPE_REPLICATED;
+    type = CRUSH_RULE_TYPE_REPLICATED;
   else if (tname == "erasure")
-    type = CEPH_PG_TYPE_ERASURE;
+    type = CRUSH_RULE_TYPE_ERASURE;
+  else if (tname == "msr_firstn")
+    type = CRUSH_RULE_TYPE_MSR_FIRSTN;
+  else if (tname == "msr_indep")
+    type = CRUSH_RULE_TYPE_MSR_INDEP;
   else 
     ceph_abort();
 
-  int minsize = int_node(i->children[start+4]);
-  int maxsize = int_node(i->children[start+6]);
-  
-  int steps = i->children.size() - start - 8;
-  //err << "num steps " << steps << std::endl;
+  // ignore min_size+max_size and find first step
+  int step_start = 0;
+  int steps = 0;
+  for (unsigned p = start + 3; p < i->children.size()-1; ++p) {
+    string tag = string_node(i->children[p]);
+    if (tag == "min_size" || tag == "max_size") {
+      std::cerr << "WARNING: " << tag << " is no longer supported, ignoring" << std::endl;
+      ++p;
+      continue;
+    }
+    // has to be a step--grammer doesn't recognized anything else
+    assert(i->children[p].value.id().to_long() == crush_grammar::_step);
+    step_start = p;
+    steps = i->children.size() - p - 1;
+    break;
+  }
+  //err << "num steps " << steps << " start " << step_start << std::endl;
 
   if (crush.rule_exists(ruleno)) {
     err << "rule " << ruleno << " already exists" << std::endl;
     return -1;
   }
-  int r = crush.add_rule(ruleno, steps, type, minsize, maxsize);
+  int r = crush.add_rule(ruleno, steps, type);
   if (r != ruleno) {
     err << "unable to add rule id " << ruleno << " for rule '" << rname
 	<< "'" << std::endl;
@@ -815,7 +858,7 @@ int CrushCompiler::parse_rule(iter_t const& i)
   }
 
   int step = 0;
-  for (iter_t p = i->children.begin() + start + 7; step < steps; p++) {
+  for (iter_t p = i->children.begin() + step_start; step < steps; p++) {
     iter_t s = p->children.begin() + 1;
     int stepid = s->value.id().to_long();
     switch (stepid) {
@@ -899,6 +942,18 @@ int CrushCompiler::parse_rule(iter_t const& i)
 	crush.set_rule_step_set_chooseleaf_stable(ruleno, step++, val);
       }
       break;
+    case crush_grammar::_step_set_msr_descents:
+      {
+	int val = int_node(s->children[1]);
+	crush.set_rule_step_set_msr_descents(ruleno, step++, val);
+      }
+      break;
+    case crush_grammar::_step_set_msr_collision_tries:
+      {
+	int val = int_node(s->children[1]);
+	crush.set_rule_step_set_msr_collision_tries(ruleno, step++, val);
+      }
+      break;
 
     case crush_grammar::_step_choose:
     case crush_grammar::_step_chooseleaf:
@@ -923,6 +978,17 @@ int CrushCompiler::parse_rule(iter_t const& i)
 	    crush.set_rule_step_choose_leaf_indep(ruleno, step++, int_node(s->children[2]), type_id[type]);
 	  else ceph_abort();
 	} else ceph_abort();
+      }
+      break;
+
+    case crush_grammar::_step_choose_msr:
+      {
+	string type = string_node(s->children[3]);
+	if (!type_id.count(type)) {
+	  err << "in rule '" << rname << "' type '" << type << "' not defined" << std::endl;
+	  return -1;
+	}
+	crush.set_rule_step_choose_msr(ruleno, step++, int_node(s->children[1]), type_id[type]);
       }
       break;
 

@@ -20,7 +20,7 @@
 #include "msg/Message.h"
 #include "MCommand.h"
 
-class MCommandReply : public Message {
+class MCommandReply final : public Message {
 public:
   errorcode32_t r;
   std::string rs;
@@ -31,11 +31,14 @@ public:
     : Message{MSG_COMMAND_REPLY}, r(_r) {
     header.tid = m->get_tid();
   }
+  // MDS now uses host errors, as defined in errno.cc, for current platform.
+  // errorcode32_t is converting, internally, the error code from host to ceph, when encoding, and vice versa,
+  // when decoding, resulting having LINUX codes on the wire, and HOST code on the receiver.
   MCommandReply(int _r, std::string_view s)
     : Message{MSG_COMMAND_REPLY},
       r(_r), rs(s) { }
 private:
-  ~MCommandReply() override {}
+  ~MCommandReply() final {}
 
 public:
   std::string_view get_type_name() const override { return "command_reply"; }

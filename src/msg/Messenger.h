@@ -18,7 +18,8 @@
 #define CEPH_MESSENGER_H
 
 #include <map>
-#include <deque>
+#include <optional>
+#include <vector>
 
 #include <errno.h>
 #include <sstream>
@@ -27,6 +28,7 @@
 #include "Message.h"
 #include "Dispatcher.h"
 #include "Policy.h"
+#include "common/Formatter.h"
 #include "common/Throttle.h"
 #include "include/Context.h"
 #include "include/types.h"
@@ -34,6 +36,7 @@
 #include "auth/Crypto.h"
 #include "common/item_history.h"
 #include "auth/AuthRegistry.h"
+#include "compressor_registry.h"
 #include "include/ceph_assert.h"
 
 #include <errno.h>
@@ -59,6 +62,29 @@ struct Interceptor {
     STOP
   };
 
+  enum STEP {
+    START_CLIENT_BANNER_EXCHANGE = 1,
+    START_SERVER_BANNER_EXCHANGE,
+    BANNER_EXCHANGE_BANNER_CONNECTING,
+    BANNER_EXCHANGE,
+    HANDLE_PEER_BANNER_BANNER_CONNECTING,
+    HANDLE_PEER_BANNER,
+    HANDLE_PEER_BANNER_PAYLOAD_HELLO_CONNECTING,
+    HANDLE_PEER_BANNER_PAYLOAD,
+    SEND_AUTH_REQUEST,
+    HANDLE_AUTH_REQUEST_ACCEPTING_SIGN,
+    SEND_CLIENT_IDENTITY,
+    SEND_SERVER_IDENTITY,
+    SEND_RECONNECT,
+    SEND_RECONNECT_OK,
+    READY,
+    HANDLE_MESSAGE,
+    READ_MESSAGE_COMPLETE,
+    SESSION_RETRY,
+    SEND_COMPRESSION_REQUEST,
+    HANDLE_COMPRESSION_REQUEST
+  };
+
   virtual ~Interceptor() {}
   virtual ACTION intercept(Connection *conn, uint32_t step) = 0;
 };
@@ -67,9 +93,30 @@ struct Interceptor {
 
 class Messenger {
 private:
-  std::deque<Dispatcher*> dispatchers;
-  std::deque<Dispatcher*> fast_dispatchers;
+  struct PriorityDispatcher {
+    using priority_t = Dispatcher::priority_t;
+    priority_t priority;
+    Dispatcher* dispatcher;
+
+    bool operator<(const PriorityDispatcher& other) const {
+      return priority < other.priority;
+    }
+  };
+  std::vector<PriorityDispatcher> dispatchers;
+  std::vector<PriorityDispatcher> fast_dispatchers;
+
   ZTracer::Endpoint trace_endpoint;
+
+  static void insert_head(std::vector<PriorityDispatcher>& v,
+                          PriorityDispatcher d)
+  {
+    v.insert(std::lower_bound(v.begin(), v.end(), d), d);
+  }
+  static void insert_tail(std::vector<PriorityDispatcher>& v,
+                          PriorityDispatcher d)
+  {
+    v.insert(std::upper_bound(v.begin(), v.end(), d), d);
+  }
 
 protected:
   void set_endpoint_addr(const entity_addr_t& a,
@@ -95,14 +142,6 @@ public:
 #ifdef UNIT_TESTS_BUILT
   Interceptor *interceptor = nullptr;
 #endif
-
-  /**
-   * Various Messenger conditional config/type flags to allow
-   * different "transport" Messengers to tune themselves
-   */
-  static const int HAS_HEAVY_TRAFFIC    = 0x0001;
-  static const int HAS_MANY_CONNECTIONS = 0x0002;
-  static const int HEARTBEAT            = 0x0004;
 
   /**
    *  The CephContext this Messenger uses. Many other components initialize themselves
@@ -143,18 +182,14 @@ public:
    * @param name entity name to register
    * @param lname logical name of the messenger in this process (e.g., "client")
    * @param nonce nonce value to uniquely identify this instance on the current host
-   * @param features bits for the local connection
-   * @param cflags general std::set of flags to configure transport resources
    */
   static Messenger *create(CephContext *cct,
                            const std::string &type,
                            entity_name_t name,
 			   std::string lname,
-                           uint64_t nonce,
-			   uint64_t cflags);
+                           uint64_t nonce);
 
   static uint64_t get_random_nonce();
-  static uint64_t get_pid_nonce();
 
   /**
    * create a new messenger
@@ -162,7 +197,6 @@ public:
    * Create a new messenger instance.
    * Same as the above, but a slightly simpler interface for clients:
    * - Generate a random nonce
-   * - use the default feature bits
    * - get the messenger type from cct
    * - use the client entity_type
    *
@@ -219,6 +253,9 @@ public:
     auth_server = as;
   }
 
+  // for compression
+  CompressorRegistry comp_registry;
+
 protected:
   /**
    * std::set messenger's address
@@ -254,27 +291,20 @@ public:
    * @param addr The address to use as a template.
    */
   virtual bool set_addr_unknowns(const entity_addrvec_t &addrs) = 0;
-  /**
-   * set the address for this Messenger. This is useful if the Messenger
-   * binds to a specific address but advertises a different address on the
-   * the network.
-   *
-   * @param addr The address to use.
-   */
-  virtual void set_addrs(const entity_addrvec_t &addr) = 0;
+
   /// Get the default send priority.
   int get_default_send_priority() { return default_send_priority; }
   /**
    * Get the number of Messages which the Messenger has received
    * but not yet dispatched.
    */
-  virtual int get_dispatch_queue_len() = 0;
+  virtual int get_dispatch_queue_len() const = 0;
 
   /**
    * Get age of oldest undelivered message
    * (0 if the queue is empty)
    */
-  virtual double get_dispatch_queue_max_age(utime_t now) = 0;
+  virtual double get_dispatch_queue_max_age(utime_t now) const = 0;
 
   /**
    * @} // Accessors
@@ -381,11 +411,13 @@ public:
    *
    * @param d The Dispatcher to insert into the list.
    */
-  void add_dispatcher_head(Dispatcher *d) {
+  void add_dispatcher_head(Dispatcher *d, PriorityDispatcher::priority_t priority=Dispatcher::PRIORITY_DEFAULT) {
     bool first = dispatchers.empty();
-    dispatchers.push_front(d);
-    if (d->ms_can_fast_dispatch_any())
-      fast_dispatchers.push_front(d);
+    const PriorityDispatcher entry{priority, d};
+    insert_head(dispatchers, entry);
+    if (d->ms_can_fast_dispatch_any()) {
+      insert_head(fast_dispatchers, entry);
+    }
     if (first)
       ready();
   }
@@ -396,11 +428,13 @@ public:
    *
    * @param d The Dispatcher to insert into the list.
    */
-  void add_dispatcher_tail(Dispatcher *d) {
+  void add_dispatcher_tail(Dispatcher *d, PriorityDispatcher::priority_t priority=Dispatcher::PRIORITY_DEFAULT) {
     bool first = dispatchers.empty();
-    dispatchers.push_back(d);
-    if (d->ms_can_fast_dispatch_any())
-      fast_dispatchers.push_back(d);
+    const PriorityDispatcher entry{priority, d};
+    insert_tail(dispatchers, entry);
+    if (d->ms_can_fast_dispatch_any()) {
+      insert_tail(fast_dispatchers, entry);
+    }
     if (first)
       ready();
   }
@@ -411,12 +445,15 @@ public:
    * in an unspecified order.
    *
    * @param bind_addr The address to bind to.
+   * @patam public_addrs The addresses to announce over the network
    * @return 0 on success, or -1 on error, or -errno if
    * we can be more specific about the failure.
    */
-  virtual int bind(const entity_addr_t& bind_addr) = 0;
+  virtual int bind(const entity_addr_t& bind_addr,
+		   std::optional<entity_addrvec_t> public_addrs=std::nullopt) = 0;
 
-  virtual int bindv(const entity_addrvec_t& addrs);
+  virtual int bindv(const entity_addrvec_t& bind_addrs,
+                    std::optional<entity_addrvec_t> public_addrs=std::nullopt);
 
   /**
    * This function performs a full restart of the Messenger component,
@@ -484,6 +521,10 @@ public:
   /**
    * @} // Startup/Shutdown
    */
+
+  virtual void dump(
+      Formatter* f, std::function<bool(const std::string&)> filter =
+                        [](const std::string&) { return true; }) const = 0;
 
   /**
    * @defgroup Messaging
@@ -656,9 +697,10 @@ public:
    * @param m The Message we are testing.
    */
   bool ms_can_fast_dispatch(const ceph::cref_t<Message>& m) {
-    for (const auto &dispatcher : fast_dispatchers) {
-      if (dispatcher->ms_can_fast_dispatch2(m))
-	return true;
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : fast_dispatchers) {
+      if (dispatcher->ms_can_fast_dispatch2(m)) {
+        return true;
+      }
     }
     return false;
   }
@@ -671,10 +713,10 @@ public:
    */
   void ms_fast_dispatch(const ceph::ref_t<Message> &m) {
     m->set_dispatch_stamp(ceph_clock_now());
-    for (const auto &dispatcher : fast_dispatchers) {
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : fast_dispatchers) {
       if (dispatcher->ms_can_fast_dispatch2(m)) {
-	dispatcher->ms_fast_dispatch2(m);
-	return;
+        dispatcher->ms_fast_dispatch2(m);
+        return;
       }
     }
     ceph_abort();
@@ -686,7 +728,7 @@ public:
    *
    */
   void ms_fast_preprocess(const ceph::ref_t<Message> &m) {
-    for (const auto &dispatcher : fast_dispatchers) {
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : fast_dispatchers) {
       dispatcher->ms_fast_preprocess2(m);
     }
   }
@@ -699,10 +741,17 @@ public:
    */
   void ms_deliver_dispatch(const ceph::ref_t<Message> &m) {
     m->set_dispatch_stamp(ceph_clock_now());
-    for (const auto &dispatcher : dispatchers) {
-      if (dispatcher->ms_dispatch2(m))
-	return;
+    bool acked = false;
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : dispatchers) {
+      auto r = Dispatcher::fold_dispatch_result(dispatcher->ms_dispatch2(m));
+      if (std::holds_alternative<Dispatcher::HANDLED>(r)) {
+        return;
+      } else if (std::holds_alternative<Dispatcher::ACKNOWLEDGED>(r)) {
+        acked = true;
+      }
     }
+    if (acked)
+      return;
     lsubdout(cct, ms, 0) << "ms_deliver_dispatch: unhandled message " << m << " " << *m << " from "
 			 << m->get_source_inst() << dendl;
     ceph_assert(!cct->_conf->ms_die_on_unhandled_msg);
@@ -718,7 +767,7 @@ public:
    * @param con Pointer to the new Connection.
    */
   void ms_deliver_handle_connect(Connection *con) {
-    for (const auto& dispatcher : dispatchers) {
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : dispatchers) {
       dispatcher->ms_handle_connect(con);
     }
   }
@@ -731,7 +780,7 @@ public:
    * @param con Pointer to the new Connection.
    */
   void ms_deliver_handle_fast_connect(Connection *con) {
-    for (const auto& dispatcher : fast_dispatchers) {
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : fast_dispatchers) {
       dispatcher->ms_handle_fast_connect(con);
     }
   }
@@ -743,7 +792,7 @@ public:
    * @param con Pointer to the new Connection.
    */
   void ms_deliver_handle_accept(Connection *con) {
-    for (const auto& dispatcher : dispatchers) {
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : dispatchers) {
       dispatcher->ms_handle_accept(con);
     }
   }
@@ -755,7 +804,7 @@ public:
    * @param con Pointer to the new Connection.
    */
   void ms_deliver_handle_fast_accept(Connection *con) {
-    for (const auto& dispatcher : fast_dispatchers) {
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : fast_dispatchers) {
       dispatcher->ms_handle_fast_accept(con);
     }
   }
@@ -768,9 +817,10 @@ public:
    * @param con Pointer to the broken Connection.
    */
   void ms_deliver_handle_reset(Connection *con) {
-    for (const auto& dispatcher : dispatchers) {
-      if (dispatcher->ms_handle_reset(con))
-	return;
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : dispatchers) {
+      if (dispatcher->ms_handle_reset(con)) {
+        return;
+      }
     }
   }
   /**
@@ -781,7 +831,7 @@ public:
    * @param con Pointer to the broken Connection.
    */
   void ms_deliver_handle_remote_reset(Connection *con) {
-    for (const auto& dispatcher : dispatchers) {
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : dispatchers) {
       dispatcher->ms_handle_remote_reset(con);
     }
   }
@@ -795,9 +845,10 @@ public:
    * @param con Pointer to the broken Connection.
    */
   void ms_deliver_handle_refused(Connection *con) {
-    for (const auto& dispatcher : dispatchers) {
-      if (dispatcher->ms_handle_refused(con))
+    for ([[maybe_unused]] const auto& [priority, dispatcher] : dispatchers) {
+      if (dispatcher->ms_handle_refused(con)) {
         return;
+      }
     }
   }
 

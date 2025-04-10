@@ -76,6 +76,7 @@ int ceph_flags_sys2wire(int flags)
        ceph_sys2wire(O_CREAT);
        ceph_sys2wire(O_EXCL);
        ceph_sys2wire(O_TRUNC);
+
        ceph_sys2wire(O_DIRECTORY);
        ceph_sys2wire(O_NOFOLLOW);
 

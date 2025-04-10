@@ -9,9 +9,13 @@
 #include "cls/queue/cls_queue_const.h"
 #include "cls/queue/cls_queue_src.h"
 
+using std::string;
 using ceph::bufferlist;
 using ceph::decode;
 using ceph::encode;
+
+const uint64_t page_size = 4096;
+const uint64_t large_chunk_size = 1ul << 22;
 
 int queue_write_head(cls_method_context_t hctx, cls_queue_head& head)
 {
@@ -27,6 +31,11 @@ int queue_write_head(cls_method_context_t hctx, cls_queue_head& head)
 
   bl.claim_append(bl_head);
 
+  if (bl.length() > head.max_head_size) {
+    CLS_LOG(0, "ERROR: queue_write_head: invalid head size = %u and urgent data size = %u \n", bl.length(), head.bl_urgent_data.length());
+    return -EINVAL;
+  }
+
   int ret = cls_cxx_write2(hctx, 0, bl.length(), &bl, CEPH_OSD_OP_FLAG_FADVISE_WILLNEED);
   if (ret < 0) {
     CLS_LOG(5, "ERROR: queue_write_head: failed to write head");
@@ -37,7 +46,7 @@ int queue_write_head(cls_method_context_t hctx, cls_queue_head& head)
 
 int queue_read_head(cls_method_context_t hctx, cls_queue_head& head)
 {
-  uint64_t chunk_size = 1024, start_offset = 0;
+  uint64_t chunk_size = page_size, start_offset = 0;
 
   bufferlist bl_head;
   const auto  ret = cls_cxx_read(hctx, start_offset, chunk_size, &bl_head);
@@ -275,7 +284,6 @@ int queue_list_entries(cls_method_context_t hctx, const cls_queue_list_op& op, c
   }
 
   op_ret.is_truncated = true;
-  uint64_t chunk_size = 1024;
   uint64_t contiguous_data_size = 0, size_to_read = 0;
   bool wrap_around = false;
 
@@ -297,17 +305,14 @@ int queue_list_entries(cls_method_context_t hctx, const cls_queue_list_op& op, c
   uint64_t data_size = 0, num_ops = 0;
   uint16_t entry_start = 0;
   bufferlist bl;
+  string last_marker;
   do
   {
     CLS_LOG(10, "INFO: queue_list_entries(): start_offset is %lu", start_offset);
   
     bufferlist bl_chunk;
     //Read chunk size at a time, if it is less than contiguous data size, else read contiguous data size
-    if (contiguous_data_size > chunk_size) {
-      size_to_read = chunk_size;
-    } else {
-      size_to_read = contiguous_data_size;
-    }
+    size_to_read = std::min(contiguous_data_size, large_chunk_size);
     CLS_LOG(10, "INFO: queue_list_entries(): size_to_read is %lu", size_to_read);
     if (size_to_read == 0) {
       next_marker = head.tail;
@@ -322,11 +327,11 @@ int queue_list_entries(cls_method_context_t hctx, const cls_queue_list_op& op, c
     }
 
     //If there is leftover data from previous iteration, append new data to leftover data
-    uint64_t entry_start_offset = start_offset - bl.length();
+    uint64_t entry_start_offset = start_offset - bl.length(); //NOLINT(bugprone-use-after-move)
     CLS_LOG(20, "INFO: queue_list_entries(): Entry start offset accounting for leftover data is %lu", entry_start_offset);
     bl.claim_append(bl_chunk);
     bl_chunk = std::move(bl);
-
+    bl.clear(); //NOLINT(bugprone-use-after-move)
     CLS_LOG(20, "INFO: queue_list_entries(): size of chunk %u", bl_chunk.length());
 
     //Process the chunk of data read
@@ -337,6 +342,10 @@ int queue_list_entries(cls_method_context_t hctx, const cls_queue_list_op& op, c
       CLS_LOG(10, "INFO: queue_list_entries(): index: %u, size_to_process: %lu", index, size_to_process);
       cls_queue_entry entry;
       ceph_assert(it.get_off() == index);
+      //Use the last marker saved in previous iteration as the marker for this entry
+      if (offset_populated) {
+        entry.marker = last_marker;
+      }
       //Populate offset if not done in previous iteration
       if (! offset_populated) {
         cls_queue_marker marker = {entry_start_offset + index, gen};
@@ -370,6 +379,7 @@ int queue_list_entries(cls_method_context_t hctx, const cls_queue_list_op& op, c
           // Copy unprocessed data to bl
           bl_chunk.splice(index, size_to_process, &bl);
           offset_populated = true;
+          last_marker = entry.marker;
           CLS_LOG(10, "INFO: queue_list_entries: not enough data to read entry start and data size, breaking out!");
           break;
         }
@@ -386,7 +396,12 @@ int queue_list_entries(cls_method_context_t hctx, const cls_queue_list_op& op, c
         it.copy(size_to_process, bl);
         offset_populated = true;
         entry_start_processed = true;
+        last_marker = entry.marker;
         CLS_LOG(10, "INFO: queue_list_entries(): not enough data to read data, breaking out!");
+        break;
+      }
+      if (!op.end_marker.empty() && entry.marker == op.end_marker) {
+        last_marker = entry.marker;
         break;
       }
       op_ret.entries.emplace_back(entry);
@@ -396,17 +411,24 @@ int queue_list_entries(cls_method_context_t hctx, const cls_queue_list_op& op, c
       data_size = 0;
       entry_start = 0;
       num_ops++;
+      last_marker.clear();
       if (num_ops == op.max) {
         CLS_LOG(10, "INFO: queue_list_entries(): num_ops is same as op.max, hence breaking out from inner loop!");
         break;
       }
     } while(index < bl_chunk.length());
 
-    CLS_LOG(10, "INFO: num_ops: %lu and op.max is %lu\n", num_ops, op.max);
+    CLS_LOG(10, "INFO: num_ops: %lu and op.max is %lu, last_marker: %s and op.end_marker is %s\n",
+            num_ops, op.max, last_marker.c_str(), op.end_marker.c_str());
 
-    if (num_ops == op.max) {
-      next_marker = cls_queue_marker{(entry_start_offset + index), gen};
-      CLS_LOG(10, "INFO: queue_list_entries(): num_ops is same as op.max, hence breaking out from outer loop with next offset: %lu", next_marker.offset);
+    if (num_ops == op.max || (!op.end_marker.empty() && op.end_marker == last_marker)) {
+      if (!op.end_marker.empty()) {
+        next_marker.from_str(op.end_marker.c_str());
+      } else {
+        next_marker = cls_queue_marker{(entry_start_offset + index), gen};
+      }
+      CLS_LOG(10, "INFO: queue_list_entries(): either num_ops is same as op.max or last_marker is same as op.end_marker, "
+                  "hence breaking out from outer loop with next offset: %lu", next_marker.offset);
       break;
     }
 

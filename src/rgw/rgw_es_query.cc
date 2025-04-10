@@ -8,12 +8,15 @@
 #include <boost/algorithm/string.hpp>
 
 #include "common/ceph_json.h"
+#include "common/strtol.h"
 #include "rgw_common.h"
 #include "rgw_es_query.h"
 
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
+
+using namespace std;
 
 bool pop_front(list<string>& l, string *s)
 {

@@ -9,8 +9,11 @@
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 
+#include "common/fmt_common.h"
 #include "common/intrusive_lru.h"
 #include "osd/object_state.h"
+#include "crimson/common/exception.h"
+#include "crimson/common/tri_mutex.h"
 #include "crimson/osd/osd_operation.h"
 
 namespace ceph {
@@ -24,6 +27,8 @@ namespace crimson::common {
 namespace crimson::osd {
 
 class Watch;
+struct SnapSetContext;
+using SnapSetContextRef = boost::intrusive_ptr<SnapSetContext>;
 
 template <typename OBC>
 struct obc_to_hoid {
@@ -33,23 +38,52 @@ struct obc_to_hoid {
   }
 };
 
-class ObjectContext : public Blocker,
-		      public ceph::common::intrusive_lru_base<
+struct SnapSetContext :
+  public boost::intrusive_ref_counter<SnapSetContext,
+                                     boost::thread_unsafe_counter>
+{
+  hobject_t oid;
+  SnapSet snapset;
+  bool exists = false;
+  /**
+   * exists
+   *
+   * Because ObjectContext's are cached, we need to be able to express the case
+   * where the object to which a cached ObjectContext refers does not exist.
+   * ObjectContext's for yet-to-be-created objects are initialized with exists=false.
+   * The ObjectContext for a deleted object will have exists set to false until it falls
+   * out of cache (or another write recreates the object).
+   */
+  explicit SnapSetContext(const hobject_t& o) :
+    oid(o), exists(false) {}
+};
+
+class ObjectContext : public ceph::common::intrusive_lru_base<
   ceph::common::intrusive_lru_config<
     hobject_t, ObjectContext, obc_to_hoid<ObjectContext>>>
 {
+private:
+  tri_mutex lock;
+
 public:
-  Ref head; // Ref defined as part of ceph::common::intrusive_lru_base
   ObjectState obs;
-  std::optional<SnapSet> ss;
-  bool loaded : 1;
+  SnapSetContextRef ssc;
   // the watch / notify machinery rather stays away from the hot and
   // frequented paths. std::map is used mostly because of developer's
   // convenience.
   using watch_key_t = std::pair<uint64_t, entity_name_t>;
   std::map<watch_key_t, seastar::shared_ptr<crimson::osd::Watch>> watchers;
 
-  ObjectContext(const hobject_t &hoid) : obs(hoid), loaded(false) {}
+  CommonOBCPipeline obc_pipeline;
+
+  ObjectContext(hobject_t hoid) : lock(hoid.to_str()),
+                                  obs(std::move(hoid)) {}
+
+  void update_from(
+    std::pair<ObjectState, SnapSetContextRef> obc_data) {
+    obs = obc_data.first;
+    ssc = obc_data.second;
+  }
 
   const hobject_t &get_oid() const {
     return obs.oi.soid;
@@ -59,164 +93,137 @@ public:
     return get_oid().is_head();
   }
 
-  const SnapSet &get_ro_ss() const {
-    if (is_head()) {
-      ceph_assert(ss);
-      return *ss;
-    } else {
-      ceph_assert(head);
-      return head->get_ro_ss();
-    }
+  hobject_t get_head_oid() const {
+    return get_oid().get_head();
   }
 
-  void set_head_state(ObjectState &&_obs, SnapSet &&_ss) {
+  const SnapSet &get_head_ss() const {
+    ceph_assert(is_head());
+    ceph_assert(ssc);
+    return ssc->snapset;
+  }
+
+  void set_head_state(ObjectState &&_obs, SnapSetContextRef &&_ssc) {
     ceph_assert(is_head());
     obs = std::move(_obs);
-    ss = std::move(_ss);
-    loaded = true;
+    ssc = std::move(_ssc);
+    // ObjectContextLoader::load_and_lock* rely on this to determine whether to
+    // start loading from disk.  As this method fills in the metadata, such
+    // loading will not be necessary in the future. loading_started will already
+    // be set if this is invoked from ObjectContextLoader::load_and_lock*
+    loading_started = true;
+    fully_loaded = true;
   }
 
-  void set_clone_state(ObjectState &&_obs, Ref &&_head) {
+  void set_clone_state(ObjectState &&_obs) {
     ceph_assert(!is_head());
     obs = std::move(_obs);
-    head = _head;
-    loaded = true;
+    // ObjectContextLoader::load_and_lock* rely on this to determine whether to
+    // start loading from disk.  As this method fills in the metadata, such
+    // loading will not be necessary in the future. loading_started will already
+    // be set if this is invoked from ObjectContextLoader::load_and_lock*
+    loading_started = true;
+    fully_loaded = true;
+  }
+
+  void set_clone_ssc(SnapSetContextRef head_ssc) {
+    ceph_assert(!is_head());
+    ssc = head_ssc;
+  }
+
+  /// pass the provided exception to any waiting consumers of this ObjectContext
+  template<typename Exception>
+  void interrupt(Exception ex) {
+    lock.abort(std::move(ex));
+  }
+
+  bool is_loaded() const {
+    return fully_loaded;
+  }
+
+  bool is_valid() const {
+    return !invalidated;
   }
 
 private:
-  RWState rwstate;
-  seastar::shared_mutex wait_queue;
-  std::optional<seastar::shared_promise<>> wake;
+  boost::intrusive::list_member_hook<> obc_accessing_hook;
+  uint64_t list_link_cnt = 0;
 
-  template <typename F>
-  seastar::future<> with_queue(F &&f) {
-    return wait_queue.lock().then([this, f=std::move(f)] {
-      ceph_assert(!wake);
-      return seastar::repeat([this, f=std::move(f)]() {
-	if (f()) {
-	  wait_queue.unlock();
-	  return seastar::make_ready_future<seastar::stop_iteration>(
-	    seastar::stop_iteration::yes);
-	} else {
-	  rwstate.inc_waiters();
-	  wake = seastar::shared_promise<>();
-	  return wake->get_shared_future().then([this, f=std::move(f)] {
-	    wake = std::nullopt;
-	    rwstate.dec_waiters(1);
-	    return seastar::make_ready_future<seastar::stop_iteration>(
-	      seastar::stop_iteration::no);
-	  });
-	}
-      });
-    });
-  }
+  /**
+   * loading_started
+   *
+   * ObjectContext instances may be used for pipeline stages
+   * prior to actually being loaded.
+   *
+   * ObjectContextLoader::load_and_lock* use loading_started
+   * to determine whether to initiate loading or simply take
+   * the desired lock directly.
+   *
+   * If loading_started is not set, the task must set it and
+   * (syncronously) take an exclusive lock.  That exclusive lock
+   * must be held until the loading completes, at which point the
+   * lock may be relaxed or released.
+   *
+   * If loading_started is set, it is safe to directly take
+   * the desired lock, once the lock is obtained loading may
+   * be assumed to be complete.
+   *
+   * loading_started, once set, remains set for the lifetime
+   * of the object.
+   */
+  bool loading_started = false;
 
+  /// true once set_*_state has been called, used for debugging
+  bool fully_loaded = false;
 
-  const char *get_type_name() const final {
-    return "ObjectContext";
-  }
-  void dump_detail(Formatter *f) const final;
+  /**
+   * invalidated
+   *
+   * Set to true upon eviction from cache.  This happens to all
+   * cached obc's upon interval change and to the target of
+   * a repop received on a replica to ensure that the cached
+   * state is refreshed upon subsequent replica read.
+   */
+  bool invalidated = false;
 
-  template <typename LockF>
-  seastar::future<> get_lock(
-    Operation *op,
-    LockF &&lockf) {
-    return op->with_blocking_future(
-      make_blocking_future(with_queue(std::forward<LockF>(lockf))));
-  }
-
-  template <typename UnlockF>
-  void put_lock(
-    UnlockF &&unlockf) {
-    if (unlockf() && wake) wake->set_value();
-  }
+  friend class ObjectContextRegistry;
+  friend class ObjectContextLoader;
 public:
-  seastar::future<> get_lock_type(Operation *op, RWState::State type) {
-    switch (type) {
-    case RWState::RWWRITE:
-      return get_lock(op, [this] { return rwstate.get_write_lock(); });
-    case RWState::RWREAD:
-      return get_lock(op, [this] { return rwstate.get_read_lock(); });
-    case RWState::RWEXCL:
-      return get_lock(op, [this] { return rwstate.get_excl_lock(); });
-    case RWState::RWNONE:
-      return seastar::now();
-    default:
-      ceph_abort_msg("invalid lock type");
-      return seastar::now();
+
+  template <typename ListType>
+  void append_to(ListType& list) {
+    if (list_link_cnt++ == 0) {
+      list.push_back(*this);
     }
   }
 
-  void put_lock_type(RWState::State type) {
-    switch (type) {
-    case RWState::RWWRITE:
-      return put_lock([this] { return rwstate.put_write(); });
-    case RWState::RWREAD:
-      return put_lock([this] { return rwstate.put_read(); });
-    case RWState::RWEXCL:
-      return put_lock([this] { return rwstate.put_excl(); });
-    case RWState::RWNONE:
-      return;
-    default:
-      ceph_abort_msg("invalid lock type");
-      return;
+  template <typename ListType>
+  void remove_from(ListType&& list) {
+    assert(list_link_cnt > 0);
+    if (--list_link_cnt == 0) {
+      list.erase(std::decay_t<ListType>::s_iterator_to(*this));
     }
   }
 
-  void degrade_excl_to(RWState::State type) {
-    // assume we already hold an excl lock
-    bool put = rwstate.put_excl();
-    bool success = false;
-    switch (type) {
-    case RWState::RWWRITE:
-      success = rwstate.get_write_lock();
-      break;
-    case RWState::RWREAD:
-      success = rwstate.get_read_lock();
-      break;
-    case RWState::RWEXCL:
-      success = rwstate.get_excl_lock();
-      break;
-    case RWState::RWNONE:
-      success = true;
-      break;
-    default:
-      ceph_abort_msg("invalid lock type");
-      break;
-    }
-    ceph_assert(success);
-    if (put && wake) {
-      wake->set_value();
-    }
+  template <typename FormatContext>
+  auto fmt_print_ctx(FormatContext & ctx) const {
+    return fmt::format_to(
+      ctx.out(), "ObjectContext({}, oid={}, refcount={})",
+      (void*)this,
+      get_oid(),
+      get_use_count());
   }
 
-  bool empty() const { return rwstate.empty(); }
+  using obc_accessing_option_t = boost::intrusive::member_hook<
+    ObjectContext,
+    boost::intrusive::list_member_hook<>,
+    &ObjectContext::obc_accessing_hook>;
 
-  template <typename F>
-  seastar::future<> get_write_greedy(Operation *op) {
-    return get_lock(op, [this] { return rwstate.get_write_lock(true); });
+  bool empty() const {
+    return !lock.is_acquired();
   }
-
-  bool try_get_read_lock() {
-    return rwstate.get_read_lock();
-  }
-  void drop_read() {
-    return put_lock_type(RWState::RWREAD);
-  }
-  bool get_recovery_read() {
-    return rwstate.get_recovery_read();
-  }
-  void drop_recovery_read() {
-    ceph_assert(rwstate.recovery_read_marker);
-    drop_read();
-    rwstate.recovery_read_marker = false;
-  }
-  bool maybe_get_excl() {
-    return rwstate.get_excl_lock();
-  }
-
   bool is_request_pending() const {
-    return !rwstate.empty();
+    return lock.is_acquired();
   }
 };
 using ObjectContextRef = ObjectContext::Ref;
@@ -226,14 +233,42 @@ class ObjectContextRegistry : public md_config_obs_t  {
 
 public:
   ObjectContextRegistry(crimson::common::ConfigProxy &conf);
+  ~ObjectContextRegistry();
 
   std::pair<ObjectContextRef, bool> get_cached_obc(const hobject_t &hoid) {
     return obc_lru.get_or_create(hoid);
   }
+  ObjectContextRef maybe_get_cached_obc(const hobject_t &hoid) {
+    return obc_lru.get(hoid);
+  }
 
-  const char** get_tracked_conf_keys() const final;
+  void clear_range(const hobject_t &from,
+                   const hobject_t &to) {
+    obc_lru.clear_range(from, to, [](auto &obc) {
+      obc.invalidated = true;
+    });
+  }
+
+  void invalidate_on_interval_change() {
+    obc_lru.clear([](auto &obc) {
+      obc.invalidated = true;
+    });
+  }
+
+  template <class F>
+  void for_each(F&& f) {
+    obc_lru.for_each(std::forward<F>(f));
+  }
+
+  std::vector<std::string> get_tracked_keys() const noexcept final;
   void handle_conf_change(const crimson::common::ConfigProxy& conf,
                           const std::set <std::string> &changed) final;
 };
 
+std::optional<hobject_t> resolve_oid(const SnapSet &ss,
+                                     const hobject_t &oid);
+
 } // namespace crimson::osd
+
+template <>
+struct fmt::formatter<RWState::State> : fmt::ostream_formatter {};

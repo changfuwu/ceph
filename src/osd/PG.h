@@ -15,18 +15,12 @@
 #ifndef CEPH_PG_H
 #define CEPH_PG_H
 
-#include <boost/statechart/custom_reaction.hpp>
-#include <boost/statechart/event.hpp>
-#include <boost/statechart/simple_state.hpp>
-#include <boost/statechart/state.hpp>
-#include <boost/statechart/state_machine.hpp>
-#include <boost/statechart/transition.hpp>
-#include <boost/statechart/event_base.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/container/flat_set.hpp>
 #include "include/mempool.h"
 
 // re-include our assert to clobber boost's
+#include "common/admin_finisher.h"
 #include "include/ceph_assert.h" 
 #include "include/common_fwd.h"
 
@@ -40,12 +34,13 @@
 
 #include "PGLog.h"
 #include "OSDMap.h"
-#include "messages/MOSDPGLog.h"
 #include "include/str_list.h"
 #include "PGBackend.h"
 #include "PGPeeringEvent.h"
 #include "PeeringState.h"
+#include "recovery_types.h"
 #include "MissingLoc.h"
+#include "scrubber_common.h"
 
 #include "mgr/OSDPerfMetricTypes.h"
 
@@ -60,21 +55,21 @@
 
 class OSD;
 class OSDService;
-class OSDShard;
-class OSDShardPGSlot;
-class MOSDOp;
-class MOSDPGScan;
-class MOSDPGBackfill;
-class MOSDPGInfo;
+struct OSDShard;
+struct OSDShardPGSlot;
 
 class PG;
 struct OpRequest;
 typedef OpRequest::Ref OpRequestRef;
-class MOSDPGLog;
 class DynamicPerfStats;
+class PgScrubber;
+class ScrubBackend;
 
 namespace Scrub {
   class Store;
+  class ReplicaReservations;
+  class ReservedByRemotePrimary;
+  enum class schedule_result_t;
 }
 
 #ifdef PG_DEBUG_REFS
@@ -168,13 +163,28 @@ class PGRecoveryStats {
  *
  */
 
-class PG : public DoutPrefixProvider, public PeeringState::PeeringListener {
+class PG : public DoutPrefixProvider,
+	   public PeeringState::PeeringListener,
+	   public Scrub::PgScrubBeListener {
   friend struct NamedState;
   friend class PeeringState;
+  friend class PgScrubber;
+  friend class ScrubBackend;
 
 public:
   const pg_shard_t pg_whoami;
   const spg_t pg_id;
+
+  /// the 'scrubber'. Will be allocated in the derivative (PrimaryLogPG) ctor,
+  /// and be removed only in the PrimaryLogPG destructor.
+  std::unique_ptr<ScrubPgIF> m_scrubber;
+
+  /// scrubbing state for both Primary & replicas
+  bool is_scrub_active() const { return m_scrubber->is_scrub_active(); }
+
+  /// set when the scrub request is queued, and reset after scrubbing fully
+  /// cleaned up.
+  bool is_scrub_queued_or_active() const { return m_scrubber->is_queued_or_active(); }
 
 public:
   // -- members --
@@ -211,11 +221,6 @@ public:
     const char *state_name, utime_t enter_time,
     uint64_t events, utime_t event_dur) override;
 
-  void lock_suspend_timeout(ThreadPool::TPHandle &handle) {
-    handle.suspend_tp_timeout();
-    lock();
-    handle.reset_tp_timeout();
-  }
   void lock(bool no_lockdep = false) const;
   void unlock() const;
   bool is_locked() const;
@@ -224,7 +229,7 @@ public:
     return pg_id;
   }
 
-  const PGPool& get_pool() const {
+  const PGPool& get_pgpool() const final {
     return pool;
   }
   uint64_t get_last_user_version() const {
@@ -240,6 +245,11 @@ public:
     return info.history.same_interval_since;
   }
 
+  bool is_waiting_for_unreadable_object() const final
+  {
+    return !waiting_for_unreadable_object.empty();
+  }
+
   static void set_last_scrub_stamp(
     utime_t t, pg_history_t &history, pg_stat_t &stats) {
     stats.last_scrub_stamp = t;
@@ -248,10 +258,11 @@ public:
 
   void set_last_scrub_stamp(utime_t t) {
     recovery_state.update_stats(
-      [=](auto &history, auto &stats) {
+      [t](auto &history, auto &stats) {
 	set_last_scrub_stamp(t, history, stats);
 	return true;
       });
+    on_scrub_schedule_input_change(Scrub::delay_ready_t::delay_ready);
   }
 
   static void set_last_deep_scrub_stamp(
@@ -262,10 +273,37 @@ public:
 
   void set_last_deep_scrub_stamp(utime_t t) {
     recovery_state.update_stats(
-      [=](auto &history, auto &stats) {
+      [t](auto &history, auto &stats) {
 	set_last_deep_scrub_stamp(t, history, stats);
+	set_last_scrub_stamp(t, history, stats);
 	return true;
       });
+    on_scrub_schedule_input_change(Scrub::delay_ready_t::delay_ready);
+  }
+
+  static void add_objects_scrubbed_count(
+    int64_t count, pg_stat_t &stats) {
+    stats.objects_scrubbed += count;
+  }
+
+  void add_objects_scrubbed_count(int64_t count) {
+    recovery_state.update_stats(
+      [count](auto &history, auto &stats) {
+	add_objects_scrubbed_count(count, stats);
+	return true;
+      });
+  }
+
+  static void reset_objects_scrubbed(pg_stat_t &stats) {
+    stats.objects_scrubbed = 0;
+  }
+
+  void reset_objects_scrubbed()
+  {
+    recovery_state.update_stats([](auto& history, auto& stats) {
+      reset_objects_scrubbed(stats);
+      return true;
+    });
   }
 
   bool is_deleting() const {
@@ -300,7 +338,7 @@ public:
   int get_acting_primary() const {
     return recovery_state.get_acting_primary();
   }
-  pg_shard_t get_primary() const {
+  pg_shard_t get_primary() const final {
     return recovery_state.get_primary();
   }
   const std::vector<int> get_up() const {
@@ -337,7 +375,6 @@ public:
     int acting_primary,
     const pg_history_t& history,
     const PastIntervals& pim,
-    bool backfill,
     ObjectStore::Transaction &t);
 
   /// read existing pg state off disk
@@ -375,11 +412,81 @@ public:
   void finish_split_stats(const object_stat_sum_t& stats,
 			  ObjectStore::Transaction &t);
 
-  void scrub(epoch_t queued, ThreadPool::TPHandle &handle);
+  void scrub(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    // a new scrub
+    forward_scrub_event(&ScrubPgIF::initiate_regular_scrub, queued, "StartScrub");
+  }
 
-  bool is_scrub_registered();
-  void reg_next_scrub();
-  void unreg_next_scrub();
+  void replica_scrub(epoch_t queued,
+		     Scrub::act_token_t act_token,
+		     ThreadPool::TPHandle& handle);
+
+  void replica_scrub_resched(epoch_t queued,
+			     Scrub::act_token_t act_token,
+			     ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_sched_replica, queued, act_token,
+			"SchedReplica");
+  }
+
+  void scrub_send_scrub_resched(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_scrub_resched, queued, "InternalSchedScrub");
+  }
+
+  void scrub_send_pushes_update(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::active_pushes_notification, queued,
+			"ActivePushesUpd");
+  }
+
+  void scrub_send_applied_update(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::update_applied_notification, queued,
+			"UpdatesApplied");
+  }
+
+  void scrub_send_unblocking(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_scrub_unblock, queued, "Unblocked");
+  }
+
+  void scrub_send_digest_update(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::digest_update_notification, queued, "DigestUpdate");
+  }
+
+  void scrub_send_replmaps_ready(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_replica_maps_ready, queued, "GotReplicas");
+  }
+
+  void scrub_send_replica_pushes(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_replica_pushes_upd, queued,
+			"ReplicaPushesUpd");
+  }
+
+  void scrub_send_get_next_chunk(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_get_next_chunk, queued, "NextChunk");
+  }
+
+  void scrub_send_scrub_is_finished(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_scrub_is_finished, queued, "ScrubFinished");
+  }
+
+  void scrub_send_chunk_free(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_chunk_free, queued, "SelectedChunkFree");
+  }
+
+  void scrub_send_chunk_busy(epoch_t queued, ThreadPool::TPHandle& handle)
+  {
+    forward_scrub_event(&ScrubPgIF::send_chunk_busy, queued, "ChunkIsBusy");
+  }
 
   void queue_want_pg_temp(const std::vector<int> &wanted) override;
   void clear_want_pg_temp() override;
@@ -393,19 +500,69 @@ public:
   void on_pool_change() override;
   virtual void plpg_on_pool_change() = 0;
 
-  void on_info_history_change() override;
+  /**
+   * on_scrub_schedule_input_change
+   *
+   * To be called when inputs to scrub scheduling may have changed.
+   * - OSD config params related to scrub such as  osd_scrub_min_interval,
+   *   osd_scrub_max_interval
+   * - Pool params related to scrub such as osd_scrub_min_interval,
+   *   osd_scrub_max_interval
+   * - pg stat scrub timestamps
+   * - etc
+   */
+  void on_scrub_schedule_input_change(Scrub::delay_ready_t delay_ready);
 
-  void scrub_requested(bool deep, bool repair, bool need_auto = false) override;
+  void scrub_requested(scrub_level_t scrub_level, scrub_type_t scrub_type) override;
 
   uint64_t get_snap_trimq_size() const override {
     return snap_trimq.size();
   }
+
+  static void add_objects_trimmed_count(
+    int64_t count, pg_stat_t &stats) {
+    stats.objects_trimmed += count;
+  }
+
+  void add_objects_trimmed_count(int64_t count) {
+    recovery_state.update_stats_wo_resched(
+      [count](auto &history, auto &stats) {
+        add_objects_trimmed_count(count, stats);
+      });
+  }
+
+  static void reset_objects_trimmed(pg_stat_t &stats) {
+    stats.objects_trimmed = 0;
+  }
+
+  void reset_objects_trimmed() {
+    recovery_state.update_stats_wo_resched(
+      [](auto &history, auto &stats) {
+        reset_objects_trimmed(stats);
+      });
+  }
+
+  utime_t snaptrim_begin_stamp;
+
+  void set_snaptrim_begin_stamp() {
+    snaptrim_begin_stamp = ceph_clock_now();
+  }
+
+  void set_snaptrim_duration() {
+    utime_t cur_stamp = ceph_clock_now();
+    utime_t duration = cur_stamp - snaptrim_begin_stamp;
+    recovery_state.update_stats_wo_resched(
+      [duration](auto &history, auto &stats) {
+        stats.snaptrim_duration = double(duration);
+    });
+  }
+
   unsigned get_target_pg_log_entries() const override;
 
   void clear_publish_stats() override;
   void clear_primary_state() override;
 
-  epoch_t oldest_stored_osdmap() override;
+  epoch_t cluster_osdmap_trim_lower_bound() override;
   OstreamTemp get_clog_error() override;
   OstreamTemp get_clog_info() override;
   OstreamTemp get_clog_debug() override;
@@ -415,16 +572,16 @@ public:
     float delay) override;
   void request_local_background_io_reservation(
     unsigned priority,
-    PGPeeringEventRef on_grant,
-    PGPeeringEventRef on_preempt) override;
+    PGPeeringEventURef on_grant,
+    PGPeeringEventURef on_preempt) override;
   void update_local_background_io_priority(
     unsigned priority) override;
   void cancel_local_background_io_reservation() override;
 
   void request_remote_recovery_reservation(
     unsigned priority,
-    PGPeeringEventRef on_grant,
-    PGPeeringEventRef on_preempt) override;
+    PGPeeringEventURef on_grant,
+    PGPeeringEventURef on_preempt) override;
   void cancel_remote_recovery_reservation() override;
 
   void schedule_event_on_commit(
@@ -433,21 +590,11 @@ public:
 
   void on_active_exit() override;
 
-  Context *on_clean() override {
-    if (is_active()) {
-      kick_snap_trim();
-    }
-    requeue_ops(waiting_for_clean_to_primary_repair);
-    return finish_recovery();
-  }
+  Context *on_clean() override;
 
-  void on_activate(interval_set<snapid_t> snaps) override {
-    ceph_assert(scrubber.callbacks.empty());
-    ceph_assert(callbacks_for_degraded_object.empty());
-    snap_trimq = snaps;
-    release_pg_backoffs();
-    projected_last_update = info.last_update;
-  }
+  void on_activate(interval_set<snapid_t> snaps) override;
+
+  void on_replica_activate() override;
 
   void on_activate_committed() override;
 
@@ -457,7 +604,8 @@ public:
   void queue_snap_retrim(snapid_t snap);
 
   void on_backfill_reserved() override;
-  void on_backfill_canceled() override;
+  void on_backfill_suspended() override;
+  void on_recovery_cancelled() override {}
   void on_recovery_reserved() override;
 
   bool is_forced_recovery_or_backfill() const {
@@ -469,7 +617,8 @@ public:
     return std::make_unique<PG::PGLogEntryHandler>(this, &t);
   }
 
-  void do_delete_work(ObjectStore::Transaction &t) override;
+  std::pair<ghobject_t, bool> do_delete_work(ObjectStore::Transaction &t,
+    ghobject_t _next) override;
 
   void clear_ready_to_merge() override;
   void set_not_ready_to_merge_target(pg_t pgid, pg_t src) override;
@@ -479,7 +628,7 @@ public:
 
   void send_pg_created(pg_t pgid) override;
 
-  ceph::signedspan get_mnow() override;
+  ceph::signedspan get_mnow() const override;
   HeartbeatStampsRef get_hb_stamps(int peer) override;
   void schedule_renew_lease(epoch_t lpr, ceph::timespan delay) override;
   void queue_check_readable(epoch_t lpr, ceph::timespan delay) override;
@@ -495,7 +644,14 @@ public:
     std::vector<int>& newup, int up_primary,
     std::vector<int>& newacting, int acting_primary,
     PeeringCtx &rctx);
-  void handle_activate_map(PeeringCtx &rctx);
+
+  /**
+   *  \note: handle_activate_map() is not guaranteed to be called for
+   *  each epoch in sequence. Thus we supply it with the full range of
+   *  epochs that were skipped.
+   */
+  void handle_activate_map(PeeringCtx &rctx, epoch_t range_starts_at);
+
   void handle_initialize(PeeringCtx &rxcx);
   void handle_query_state(ceph::Formatter *f);
 
@@ -516,17 +672,38 @@ public:
   void dump_pgstate_history(ceph::Formatter *f);
   void dump_missing(ceph::Formatter *f);
 
-  void get_pg_stats(std::function<void(const pg_stat_t&, epoch_t lec)> f);
-  void with_heartbeat_peers(std::function<void(int)> f);
+  void with_pg_stats(ceph::coarse_real_clock::time_point now_is,
+		     std::function<void(const pg_stat_t&, epoch_t lec)>&& f);
+  void with_heartbeat_peers(std::function<void(int)>&& f);
 
   void shutdown();
   virtual void on_shutdown() = 0;
 
-  bool get_must_scrub() const {
-    return scrubber.must_scrub;
-  }
-  bool sched_scrub();
+  Scrub::schedule_result_t start_scrubbing(
+    const Scrub::SchedEntry& candidate,
+    Scrub::OSDRestrictions osd_restrictions);
 
+  unsigned int scrub_requeue_priority(
+      Scrub::scrub_prio_t with_priority,
+      unsigned int suggested_priority) const;
+  /// the version that refers to flags_.priority
+  unsigned int scrub_requeue_priority(Scrub::scrub_prio_t with_priority) const;
+
+private:
+  // auxiliaries used by sched_scrub():
+  double next_deepscrub_interval() const;
+
+  using ScrubAPI = void (ScrubPgIF::*)(epoch_t epoch_queued);
+  void forward_scrub_event(ScrubAPI fn, epoch_t epoch_queued, std::string_view desc);
+  // and for events that carry a meaningful 'activation token'
+  using ScrubSafeAPI = void (ScrubPgIF::*)(epoch_t epoch_queued,
+					   Scrub::act_token_t act_token);
+  void forward_scrub_event(ScrubSafeAPI fn,
+			   epoch_t epoch_queued,
+			   Scrub::act_token_t act_token,
+			   std::string_view desc);
+
+public:
   virtual void do_request(
     OpRequestRef& op,
     ThreadPool::TPHandle &handle
@@ -536,10 +713,10 @@ public:
 
   virtual void snap_trimmer(epoch_t epoch_queued) = 0;
   virtual void do_command(
-    const std::string_view& prefix,
+    std::string_view prefix,
     const cmdmap_t& cmdmap,
     const ceph::buffer::list& idata,
-    std::function<void(int,const std::string&,ceph::buffer::list&)> on_finish) = 0;
+    asok_finisher on_finish) = 0;
 
   virtual bool agent_work(int max) = 0;
   virtual bool agent_work(int max, int agent_flush_quota) = 0;
@@ -551,14 +728,14 @@ public:
   struct C_DeleteMore : public Context {
     PGRef pg;
     epoch_t epoch;
-    C_DeleteMore(PG *p, epoch_t e) : pg(p), epoch(e) {}
+    int64_t num_objects;
+    C_DeleteMore(PG *p, epoch_t e, int64_t num) : pg(p), epoch(e),
+	                                          num_objects(num){}
     void finish(int r) override {
       ceph_abort();
     }
     void complete(int r) override;
   };
-
-  void _delete_some(ObjectStore::Transaction *t);
 
   virtual void set_dynamic_perf_stats_queries(
     const std::list<OSDPerfMetricQuery> &queries) {
@@ -635,7 +812,6 @@ private:
 protected:
   OSDriver osdriver;
   SnapMapper snap_mapper;
-  bool eio_errors_to_process = false;
 
   virtual PGBackend *get_pgbackend() = 0;
   virtual const PGBackend* get_pgbackend() const = 0;
@@ -662,7 +838,6 @@ protected:
   /* You should not use these items without taking their respective queue locks
    * (if they have one) */
   xlist<PG*>::item stat_queue_item;
-  bool scrub_queued;
   bool recovery_queued;
 
   int recovery_ops_active;
@@ -674,8 +849,8 @@ protected:
 public:
   bool dne() { return info.dne(); }
 
-  virtual void send_cluster_message(
-    int osd, Message *m, epoch_t epoch, bool share_map_update) override;
+  void send_cluster_message(
+    int osd, MessageRef m, epoch_t epoch, bool share_map_update) override;
 
 protected:
   epoch_t get_last_peering_reset() const {
@@ -690,91 +865,6 @@ protected:
     ceph::make_mutex("PG::heartbeat_peer_lock");
   std::set<int> heartbeat_peers;
   std::set<int> probe_targets;
-
-public:
-  /**
-   * BackfillInterval
-   *
-   * Represents the objects in a range [begin, end)
-   *
-   * Possible states:
-   * 1) begin == end == hobject_t() indicates the the interval is unpopulated
-   * 2) Else, objects contains all objects in [begin, end)
-   */
-  struct BackfillInterval {
-    // info about a backfill interval on a peer
-    eversion_t version; /// version at which the scan occurred
-    std::map<hobject_t,eversion_t> objects;
-    hobject_t begin;
-    hobject_t end;
-
-    /// clear content
-    void clear() {
-      *this = BackfillInterval();
-    }
-
-    /// clear objects std::list only
-    void clear_objects() {
-      objects.clear();
-    }
-
-    /// reinstantiate with a new start+end position and sort order
-    void reset(hobject_t start) {
-      clear();
-      begin = end = start;
-    }
-
-    /// true if there are no objects in this interval
-    bool empty() const {
-      return objects.empty();
-    }
-
-    /// true if interval extends to the end of the range
-    bool extends_to_end() const {
-      return end.is_max();
-    }
-
-    /// removes items <= soid and adjusts begin to the first object
-    void trim_to(const hobject_t &soid) {
-      trim();
-      while (!objects.empty() &&
-	     objects.begin()->first <= soid) {
-	pop_front();
-      }
-    }
-
-    /// Adjusts begin to the first object
-    void trim() {
-      if (!objects.empty())
-	begin = objects.begin()->first;
-      else
-	begin = end;
-    }
-
-    /// drop first entry, and adjust @begin accordingly
-    void pop_front() {
-      ceph_assert(!objects.empty());
-      objects.erase(objects.begin());
-      trim();
-    }
-
-    /// dump
-    void dump(ceph::Formatter *f) const {
-      f->dump_stream("begin") << begin;
-      f->dump_stream("end") << end;
-      f->open_array_section("objects");
-      for (std::map<hobject_t, eversion_t>::const_iterator i =
-	     objects.begin();
-	   i != objects.end();
-	   ++i) {
-	f->open_object_section("object");
-	f->dump_stream("object") << i->first;
-	f->dump_stream("version") << i->second;
-	f->close_section();
-      }
-      f->close_section();
-    }
-  };
 
 protected:
   BackfillInterval backfill_info;
@@ -884,6 +974,19 @@ public:
     return num_bytes;
   }
 
+  uint64_t get_average_object_size() {
+    ceph_assert(ceph_mutex_is_locked_by_me(_lock));
+    auto num_bytes = static_cast<uint64_t>(
+      std::max<int64_t>(
+        0, // ensure bytes is non-negative
+        info.stats.stats.sum.num_bytes));
+    auto num_objects = static_cast<uint64_t>(
+      std::max<int64_t>(
+        1, // ensure objects is non-negative and non-zero
+        info.stats.stats.sum.num_objects));
+    return std::max<uint64_t>(num_bytes / num_objects, 1);
+  }
+
 protected:
 
   /*
@@ -967,6 +1070,7 @@ protected:
 
   std::set<hobject_t> objects_blocked_on_cache_full;
   std::map<hobject_t,snapid_t> objects_blocked_on_degraded_snap;
+  std::map<hobject_t,snapid_t> objects_blocked_on_unreadable_snap;
   std::map<hobject_t,ObjectContextRef> objects_blocked_on_snap_promotion;
 
   // Callbacks should assume pg (and nothing else) is locked
@@ -987,8 +1091,7 @@ protected:
   // publish stats
   ceph::mutex pg_stats_publish_lock =
     ceph::make_mutex("PG::pg_stats_publish_lock");
-  bool pg_stats_publish_valid;
-  pg_stat_t pg_stats_publish;
+  std::optional<pg_stat_t> pg_stats_publish;
 
   friend class TestOpsSocketHook;
   void publish_stats_to_osd() override;
@@ -1025,7 +1128,7 @@ protected:
       pg->get_pgbackend()->trim(entry, t);
     }
   };
-  
+
   void update_object_snap_mapping(
     ObjectStore::Transaction *t, const hobject_t &soid,
     const std::set<snapid_t> &snaps);
@@ -1092,244 +1195,15 @@ public:
     hobject_t end = info.pgid.pgid.get_hobj_end(pool.info.get_pg_num());
     release_backoffs(begin, end);
   }
-protected:
 
   // -- scrub --
-public:
-  struct Scrubber {
-    Scrubber();
-    ~Scrubber();
-
-    // metadata
-    std::set<pg_shard_t> reserved_peers;
-    bool local_reserved, remote_reserved, reserve_failed;
-    epoch_t epoch_start;
-
-    // common to both scrubs
-    bool active;
-    std::set<pg_shard_t> waiting_on_whom;
-    int shallow_errors;
-    int deep_errors;
-    int fixed;
-    ScrubMap primary_scrubmap;
-    ScrubMapBuilder primary_scrubmap_pos;
-    epoch_t replica_scrub_start = 0;
-    ScrubMap replica_scrubmap;
-    ScrubMapBuilder replica_scrubmap_pos;
-    std::map<pg_shard_t, ScrubMap> received_maps;
-    OpRequestRef active_rep_scrub;
-    utime_t scrub_reg_stamp;  // stamp we registered for
-
-    static utime_t scrub_must_stamp() { return utime_t(0,1); }
-
-    omap_stat_t omap_stats  = (const struct omap_stat_t){ 0 };
-
-    // For async sleep
-    bool sleeping = false;
-    bool needs_sleep = true;
-    utime_t sleep_start;
-
-    // flags to indicate explicitly requested scrubs (by admin)
-    bool must_scrub, must_deep_scrub, must_repair, need_auto;
-
-    // Priority to use for scrub scheduling
-    unsigned priority = 0;
-
-    bool time_for_deep;
-    // this flag indicates whether we would like to do auto-repair of the PG or not
-    bool auto_repair;
-    // this flag indicates that we are scrubbing post repair to verify everything is fixed
-    bool check_repair;
-    // this flag indicates that if a regular scrub detects errors <= osd_scrub_auto_repair_num_errors,
-    // we should deep scrub in order to auto repair
-    bool deep_scrub_on_error;
-
-    // Maps from objects with errors to missing/inconsistent peers
-    std::map<hobject_t, std::set<pg_shard_t>> missing;
-    std::map<hobject_t, std::set<pg_shard_t>> inconsistent;
-
-    // Std::map from object with errors to good peers
-    std::map<hobject_t, std::list<std::pair<ScrubMap::object, pg_shard_t> >> authoritative;
-
-    // Cleaned std::map pending snap metadata scrub
-    ScrubMap cleaned_meta_map;
-
-    void clean_meta_map(ScrubMap &for_meta_scrub) {
-      if (end.is_max() ||
-          cleaned_meta_map.objects.empty()) {
-         cleaned_meta_map.swap(for_meta_scrub);
-      } else {
-        auto iter = cleaned_meta_map.objects.end();
-        --iter; // not empty, see if clause
-        auto begin = cleaned_meta_map.objects.begin();
-        if (iter->first.has_snapset()) {
-          ++iter;
-        } else {
-          while (iter != begin) {
-            auto next = iter--;
-            if (next->first.get_head() != iter->first.get_head()) {
-	      ++iter;
-	      break;
-            }
-          }
-        }
-        for_meta_scrub.objects.insert(begin, iter);
-        cleaned_meta_map.objects.erase(begin, iter);
-      }
-    }
-
-    // digest updates which we are waiting on
-    int num_digest_updates_pending;
-
-    // chunky scrub
-    hobject_t start, end;    // [start,end)
-    hobject_t max_end;       // Largest end that may have been sent to replicas
-    eversion_t subset_last_update;
-
-    // chunky scrub state
-    enum State {
-      INACTIVE,
-      NEW_CHUNK,
-      WAIT_PUSHES,
-      WAIT_LAST_UPDATE,
-      BUILD_MAP,
-      BUILD_MAP_DONE,
-      WAIT_REPLICAS,
-      COMPARE_MAPS,
-      WAIT_DIGEST_UPDATES,
-      FINISH,
-      BUILD_MAP_REPLICA,
-    } state;
-
-    std::unique_ptr<Scrub::Store> store;
-    // deep scrub
-    bool deep;
-    int preempt_left;
-    int preempt_divisor;
-
-    std::list<Context*> callbacks;
-    void add_callback(Context *context) {
-      callbacks.push_back(context);
-    }
-    void run_callbacks() {
-      std::list<Context*> to_run;
-      to_run.swap(callbacks);
-      for (std::list<Context*>::iterator i = to_run.begin();
-	   i != to_run.end();
-	   ++i) {
-	(*i)->complete(0);
-      }
-    }
-
-    static const char *state_string(const PG::Scrubber::State& state) {
-      const char *ret = NULL;
-      switch( state )
-      {
-        case INACTIVE: ret = "INACTIVE"; break;
-        case NEW_CHUNK: ret = "NEW_CHUNK"; break;
-        case WAIT_PUSHES: ret = "WAIT_PUSHES"; break;
-        case WAIT_LAST_UPDATE: ret = "WAIT_LAST_UPDATE"; break;
-        case BUILD_MAP: ret = "BUILD_MAP"; break;
-        case BUILD_MAP_DONE: ret = "BUILD_MAP_DONE"; break;
-        case WAIT_REPLICAS: ret = "WAIT_REPLICAS"; break;
-        case COMPARE_MAPS: ret = "COMPARE_MAPS"; break;
-        case WAIT_DIGEST_UPDATES: ret = "WAIT_DIGEST_UPDATES"; break;
-        case FINISH: ret = "FINISH"; break;
-        case BUILD_MAP_REPLICA: ret = "BUILD_MAP_REPLICA"; break;
-      }
-      return ret;
-    }
-
-    bool is_chunky_scrub_active() const { return state != INACTIVE; }
-
-    // clear all state
-    void reset() {
-      active = false;
-      waiting_on_whom.clear();
-      if (active_rep_scrub) {
-        active_rep_scrub = OpRequestRef();
-      }
-      received_maps.clear();
-
-      must_scrub = false;
-      must_deep_scrub = false;
-      must_repair = false;
-      need_auto = false;
-      time_for_deep = false;
-      auto_repair = false;
-      check_repair = false;
-      deep_scrub_on_error = false;
-
-      state = PG::Scrubber::INACTIVE;
-      start = hobject_t();
-      end = hobject_t();
-      max_end = hobject_t();
-      subset_last_update = eversion_t();
-      shallow_errors = 0;
-      deep_errors = 0;
-      fixed = 0;
-      omap_stats = (const struct omap_stat_t){ 0 };
-      deep = false;
-      run_callbacks();
-      inconsistent.clear();
-      missing.clear();
-      authoritative.clear();
-      num_digest_updates_pending = 0;
-      primary_scrubmap = ScrubMap();
-      primary_scrubmap_pos.reset();
-      replica_scrubmap = ScrubMap();
-      replica_scrubmap_pos.reset();
-      cleaned_meta_map = ScrubMap();
-      sleeping = false;
-      needs_sleep = true;
-      sleep_start = utime_t();
-    }
-
-    void create_results(const hobject_t& obj);
-    void cleanup_store(ObjectStore::Transaction *t);
-  } scrubber;
-
 protected:
-  bool scrub_after_recovery;
-
   int active_pushes;
 
-  bool scrub_can_preempt = false;
-  bool scrub_preempted = false;
+  [[nodiscard]] bool ops_blocked_by_scrub() const;
+  [[nodiscard]] Scrub::scrub_prio_t is_scrub_blocking_ops() const;
 
-  // we allow some number of preemptions of the scrub, which mean we do
-  // not block.  then we start to block.  once we start blocking, we do
-  // not stop until the scrub range is completed.
-  bool write_blocked_by_scrub(const hobject_t &soid);
-
-  /// true if the given range intersects the scrub interval in any way
-  bool range_intersects_scrub(const hobject_t &start, const hobject_t& end);
-
-  void repair_object(
-    const hobject_t &soid,
-    const std::list<std::pair<ScrubMap::object, pg_shard_t> > &ok_peers,
-    const std::set<pg_shard_t> &bad_peers);
-
-  void chunky_scrub(ThreadPool::TPHandle &handle);
-  void scrub_compare_maps();
-  /**
-   * return true if any inconsistency/missing is repaired, false otherwise
-   */
-  bool scrub_process_inconsistent();
-  bool ops_blocked_by_scrub() const;
-  void scrub_finish();
-  void scrub_clear_state(bool keep_repair = false);
-  void _scan_snaps(ScrubMap &map);
-  void _repair_oinfo_oid(ScrubMap &map);
   void _scan_rollback_obs(const std::vector<ghobject_t> &rollback_obs);
-  void _request_scrub_map(pg_shard_t replica, eversion_t version,
-                          hobject_t start, hobject_t end, bool deep,
-			  bool allow_preemption);
-  int build_scrub_map_chunk(
-    ScrubMap &map,
-    ScrubMapBuilder &pos,
-    hobject_t start, hobject_t end, bool deep,
-    ThreadPool::TPHandle &handle);
   /**
    * returns true if [begin, end) is good to scrub at this time
    * a false return value obliges the implementer to requeue scrub when the
@@ -1337,27 +1211,12 @@ protected:
    */
   virtual bool _range_available_for_scrub(
     const hobject_t &begin, const hobject_t &end) = 0;
-  virtual void scrub_snapshot_metadata(
-    ScrubMap &map,
-    const std::map<hobject_t,
-                   std::pair<std::optional<uint32_t>,
-                        std::optional<uint32_t>>> &missing_digest) { }
-  virtual void _scrub_clear_state() { }
-  virtual void _scrub_finish() { }
-  void clear_scrub_reserved();
-  void scrub_reserve_replicas();
-  void scrub_unreserve_replicas();
-  bool scrub_all_replicas_reserved() const;
 
-  void replica_scrub(
-    OpRequestRef op,
-    ThreadPool::TPHandle &handle);
-  void do_replica_scrub_map(OpRequestRef op);
-
-  void handle_scrub_reserve_request(OpRequestRef op);
-  void handle_scrub_reserve_grant(OpRequestRef op, pg_shard_t from);
-  void handle_scrub_reserve_reject(OpRequestRef op, pg_shard_t from);
-  void handle_scrub_reserve_release(OpRequestRef op);
+  /**
+   * Initiate the process that will create our scrub map for the Primary.
+   * (triggered by MSG_OSD_REP_SCRUB)
+   */
+  void replica_scrub(OpRequestRef op, ThreadPool::TPHandle &handle);
 
   // -- recovery state --
 
@@ -1382,6 +1241,7 @@ protected:
 
 public:
   int pg_stat_adjust(osd_stat_t *new_stat);
+  bool is_degraded() const { return recovery_state.is_degraded(); }
 protected:
   bool delete_needs_sleep = false;
 
@@ -1405,9 +1265,8 @@ protected:
   bool is_backfill_unfound() const { return recovery_state.is_backfill_unfound(); }
   bool is_incomplete() const { return recovery_state.is_incomplete(); }
   bool is_clean() const { return recovery_state.is_clean(); }
-  bool is_degraded() const { return recovery_state.is_degraded(); }
   bool is_undersized() const { return recovery_state.is_undersized(); }
-  bool is_scrubbing() const { return state_test(PG_STATE_SCRUBBING); }
+  bool is_scrubbing() const { return state_test(PG_STATE_SCRUBBING); } // Primary only
   bool is_remapped() const { return recovery_state.is_remapped(); }
   bool is_peered() const { return recovery_state.is_peered(); }
   bool is_recovering() const { return recovery_state.is_recovering(); }
@@ -1422,7 +1281,7 @@ protected:
   void do_pending_flush();
 
 public:
-  virtual void prepare_write(
+  void prepare_write(
     pg_info_t &info,
     pg_info_t &last_written_info,
     PastIntervals &past_intervals,
@@ -1470,10 +1329,9 @@ protected:
 
   virtual void kick_snap_trim() = 0;
   virtual void snap_trimmer_scrub_complete() = 0;
-  bool requeue_scrub(bool high_priority = false);
+
   void queue_recovery();
-  bool queue_scrub();
-  unsigned get_scrub_priority();
+  unsigned int get_scrub_priority();
 
   bool try_flush_or_schedule_async() override;
   void start_flush_on_transaction(
@@ -1515,9 +1373,47 @@ protected:
 
   // ref to recovery_state.info
   const pg_info_t &info;
+
+
+// ScrubberPasskey getters/misc:
+public:
+ const pg_info_t& get_pg_info(ScrubberPasskey) const final { return info; }
+
+ OSDService* get_pg_osd(ScrubberPasskey) const { return osd; }
+
+ void force_object_missing(ScrubberPasskey,
+                           const std::set<pg_shard_t>& peer,
+                           const hobject_t& oid,
+                           eversion_t version) final
+ {
+   recovery_state.force_object_missing(peer, oid, version);
+ }
+
+ uint64_t logical_to_ondisk_size(uint64_t logical_size) const final
+ {
+   return get_pgbackend()->be_get_ondisk_size(logical_size);
+ }
 };
 
-
-ostream& operator<<(ostream& out, const PG::BackfillInterval& bi);
+/**
+ * Initialized with a locked PG. That PG is unlocked in the
+ * destructor.
+ * Used by OsdScrub when initiating a scrub.
+ */
+class PGLockWrapper {
+ public:
+  template <typename A_PG_REF>
+  explicit PGLockWrapper(A_PG_REF&& locked_pg)
+      : m_pg{std::forward<A_PG_REF>(locked_pg)}
+  {}
+  PGRef pg() { return m_pg; }
+  ~PGLockWrapper();
+  PGLockWrapper(PGLockWrapper&& rhs) noexcept : m_pg(std::move(rhs.m_pg)) {
+    rhs.m_pg = nullptr;
+  }
+  PGLockWrapper(const PGLockWrapper& rhs) = delete;
+ private:
+  PGRef m_pg;
+};
 
 #endif

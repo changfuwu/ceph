@@ -1,7 +1,12 @@
 #include "gtest/gtest.h"
 
 #include "common/WorkQueue.h"
+
+#include <iostream> // for std::cout
+
 #include "common/ceph_argparse.h"
+
+using namespace std;
 
 TEST(WorkQueue, StartStop)
 {
@@ -52,4 +57,45 @@ TEST(WorkQueue, Resize)
 
   sleep(1);
   tp.stop();
+}
+
+class twq : public ThreadPool::WorkQueue<int> {
+public:
+    twq(time_t timeout, time_t suicide_timeout, ThreadPool *tp)
+        : ThreadPool::WorkQueue<int>("test_wq", ceph::make_timespan(timeout), ceph::make_timespan(suicide_timeout), tp) {}
+
+    bool _enqueue(int* item) override {
+        return true;
+    }
+    void _dequeue(int* item) override {
+        ceph_abort();
+    }
+    bool _empty() override {
+        return true;
+    }
+    int *_dequeue() override {
+        return nullptr;
+    }
+    void _process(int *osr, ThreadPool::TPHandle &handle) override {
+    }
+    void _process_finish(int *osr) override {
+    }
+    void _clear() override {
+    }
+};
+
+TEST(WorkQueue, change_timeout){
+    ThreadPool tp(g_ceph_context, "bar", "tp_bar", 2, "filestore_op_threads");
+    tp.start();
+    twq wq(2, 20, &tp);
+    // check timeout and suicide
+    ASSERT_EQ(ceph::make_timespan(2), wq.timeout_interval.load());
+    ASSERT_EQ(ceph::make_timespan(20), wq.suicide_interval.load());
+
+    // change the timeout and suicide and then check them
+    wq.set_timeout(4);
+    wq.set_suicide_timeout(40);
+    ASSERT_EQ(ceph::make_timespan(4), wq.timeout_interval.load());
+    ASSERT_EQ(ceph::make_timespan(40), wq.suicide_interval.load());
+    tp.stop();
 }

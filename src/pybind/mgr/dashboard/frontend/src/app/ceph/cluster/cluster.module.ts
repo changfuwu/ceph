@@ -3,24 +3,41 @@ import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
 
-import { TreeModule } from 'angular-tree-component';
-import { NgBootstrapFormValidationModule } from 'ng-bootstrap-form-validation';
-import { AlertModule } from 'ngx-bootstrap/alert';
-import { BsDatepickerModule } from 'ngx-bootstrap/datepicker';
-import { BsDropdownModule } from 'ngx-bootstrap/dropdown';
-import { ModalModule } from 'ngx-bootstrap/modal';
-import { TabsModule } from 'ngx-bootstrap/tabs';
-import { TimepickerModule } from 'ngx-bootstrap/timepicker';
-import { TooltipModule } from 'ngx-bootstrap/tooltip';
-import { TypeaheadModule } from 'ngx-bootstrap/typeahead';
+import {
+  ComboBoxModule,
+  DropdownModule,
+  CheckboxModule,
+  ButtonModule,
+  GridModule,
+  ProgressIndicatorModule,
+  InputModule,
+  ModalModule,
+  TreeviewModule,
+  ListModule,
+  ToggletipModule
+} from 'carbon-components-angular';
 
-import { OrchestratorDocModalComponent } from '../../shared/components/orchestrator-doc-modal/orchestrator-doc-modal.component';
-import { SharedModule } from '../../shared/shared.module';
+import {
+  NgbActiveModal,
+  NgbDatepickerModule,
+  NgbDropdownModule,
+  NgbNavModule,
+  NgbPopoverModule,
+  NgbProgressbarModule,
+  NgbTimepickerModule,
+  NgbTooltipModule,
+  NgbTypeaheadModule
+} from '@ng-bootstrap/ng-bootstrap';
+import { PipesModule } from '~/app/shared/pipes/pipes.module';
+
+import { SharedModule } from '~/app/shared/shared.module';
 import { PerformanceCounterModule } from '../performance-counter/performance-counter.module';
 import { CephSharedModule } from '../shared/ceph-shared.module';
 import { ConfigurationDetailsComponent } from './configuration/configuration-details/configuration-details.component';
 import { ConfigurationFormComponent } from './configuration/configuration-form/configuration-form.component';
 import { ConfigurationComponent } from './configuration/configuration.component';
+import { CreateClusterReviewComponent } from './create-cluster/create-cluster-review.component';
+import { CreateClusterComponent } from './create-cluster/create-cluster.component';
 import { CrushmapComponent } from './crushmap/crushmap.component';
 import { HostDetailsComponent } from './hosts/host-details/host-details.component';
 import { HostFormComponent } from './hosts/host-form/host-form.component';
@@ -34,66 +51,72 @@ import { OsdCreationPreviewModalComponent } from './osd/osd-creation-preview-mod
 import { OsdDetailsComponent } from './osd/osd-details/osd-details.component';
 import { OsdDevicesSelectionGroupsComponent } from './osd/osd-devices-selection-groups/osd-devices-selection-groups.component';
 import { OsdDevicesSelectionModalComponent } from './osd/osd-devices-selection-modal/osd-devices-selection-modal.component';
+import { OsdFlagsIndivModalComponent } from './osd/osd-flags-indiv-modal/osd-flags-indiv-modal.component';
 import { OsdFlagsModalComponent } from './osd/osd-flags-modal/osd-flags-modal.component';
 import { OsdFormComponent } from './osd/osd-form/osd-form.component';
 import { OsdListComponent } from './osd/osd-list/osd-list.component';
-import { OsdPerformanceHistogramComponent } from './osd/osd-performance-histogram/osd-performance-histogram.component';
 import { OsdPgScrubModalComponent } from './osd/osd-pg-scrub-modal/osd-pg-scrub-modal.component';
 import { OsdRecvSpeedModalComponent } from './osd/osd-recv-speed-modal/osd-recv-speed-modal.component';
 import { OsdReweightModalComponent } from './osd/osd-reweight-modal/osd-reweight-modal.component';
 import { OsdScrubModalComponent } from './osd/osd-scrub-modal/osd-scrub-modal.component';
 import { ActiveAlertListComponent } from './prometheus/active-alert-list/active-alert-list.component';
-import { MonitoringListComponent } from './prometheus/monitoring-list/monitoring-list.component';
+import { PrometheusTabsComponent } from './prometheus/prometheus-tabs/prometheus-tabs.component';
 import { RulesListComponent } from './prometheus/rules-list/rules-list.component';
 import { SilenceFormComponent } from './prometheus/silence-form/silence-form.component';
 import { SilenceListComponent } from './prometheus/silence-list/silence-list.component';
 import { SilenceMatcherModalComponent } from './prometheus/silence-matcher-modal/silence-matcher-modal.component';
+import { PlacementPipe } from './services/placement.pipe';
 import { ServiceDaemonListComponent } from './services/service-daemon-list/service-daemon-list.component';
 import { ServiceDetailsComponent } from './services/service-details/service-details.component';
+import { ServiceFormComponent } from './services/service-form/service-form.component';
 import { ServicesComponent } from './services/services.component';
+import { TelemetryComponent } from './telemetry/telemetry.component';
+import { UpgradeComponent } from './upgrade/upgrade.component';
+import { UpgradeStartModalComponent } from './upgrade/upgrade-form/upgrade-start-modal.component';
+import { UpgradeProgressComponent } from './upgrade/upgrade-progress/upgrade-progress.component';
+import { MultiClusterComponent } from './multi-cluster/multi-cluster.component';
+import { MultiClusterFormComponent } from './multi-cluster/multi-cluster-form/multi-cluster-form.component';
+import { MultiClusterListComponent } from './multi-cluster/multi-cluster-list/multi-cluster-list.component';
+import { DashboardV3Module } from '../dashboard-v3/dashboard-v3.module';
+import { MultiClusterDetailsComponent } from './multi-cluster/multi-cluster-details/multi-cluster-details.component';
 
 @NgModule({
-  entryComponents: [
-    OsdDetailsComponent,
-    OsdScrubModalComponent,
-    OsdFlagsModalComponent,
-    OsdRecvSpeedModalComponent,
-    OsdReweightModalComponent,
-    OsdPgScrubModalComponent,
-    OsdReweightModalComponent,
-    SilenceMatcherModalComponent,
-    OsdDevicesSelectionModalComponent,
-    OsdCreationPreviewModalComponent,
-    OrchestratorDocModalComponent
-  ],
   imports: [
     CommonModule,
     PerformanceCounterModule,
-    TabsModule.forRoot(),
+    NgbNavModule,
     SharedModule,
     RouterModule,
     FormsModule,
     ReactiveFormsModule,
-    BsDropdownModule.forRoot(),
-    BsDatepickerModule.forRoot(),
-    ModalModule.forRoot(),
-    AlertModule.forRoot(),
-    TooltipModule.forRoot(),
+    NgbTooltipModule,
     MgrModulesModule,
-    TypeaheadModule.forRoot(),
-    TimepickerModule.forRoot(),
-    TreeModule.forRoot(),
-    BsDatepickerModule.forRoot(),
-    NgBootstrapFormValidationModule,
-    CephSharedModule
+    NgbTypeaheadModule,
+    NgbTimepickerModule,
+    TreeviewModule,
+    CephSharedModule,
+    NgbDatepickerModule,
+    NgbPopoverModule,
+    NgbDropdownModule,
+    PipesModule,
+    NgbProgressbarModule,
+    DashboardV3Module,
+    ComboBoxModule,
+    DropdownModule,
+    CheckboxModule,
+    GridModule,
+    ProgressIndicatorModule,
+    ButtonModule,
+    InputModule,
+    ModalModule,
+    ListModule,
+    ToggletipModule
   ],
   declarations: [
-    HostsComponent,
     MonitorComponent,
     ConfigurationComponent,
     OsdListComponent,
     OsdDetailsComponent,
-    OsdPerformanceHistogramComponent,
     OsdScrubModalComponent,
     OsdFlagsModalComponent,
     HostDetailsComponent,
@@ -104,7 +127,6 @@ import { ServicesComponent } from './services/services.component';
     LogsComponent,
     OsdRecvSpeedModalComponent,
     OsdPgScrubModalComponent,
-    ActiveAlertListComponent,
     OsdRecvSpeedModalComponent,
     SilenceFormComponent,
     SilenceListComponent,
@@ -119,10 +141,24 @@ import { ServicesComponent } from './services/services.component';
     OsdCreationPreviewModalComponent,
     RulesListComponent,
     ActiveAlertListComponent,
-    MonitoringListComponent,
-    HostFormComponent,
     ServiceDetailsComponent,
-    ServiceDaemonListComponent
-  ]
+    ServiceDaemonListComponent,
+    TelemetryComponent,
+    PrometheusTabsComponent,
+    ServiceFormComponent,
+    OsdFlagsIndivModalComponent,
+    PlacementPipe,
+    CreateClusterComponent,
+    CreateClusterReviewComponent,
+    UpgradeComponent,
+    UpgradeStartModalComponent,
+    UpgradeProgressComponent,
+    MultiClusterComponent,
+    MultiClusterFormComponent,
+    MultiClusterListComponent,
+    MultiClusterDetailsComponent,
+    HostsComponent
+  ],
+  providers: [NgbActiveModal]
 })
 export class ClusterModule {}

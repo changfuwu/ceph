@@ -21,7 +21,7 @@ sub get_timestamp {
    if ($min < 10) { $min = "0$min"; }
    if ($sec < 10) { $sec = "0$sec"; }
    $year=$year+1900;
-   return $year . '_' . $mon . '_' . $mday . '_' . $hour . '_' . $min . '_' . $sec;
+   return $year . '-' . $mon . '-' . $mday . '-' . $hour . '-' . $min . '-' . $sec;
 }
 
 # Function to check if radosgw is already running
@@ -134,15 +134,28 @@ sub purge_data
     return 0;
 }
 
+# Read PRETTY_NAME from /etc/os-release
+sub os_pretty_name
+{
+    open(FH, '<', '/etc/os-release') or die $!;
+    while (my $line = <FH>) {
+        chomp $line;
+        if ($line =~ /^\s*PRETTY_NAME=\"?([^"]*)\"?/) {
+            return $1;
+        }
+    }
+    close(FH);
+}
+
+
 # Function to get the Ceph and distro info
 sub ceph_os_info
 {
         my $ceph_v = get_command_output ( "ceph -v" );
         my @ceph_arr = split(" ",$ceph_v);
         $ceph_v = "Ceph Version:   $ceph_arr[2]";
-        my $os_distro = get_command_output ( "lsb_release -d" );
-        my @os_arr = split(":",$os_distro);
-        $os_distro = "Linux Flavor:$os_arr[1]";
+        my $os_distro = os_pretty_name();
+        $os_distro = "Linux Flavor:$os_distro";
         return ($ceph_v, $os_distro);
 }
 
@@ -182,11 +195,12 @@ sub run_s3
                 host                  => $hostname,
                 secure                => 0,
                 retry                 => 1,
+                dns_bucket_names      => 0,
             }
       );
     }
 
-our $bucketname = 'buck_'.get_timestamp();
+our $bucketname = 'buck-'.get_timestamp();
 # create a new bucket (the test bucket)
 our $bucket = $s3->add_bucket( { bucket => $bucketname } )
       or die $s3->err. "bucket $bucketname create failed\n". $s3->errstr;

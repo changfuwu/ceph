@@ -1,7 +1,7 @@
 import argparse
 from ceph_volume.util import arg_validators
 
-def create_parser(prog, description):
+def create_parser(prog: str, description: str) -> argparse.ArgumentParser:
     """
     Both prepare and create share the same parser, those are defined here to
     avoid duplication
@@ -12,23 +12,29 @@ def create_parser(prog, description):
         description=description,
     )
     parser.add_argument(
+        '--objectstore',
+        dest='objectstore',
+        help='The OSD objectstore.',
+        default='bluestore',
+        choices=['bluestore', 'seastore'],
+        type=str,
+    ),
+    parser.add_argument(
         '--data',
         required=True,
-    type=arg_validators.ValidDevice(as_string=True),
+        type=arg_validators.ValidRawDevice(as_string=True),
         help='a raw device to use for the OSD',
     )
     parser.add_argument(
         '--bluestore',
         action='store_true',
-        help='Use BlueStore backend')
+        help='Use BlueStore backend. (DEPRECATED: use --objectstore instead)'
+    )
     parser.add_argument(
         '--crush-device-class',
         dest='crush_device_class',
         help='Crush device class to assign this OSD to',
-    )
-    parser.add_argument(
-        '--cluster-fsid',
-        help='Specify the cluster fsid, useful when no ceph.conf is available',
+        default=""
     )
     parser.add_argument(
         '--no-tmpfs',
@@ -38,11 +44,30 @@ def create_parser(prog, description):
     parser.add_argument(
         '--block.db',
         dest='block_db',
-        help='Path to bluestore block.db block device'
+        help='Path to bluestore block.db block device',
+        type=arg_validators.ValidRawDevice(as_string=True)
     )
     parser.add_argument(
         '--block.wal',
         dest='block_wal',
-        help='Path to bluestore block.wal block device'
+        help='Path to bluestore block.wal block device',
+        type=arg_validators.ValidRawDevice(as_string=True)
+    )
+    parser.add_argument(
+        '--dmcrypt',
+        action=arg_validators.DmcryptAction,
+        help='Enable device encryption via dm-crypt',
+    )
+    parser.add_argument(
+        '--with-tpm',
+        dest='with_tpm',
+        help='Whether encrypted OSDs should be enrolled with TPM.',
+        action='store_true'
+    ),
+    parser.add_argument(
+        '--osd-id',
+        help='Reuse an existing OSD id',
+        default=None,
+        type=arg_validators.valid_osd_id,
     )
     return parser

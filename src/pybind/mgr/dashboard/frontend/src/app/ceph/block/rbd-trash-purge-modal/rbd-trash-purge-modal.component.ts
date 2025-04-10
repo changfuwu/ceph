@@ -1,23 +1,24 @@
 import { Component, OnInit } from '@angular/core';
 
-import { BsModalRef } from 'ngx-bootstrap/modal';
+import { BaseModal } from 'carbon-components-angular';
 
-import { PoolService } from '../../../shared/api/pool.service';
-import { RbdService } from '../../../shared/api/rbd.service';
-import { CdFormBuilder } from '../../../shared/forms/cd-form-builder';
-import { CdFormGroup } from '../../../shared/forms/cd-form-group';
-import { FinishedTask } from '../../../shared/models/finished-task';
-import { Permission } from '../../../shared/models/permissions';
-import { AuthStorageService } from '../../../shared/services/auth-storage.service';
-import { TaskWrapperService } from '../../../shared/services/task-wrapper.service';
-import { Pool } from '../../pool/pool';
+import { Pool } from '~/app/ceph/pool/pool';
+import { PoolService } from '~/app/shared/api/pool.service';
+import { RbdService } from '~/app/shared/api/rbd.service';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { CdFormBuilder } from '~/app/shared/forms/cd-form-builder';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { FinishedTask } from '~/app/shared/models/finished-task';
+import { Permission } from '~/app/shared/models/permissions';
+import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
+import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 
 @Component({
   selector: 'cd-rbd-trash-purge-modal',
   templateUrl: './rbd-trash-purge-modal.component.html',
   styleUrls: ['./rbd-trash-purge-modal.component.scss']
 })
-export class RbdTrashPurgeModalComponent implements OnInit {
+export class RbdTrashPurgeModalComponent extends BaseModal implements OnInit {
   poolPermission: Permission;
   purgeForm: CdFormGroup;
   pools: any[];
@@ -25,11 +26,12 @@ export class RbdTrashPurgeModalComponent implements OnInit {
   constructor(
     private authStorageService: AuthStorageService,
     private rbdService: RbdService,
-    public modalRef: BsModalRef,
+    public actionLabels: ActionLabelsI18n,
     private fb: CdFormBuilder,
     private poolService: PoolService,
     private taskWrapper: TaskWrapperService
   ) {
+    super();
     this.poolPermission = this.authStorageService.getPermissions().pool;
   }
 
@@ -60,14 +62,13 @@ export class RbdTrashPurgeModalComponent implements OnInit {
         }),
         call: this.rbdService.purgeTrash(poolName)
       })
-      .subscribe(
-        undefined,
-        () => {
+      .subscribe({
+        error: () => {
           this.purgeForm.setErrors({ cdSubmitButton: true });
         },
-        () => {
-          this.modalRef.hide();
+        complete: () => {
+          this.closeModal();
         }
-      );
+      });
   }
 }

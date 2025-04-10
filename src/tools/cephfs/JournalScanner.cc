@@ -11,14 +11,14 @@
  * foundation.  see file copying.
  */
 
+#include "JournalScanner.h"
 
+#include "common/debug.h"
 #include "include/rados/librados.hpp"
 #include "mds/JournalPointer.h"
 
 #include "mds/events/ESubtreeMap.h"
 #include "mds/PurgeQueue.h"
-
-#include "JournalScanner.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -194,8 +194,15 @@ int JournalScanner::scan_events()
       }
 
       objects_missing.push_back(obj_offset);
-      gap = true;
-      gap_start = read_offset;
+      if (!gap) {
+        gap_start = read_offset;
+        gap = true;
+      }
+      if (read_buf.length() > 0) {
+        read_offset += read_buf.length();
+        read_buf.clear();
+      }
+      read_offset += object_size - offset_in_obj;
       continue;
     } else {
       dout(4) << "Read 0x" << std::hex << this_object.length() << std::dec
@@ -229,7 +236,8 @@ int JournalScanner::scan_events()
         }
       } while (read_buf.length() >= sizeof(JournalStream::sentinel));
       dout(4) << "read_buf size is " << read_buf.length() << dendl;
-    } else {
+    } 
+    {
       dout(10) << "Parsing data, 0x" << std::hex << read_buf.length() << std::dec << " bytes available" << dendl;
       while(true) {
         // TODO: detect and handle legacy format journals: can do many things

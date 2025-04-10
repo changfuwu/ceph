@@ -15,8 +15,10 @@
 #ifndef ASYNC_RESERVER_H
 #define ASYNC_RESERVER_H
 
-#include "common/Finisher.h"
 #include "common/Formatter.h"
+#include "common/ceph_context.h"
+#include "common/ceph_mutex.h"
+#include "include/Context.h"
 
 #define rdout(x) lgeneric_subdout(cct,reserver,x)
 
@@ -27,10 +29,10 @@
  * linear with respect to the total number of priorities used
  * over all time.
  */
-template <typename T>
+template <typename T, typename F>
 class AsyncReserver {
   CephContext *cct;
-  Finisher *f;
+  F *f;
   unsigned max_allowed;
   unsigned min_priority;
   ceph::mutex lock = ceph::make_mutex("AsyncReserver::lock");
@@ -111,8 +113,10 @@ class AsyncReserver {
       if (it->second.empty()) {
 	queues.erase(it);
       }
-      f->queue(p.grant);
-      p.grant = nullptr;
+      if (p.grant) {
+	f->queue(p.grant);
+	p.grant = nullptr;
+      }
       in_progress[p.item] = p;
       if (p.preempt) {
 	preempt_by_prio.insert(std::make_pair(p.prio, p.item));
@@ -122,7 +126,7 @@ class AsyncReserver {
 public:
   AsyncReserver(
     CephContext *cct,
-    Finisher *f,
+    F *f,
     unsigned max_allowed,
     unsigned min_priority = 0)
     : cct(cct),
@@ -263,6 +267,38 @@ public:
     queue_pointers.insert(std::make_pair(item,
 				    std::make_pair(prio,--(queues[prio]).end())));
     do_queues();
+  }
+
+  /**
+   * The synchronous version of request_reservation
+   * Used to handle requests from OSDs that do not support the async interface
+   * to scrub replica reservations, but still must count towards the max
+   * active reservations.
+   */
+  bool request_reservation_or_fail(
+      T item		     ///< [in] reservation key
+  )
+  {
+    std::lock_guard l(lock);
+    ceph_assert(!queue_pointers.count(item) && !in_progress.count(item));
+
+    if (in_progress.size() >= max_allowed) {
+      rdout(10) << fmt::format("{}: request: {} denied", __func__, item)
+		<< dendl;
+      return false;
+    }
+
+    const unsigned prio = UINT_MAX;
+    Reservation r(item, prio, nullptr, nullptr);
+    queues[prio].push_back(r);
+    queue_pointers.insert(std::make_pair(
+	item, std::make_pair(prio, --(queues[prio]).end())));
+    do_queues();
+    // the new request should be in_progress now
+    ceph_assert(in_progress.count(item));
+    rdout(10) << fmt::format("{}: request: {} granted", __func__, item)
+	      << dendl;
+    return true;
   }
 
   /**

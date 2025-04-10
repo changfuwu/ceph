@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <ctime>
 #include <regex>
+#include <boost/algorithm/string/replace.hpp>
 
 #include "common/errno.h"
 #include "common/Formatter.h"
@@ -16,6 +17,8 @@
 #include "rgw_string.h"
 
 #include "rgw_common.h"
+#include "rgw_metadata.h"
+#include "rgw_metadata_lister.h"
 #include "rgw_tools.h"
 #include "rgw_role.h"
 
@@ -24,241 +27,240 @@
 
 #define dout_subsys ceph_subsys_rgw
 
+using namespace std;
 
-const string RGWRole::role_name_oid_prefix = "role_names.";
-const string RGWRole::role_oid_prefix = "roles.";
-const string RGWRole::role_path_oid_prefix = "role_paths.";
+void RGWRoleInfo::dump(Formatter *f) const
+{
+  encode_json("RoleId", id , f);
+  std::string role_name;
+  if (tenant.empty()) {
+    role_name = name;
+  } else {
+    role_name = tenant + '$' + name;
+  }
+  encode_json("RoleName", role_name , f);
+  encode_json("Path", path, f);
+  encode_json("Arn", arn, f);
+  encode_json("CreateDate", creation_date, f);
+  encode_json("Description", description, f);
+  encode_json("MaxSessionDuration", max_session_duration, f);
+  encode_json("AssumeRolePolicyDocument", trust_policy, f);
+  encode_json("AccountId", account_id, f);
+  if (!perm_policy_map.empty()) {
+    f->open_array_section("PermissionPolicies");
+    for (const auto& it : perm_policy_map) {
+      f->open_object_section("Policy");
+      encode_json("PolicyName", it.first, f);
+      encode_json("PolicyValue", it.second, f);
+      f->close_section();
+    }
+    f->close_section();
+  }
+  if (!managed_policies.arns.empty()) {
+    f->open_array_section("ManagedPermissionPolicies");
+    for (const auto& arn : managed_policies.arns) {
+      encode_json("PolicyArn", arn, f);
+    }
+    f->close_section();
+  }
+  if (!tags.empty()) {
+    f->open_array_section("Tags");
+    for (const auto& it : tags) {
+      f->open_object_section("Tag");
+      encode_json("Key", it.first, f);
+      encode_json("Value", it.second, f);
+      f->close_section();
+    }
+    f->close_section();
+  }
+}
+
+void RGWRoleInfo::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("RoleId", id, obj);
+  JSONDecoder::decode_json("RoleName", name, obj);
+  JSONDecoder::decode_json("Path", path, obj);
+  JSONDecoder::decode_json("Arn", arn, obj);
+  JSONDecoder::decode_json("CreateDate", creation_date, obj);
+  JSONDecoder::decode_json("Description", description, obj);
+  JSONDecoder::decode_json("MaxSessionDuration", max_session_duration, obj);
+  JSONDecoder::decode_json("AssumeRolePolicyDocument", trust_policy, obj);
+  JSONDecoder::decode_json("AccountId", account_id, obj);
+
+  auto tags_iter = obj->find_first("Tags");
+  if (!tags_iter.end()) {
+    JSONObj* tags_json = *tags_iter;
+    auto iter = tags_json->find_first();
+
+    for (; !iter.end(); ++iter) {
+      std::string key, val;
+      JSONDecoder::decode_json("Key", key, *iter);
+      JSONDecoder::decode_json("Value", val, *iter);
+      this->tags.emplace(key, val);
+    }
+  }
+
+  if (auto perm_policy_iter = obj->find_first("PermissionPolicies");
+      !perm_policy_iter.end()) {
+    JSONObj* perm_policies = *perm_policy_iter;
+    auto iter = perm_policies->find_first();
+
+    for (; !iter.end(); ++iter) {
+      std::string policy_name, policy_val;
+      JSONDecoder::decode_json("PolicyName", policy_name, *iter);
+      JSONDecoder::decode_json("PolicyValue", policy_val, *iter);
+      this->perm_policy_map.emplace(policy_name, policy_val);
+    }
+  }
+
+  if (auto p = obj->find_first("ManagedPermissionPolicies"); !p.end()) {
+    for (auto iter = (*p)->find_first(); !iter.end(); ++iter) {
+      std::string arn = (*iter)->get_data();
+      this->managed_policies.arns.insert(std::move(arn));
+    }
+  }
+
+  if (auto pos = name.find('$'); pos != std::string::npos) {
+    tenant = name.substr(0, pos);
+    name = name.substr(pos+1);
+  }
+}
+
+namespace rgw::sal {
+
 const string RGWRole::role_arn_prefix = "arn:aws:iam::";
 
-int RGWRole::store_info(bool exclusive)
+RGWRole::RGWRole(std::string name,
+              std::string tenant,
+              rgw_account_id account_id,
+              std::string path,
+              std::string trust_policy,
+              std::string description,
+              std::string max_session_duration_str,
+              std::multimap<std::string,std::string> tags)
 {
-  using ceph::encode;
-  string oid = get_info_oid_prefix() + id;
-
-  bufferlist bl;
-  encode(*this, bl);
-
-  auto svc = ctl->svc;
-
-  auto obj_ctx = ctl->svc->sysobj->init_obj_ctx();
-  return rgw_put_system_obj(obj_ctx, svc->zone->get_zone_params().roles_pool, oid,
-                            bl, exclusive, NULL, real_time(), NULL);
+  info.name = std::move(name);
+  info.account_id = std::move(account_id);
+  info.path = std::move(path);
+  info.trust_policy = std::move(trust_policy);
+  info.tenant = std::move(tenant);
+  info.tags = std::move(tags);
+  if (this->info.path.empty())
+    this->info.path = "/";
+  extract_name_tenant(this->info.name);
+  info.description = std::move(description);
+  if (max_session_duration_str.empty()) {
+    info.max_session_duration = SESSION_DURATION_MIN;
+  } else {
+    info.max_session_duration = std::stoull(max_session_duration_str);
+  }
+  info.mtime = real_time();
 }
 
-int RGWRole::store_name(bool exclusive)
+RGWRole::RGWRole(std::string id)
 {
-  RGWNameToId nameToId;
-  nameToId.obj_id = id;
-
-  string oid = tenant + get_names_oid_prefix() + name;
-
-  bufferlist bl;
-  using ceph::encode;
-  encode(nameToId, bl);
-
-  auto svc = ctl->svc;
-
-  auto obj_ctx = svc->sysobj->init_obj_ctx();
-  return rgw_put_system_obj(obj_ctx, svc->zone->get_zone_params().roles_pool, oid,
-              bl, exclusive, NULL, real_time(), NULL);
+  info.id = std::move(id);
 }
 
-int RGWRole::store_path(bool exclusive)
+bool RGWRole::validate_max_session_duration(const DoutPrefixProvider* dpp)
 {
-  string oid = tenant + get_path_oid_prefix() + path + get_info_oid_prefix() + id;
-
-  auto svc = ctl->svc;
-
-  bufferlist bl;
-  auto obj_ctx = svc->sysobj->init_obj_ctx();
-  return rgw_put_system_obj(obj_ctx, svc->zone->get_zone_params().roles_pool, oid,
-              bl, exclusive, NULL, real_time(), NULL);
+  if (info.max_session_duration < SESSION_DURATION_MIN ||
+          info.max_session_duration > SESSION_DURATION_MAX) {
+    ldpp_dout(dpp, 0) << "ERROR: Invalid session duration, should be between 3600 and 43200 seconds " << dendl;
+    return false;
+  }
+  return true;
 }
 
-int RGWRole::create(bool exclusive)
+bool RGWRole::validate_input(const DoutPrefixProvider* dpp)
 {
-  int ret;
+  if (info.name.length() > MAX_ROLE_NAME_LEN) {
+    ldpp_dout(dpp, 0) << "ERROR: Invalid name length " << dendl;
+    return false;
+  }
 
-  if (! validate_input()) {
+  if (info.path.length() > MAX_PATH_NAME_LEN) {
+    ldpp_dout(dpp, 0) << "ERROR: Invalid path length " << dendl;
+    return false;
+  }
+
+  std::regex regex_name("[A-Za-z0-9:=,.@-]+");
+  if (! std::regex_match(info.name, regex_name)) {
+    ldpp_dout(dpp, 0) << "ERROR: Invalid chars in name " << dendl;
+    return false;
+  }
+
+  std::regex regex_path("(/[!-~]+/)|(/)");
+  if (! std::regex_match(info.path,regex_path)) {
+    ldpp_dout(dpp, 0) << "ERROR: Invalid chars in path " << dendl;
+    return false;
+  }
+
+  if (!validate_max_session_duration(dpp)) {
+    return false;
+  }
+  return true;
+}
+
+void RGWRole::extract_name_tenant(const std::string& str) {
+  if (auto pos = str.find('$');
+      pos != std::string::npos) {
+    info.tenant = str.substr(0, pos);
+    info.name = str.substr(pos+1);
+  }
+}
+
+int RGWRole::create(const DoutPrefixProvider *dpp, const std::string& role_id, optional_yield y)
+{
+  if (! validate_input(dpp)) {
     return -EINVAL;
   }
 
-  /* check to see the name is not used */
-  ret = read_id(name, tenant, id);
-  if (exclusive && ret == 0) {
-    ldout(cct, 0) << "ERROR: name " << name << " already in use for role id "
-                    << id << dendl;
-    return -EEXIST;
-  } else if ( ret < 0 && ret != -ENOENT) {
-    ldout(cct, 0) << "failed reading role id  " << id << ": "
-                  << cpp_strerror(-ret) << dendl;
-    return ret;
+  if (!role_id.empty()) {
+    info.id = role_id;
   }
 
-  /* create unique id */
-  uuid_d new_uuid;
-  char uuid_str[37];
-  new_uuid.generate_random();
-  new_uuid.print(uuid_str);
-  id = uuid_str;
+  if (info.id.empty()) {
+    /* create unique id */
+    uuid_d new_uuid;
+    char uuid_str[37];
+    new_uuid.generate_random();
+    new_uuid.print(uuid_str);
+    info.id = uuid_str;
+  }
 
   //arn
-  arn = role_arn_prefix + tenant + ":role" + path + name;
+  std::string_view account = !info.account_id.empty() ? info.account_id : info.tenant;
+  info.arn = string_cat_reserve(role_arn_prefix, account, ":role", info.path, info.name);
 
-  // Creation time
-  real_clock::time_point t = real_clock::now();
+  if (info.creation_date.empty()) {
+    // Creation time
+    real_clock::time_point t = real_clock::now();
 
-  struct timeval tv;
-  real_clock::to_timeval(t, tv);
+    struct timeval tv;
+    real_clock::to_timeval(t, tv);
 
-  char buf[30];
-  struct tm result;
-  gmtime_r(&tv.tv_sec, &result);
-  strftime(buf,30,"%Y-%m-%dT%H:%M:%S", &result);
-  sprintf(buf + strlen(buf),".%dZ",(int)tv.tv_usec/1000);
-  creation_date.assign(buf, strlen(buf));
-
-  auto svc = ctl->svc;
-
-  auto& pool = svc->zone->get_zone_params().roles_pool;
-  ret = store_info(exclusive);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR:  storing role info in pool: " << pool.name << ": "
-                  << id << ": " << cpp_strerror(-ret) << dendl;
-    return ret;
+    char buf[30];
+    struct tm result;
+    gmtime_r(&tv.tv_sec, &result);
+    strftime(buf,30,"%Y-%m-%dT%H:%M:%S", &result);
+    sprintf(buf + strlen(buf),".%03dZ",(int)tv.tv_usec/1000);
+    info.creation_date.assign(buf, strlen(buf));
   }
 
-  ret = store_name(exclusive);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR: storing role name in pool: " << pool.name << ": "
-                  << name << ": " << cpp_strerror(-ret) << dendl;
-
-    //Delete the role info that was stored in the previous call
-    string oid = get_info_oid_prefix() + id;
-    int info_ret = rgw_delete_system_obj(svc->sysobj, pool, oid, NULL);
-    if (info_ret < 0) {
-      ldout(cct, 0) << "ERROR: cleanup of role id from pool: " << pool.name << ": "
-                  << id << ": " << cpp_strerror(-info_ret) << dendl;
-    }
-    return ret;
-  }
-
-  ret = store_path(exclusive);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR: storing role path in pool: " << pool.name << ": "
-                  << path << ": " << cpp_strerror(-ret) << dendl;
-    //Delete the role info that was stored in the previous call
-    string oid = get_info_oid_prefix() + id;
-    int info_ret = rgw_delete_system_obj(svc->sysobj, pool, oid, NULL);
-    if (info_ret < 0) {
-      ldout(cct, 0) << "ERROR: cleanup of role id from pool: " << pool.name << ": "
-                  << id << ": " << cpp_strerror(-info_ret) << dendl;
-    }
-    //Delete role name that was stored in previous call
-    oid = tenant + get_names_oid_prefix() + name;
-    int name_ret = rgw_delete_system_obj(svc->sysobj, pool, oid, NULL);
-    if (name_ret < 0) {
-      ldout(cct, 0) << "ERROR: cleanup of role name from pool: " << pool.name << ": "
-                  << name << ": " << cpp_strerror(-name_ret) << dendl;
-    }
-    return ret;
-  }
-  return 0;
-}
-
-int RGWRole::delete_obj()
-{
-  auto svc = ctl->svc;
-  auto& pool = svc->zone->get_zone_params().roles_pool;
-
-  int ret = read_name();
-  if (ret < 0) {
-    return ret;
-  }
-
-  ret = read_info();
-  if (ret < 0) {
-    return ret;
-  }
-
-  if (! perm_policy_map.empty()) {
-    return -ERR_DELETE_CONFLICT;
-  }
-
-  // Delete id
-  string oid = get_info_oid_prefix() + id;
-  ret = rgw_delete_system_obj(svc->sysobj, pool, oid, NULL);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR: deleting role id from pool: " << pool.name << ": "
-                  << id << ": " << cpp_strerror(-ret) << dendl;
-  }
-
-  // Delete name
-  oid = tenant + get_names_oid_prefix() + name;
-  ret = rgw_delete_system_obj(svc->sysobj, pool, oid, NULL);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR: deleting role name from pool: " << pool.name << ": "
-                  << name << ": " << cpp_strerror(-ret) << dendl;
-  }
-
-  // Delete path
-  oid = tenant + get_path_oid_prefix() + path + get_info_oid_prefix() + id;
-  ret = rgw_delete_system_obj(svc->sysobj, pool, oid, NULL);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR: deleting role path from pool: " << pool.name << ": "
-                  << path << ": " << cpp_strerror(-ret) << dendl;
-  }
-  return ret;
-}
-
-int RGWRole::get()
-{
-  int ret = read_name();
-  if (ret < 0) {
-    return ret;
-  }
-
-  ret = read_info();
-  if (ret < 0) {
-    return ret;
-  }
-
-  return 0;
-}
-
-int RGWRole::get_by_id()
-{
-  int ret = read_info();
-  if (ret < 0) {
-    return ret;
-  }
-
-  return 0;
-}
-
-int RGWRole::update()
-{
-  auto& pool = ctl->svc->zone->get_zone_params().roles_pool;
-
-  int ret = store_info(false);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR:  storing info in pool: " << pool.name << ": "
-                  << id << ": " << cpp_strerror(-ret) << dendl;
-    return ret;
-  }
-
-  return 0;
+  constexpr bool exclusive = true;
+  return store_info(dpp, exclusive, y);
 }
 
 void RGWRole::set_perm_policy(const string& policy_name, const string& perm_policy)
 {
-  perm_policy_map[policy_name] = perm_policy;
+  info.perm_policy_map[policy_name] = perm_policy;
 }
 
 vector<string> RGWRole::get_role_policy_names()
 {
   vector<string> policy_names;
-  for (const auto& it : perm_policy_map)
+  for (const auto& it : info.perm_policy_map)
   {
     policy_names.push_back(std::move(it.first));
   }
@@ -266,11 +268,11 @@ vector<string> RGWRole::get_role_policy_names()
   return policy_names;
 }
 
-int RGWRole::get_role_policy(const string& policy_name, string& perm_policy)
+int RGWRole::get_role_policy(const DoutPrefixProvider* dpp, const string& policy_name, string& perm_policy)
 {
-  const auto it = perm_policy_map.find(policy_name);
-  if (it == perm_policy_map.end()) {
-    ldout(cct, 0) << "ERROR: Policy name: " << policy_name << " not found" << dendl;
+  const auto it = info.perm_policy_map.find(policy_name);
+  if (it == info.perm_policy_map.end()) {
+    ldpp_dout(dpp, 0) << "ERROR: Policy name: " << policy_name << " not found" << dendl;
     return -ENOENT;
   } else {
     perm_policy = it->second;
@@ -278,242 +280,57 @@ int RGWRole::get_role_policy(const string& policy_name, string& perm_policy)
   return 0;
 }
 
-int RGWRole::delete_policy(const string& policy_name)
+int RGWRole::delete_policy(const DoutPrefixProvider* dpp, const string& policy_name)
 {
-  const auto& it = perm_policy_map.find(policy_name);
-  if (it == perm_policy_map.end()) {
-    ldout(cct, 0) << "ERROR: Policy name: " << policy_name << " not found" << dendl;
+  const auto& it = info.perm_policy_map.find(policy_name);
+  if (it == info.perm_policy_map.end()) {
+    ldpp_dout(dpp, 0) << "ERROR: Policy name: " << policy_name << " not found" << dendl;
     return -ENOENT;
   } else {
-    perm_policy_map.erase(it);
+    info.perm_policy_map.erase(it);
   }
   return 0;
-}
-
-void RGWRole::dump(Formatter *f) const
-{
-  encode_json("RoleId", id , f);
-  encode_json("RoleName", name , f);
-  encode_json("Path", path, f);
-  encode_json("Arn", arn, f);
-  encode_json("CreateDate", creation_date, f);
-  encode_json("MaxSessionDuration", max_session_duration, f);
-  encode_json("AssumeRolePolicyDocument", trust_policy, f);
-}
-
-void RGWRole::decode_json(JSONObj *obj)
-{
-  JSONDecoder::decode_json("id", id, obj);
-  JSONDecoder::decode_json("name", name, obj);
-  JSONDecoder::decode_json("path", path, obj);
-  JSONDecoder::decode_json("arn", arn, obj);
-  JSONDecoder::decode_json("create_date", creation_date, obj);
-  JSONDecoder::decode_json("max_session_duration", max_session_duration, obj);
-  JSONDecoder::decode_json("assume_role_policy_document", trust_policy, obj);
-}
-
-int RGWRole::read_id(const string& role_name, const string& tenant, string& role_id)
-{
-  auto svc = ctl->svc;
-  auto& pool = svc->zone->get_zone_params().roles_pool;
-  string oid = tenant + get_names_oid_prefix() + role_name;
-  bufferlist bl;
-  auto obj_ctx = svc->sysobj->init_obj_ctx();
-
-  int ret = rgw_get_system_obj(obj_ctx, pool, oid, bl, NULL, NULL, null_yield);
-  if (ret < 0) {
-    return ret;
-  }
-
-  RGWNameToId nameToId;
-  try {
-    auto iter = bl.cbegin();
-    using ceph::decode;
-    decode(nameToId, iter);
-  } catch (buffer::error& err) {
-    ldout(cct, 0) << "ERROR: failed to decode role from pool: " << pool.name << ": "
-                  << role_name << dendl;
-    return -EIO;
-  }
-  role_id = nameToId.obj_id;
-  return 0;
-}
-
-int RGWRole::read_info()
-{
-  auto svc = ctl->svc;
-  auto& pool = svc->zone->get_zone_params().roles_pool;
-  string oid = get_info_oid_prefix() + id;
-  bufferlist bl;
-  auto obj_ctx = svc->sysobj->init_obj_ctx();
-
-  int ret = rgw_get_system_obj(obj_ctx, pool, oid, bl, NULL, NULL, null_yield);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR: failed reading role info from pool: " << pool.name <<
-                  ": " << id << ": " << cpp_strerror(-ret) << dendl;
-    return ret;
-  }
-
-  try {
-    using ceph::decode;
-    auto iter = bl.cbegin();
-    decode(*this, iter);
-  } catch (buffer::error& err) {
-    ldout(cct, 0) << "ERROR: failed to decode role info from pool: " << pool.name <<
-                  ": " << id << dendl;
-    return -EIO;
-  }
-
-  return 0;
-}
-
-int RGWRole::read_name()
-{
-  auto svc = ctl->svc;
-  auto& pool = svc->zone->get_zone_params().roles_pool;
-  string oid = tenant + get_names_oid_prefix() + name;
-  bufferlist bl;
-  auto obj_ctx = svc->sysobj->init_obj_ctx();
-
-  int ret = rgw_get_system_obj(obj_ctx, pool, oid, bl, NULL, NULL, null_yield);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR: failed reading role name from pool: " << pool.name << ": "
-                  << name << ": " << cpp_strerror(-ret) << dendl;
-    return ret;
-  }
-
-  RGWNameToId nameToId;
-  try {
-    using ceph::decode;
-    auto iter = bl.cbegin();
-    decode(nameToId, iter);
-  } catch (buffer::error& err) {
-    ldout(cct, 0) << "ERROR: failed to decode role name from pool: " << pool.name << ": "
-                  << name << dendl;
-    return -EIO;
-  }
-  id = nameToId.obj_id;
-  return 0;
-}
-
-bool RGWRole::validate_input()
-{
-  if (name.length() > MAX_ROLE_NAME_LEN) {
-    ldout(cct, 0) << "ERROR: Invalid name length " << dendl;
-    return false;
-  }
-
-  if (path.length() > MAX_PATH_NAME_LEN) {
-    ldout(cct, 0) << "ERROR: Invalid path length " << dendl;
-    return false;
-  }
-
-  std::regex regex_name("[A-Za-z0-9:=,.@-]+");
-  if (! std::regex_match(name, regex_name)) {
-    ldout(cct, 0) << "ERROR: Invalid chars in name " << dendl;
-    return false;
-  }
-
-  std::regex regex_path("(/[!-~]+/)|(/)");
-  if (! std::regex_match(path,regex_path)) {
-    ldout(cct, 0) << "ERROR: Invalid chars in path " << dendl;
-    return false;
-  }
-
-  if (max_session_duration < SESSION_DURATION_MIN ||
-          max_session_duration > SESSION_DURATION_MAX) {
-    ldout(cct, 0) << "ERROR: Invalid session duration, should be between 3600 and 43200 seconds " << dendl;
-    return false;
-  }
-  return true;
-}
-
-void RGWRole::extract_name_tenant(const std::string& str)
-{
-  size_t pos = str.find('$');
-  if (pos != std::string::npos) {
-    tenant = str.substr(0, pos);
-    name = str.substr(pos + 1);
-  }
 }
 
 void RGWRole::update_trust_policy(string& trust_policy)
 {
-  this->trust_policy = trust_policy;
+  this->info.trust_policy = trust_policy;
 }
 
-int RGWRole::get_roles_by_path_prefix(RGWRados *store,
-                                      CephContext *cct,
-                                      const string& path_prefix,
-                                      const string& tenant,
-                                      vector<RGWRole>& roles)
+int RGWRole::set_tags(const DoutPrefixProvider* dpp, const multimap<string,string>& tags_map)
 {
-  auto pool = store->svc.zone->get_zone_params().roles_pool;
-  string prefix;
-
-  // List all roles if path prefix is empty
-  if (! path_prefix.empty()) {
-    prefix = tenant + role_path_oid_prefix + path_prefix;
-  } else {
-    prefix = tenant + role_path_oid_prefix;
+  for (auto& it : tags_map) {
+    this->info.tags.emplace(it.first, it.second);
   }
-
-  //Get the filtered objects
-  list<string> result;
-  bool is_truncated;
-  RGWListRawObjsCtx ctx;
-  do {
-    list<string> oids;
-    int r = store->list_raw_objects(pool, prefix, 1000, ctx, oids, &is_truncated);
-    if (r < 0) {
-      ldout(cct, 0) << "ERROR: listing filtered objects failed: " << pool.name << ": "
-                  << prefix << ": " << cpp_strerror(-r) << dendl;
-      return r;
-    }
-    for (const auto& iter : oids) {
-      result.push_back(iter.substr(role_path_oid_prefix.size()));
-    }
-  } while (is_truncated);
-
-  for (const auto& it : result) {
-    //Find the role oid prefix from the end
-    size_t pos = it.rfind(role_oid_prefix);
-    if (pos == string::npos) {
-        continue;
-    }
-    // Split the result into path and info_oid + id
-    string path = it.substr(0, pos);
-
-    /*Make sure that prefix is part of path (False results could've been returned)
-      because of the role info oid + id appended to the path)*/
-    if(path_prefix.empty() || path.find(path_prefix) != string::npos) {
-      //Get id from info oid prefix + id
-      string id = it.substr(pos + role_oid_prefix.length());
-
-      RGWRole role(cct, store->pctl);
-      role.set_id(id);
-      int ret = role.read_info();
-      if (ret < 0) {
-        return ret;
-      }
-      roles.push_back(std::move(role));
-    }
+  if (this->info.tags.size() > 50) {
+    ldpp_dout(dpp, 0) << "No. of tags is greater than 50" << dendl;
+    return -EINVAL;
   }
-
   return 0;
 }
 
-const string& RGWRole::get_names_oid_prefix()
+boost::optional<multimap<string,string>> RGWRole::get_tags()
 {
-  return role_name_oid_prefix;
+  if(this->info.tags.empty()) {
+    return boost::none;
+  }
+  return this->info.tags;
 }
 
-const string& RGWRole::get_info_oid_prefix()
+void RGWRole::erase_tags(const vector<string>& tagKeys)
 {
-  return role_oid_prefix;
+  for (auto& it : tagKeys) {
+    this->info.tags.erase(it);
+  }
 }
 
-const string& RGWRole::get_path_oid_prefix()
+void RGWRole::update_max_session_duration(const std::string& max_session_duration_str)
 {
-  return role_path_oid_prefix;
+  if (max_session_duration_str.empty()) {
+    info.max_session_duration = SESSION_DURATION_MIN;
+  } else {
+    info.max_session_duration = std::stoull(max_session_duration_str);
+  }
 }
+
+} // namespace rgw::sal

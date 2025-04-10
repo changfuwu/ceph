@@ -77,7 +77,8 @@ void get_arguments_enable(po::options_description *positional,
                           po::options_description *options) {
   at::add_image_spec_options(positional, options, at::ARGUMENT_MODIFIER_NONE);
   positional->add_options()
-    ("mode", "mirror image mode (journal or snapshot) [default: journal]");
+    ("mode", po::value<std::string>()->default_value(""),
+     "mirror image mode (journal or snapshot) [default: journal]");
 }
 
 void get_arguments_disable(po::options_description *positional,
@@ -313,12 +314,8 @@ int execute_status(const po::variables_map &vm,
     return r;
   }
 
-  librados::IoCtx default_ns_io_ctx;
-  default_ns_io_ctx.dup(io_ctx);
-  default_ns_io_ctx.set_namespace("");
-
   std::vector<librbd::mirror_peer_site_t> mirror_peers;
-  utils::get_mirror_peer_sites(default_ns_io_ctx, &mirror_peers);
+  utils::get_mirror_peer_sites(io_ctx, &mirror_peers);
 
   std::map<std::string, std::string> peer_mirror_uuids_to_name;
   utils::get_mirror_peer_mirror_uuids_to_names(mirror_peers,
@@ -415,7 +412,7 @@ int execute_status(const po::variables_map &vm,
         auto name_it = peer_mirror_uuids_to_name.find(status.mirror_uuid);
         formatter->dump_string("site_name",
           (name_it != peer_mirror_uuids_to_name.end() ? name_it->second : ""));
-        formatter->dump_string("mirror_uuids", status.mirror_uuid);
+        formatter->dump_string("mirror_uuid", status.mirror_uuid);
 
         formatter->dump_string("state", utils::mirror_image_site_status_state(
           status));
@@ -518,6 +515,12 @@ int execute_status(const po::variables_map &vm,
   return 0;
 }
 
+void get_snapshot_arguments(po::options_description *positional,
+                            po::options_description *options) {
+  at::add_image_spec_options(positional, options, at::ARGUMENT_MODIFIER_NONE);
+  at::add_snap_create_options(options);
+}
+
 int execute_snapshot(const po::variables_map &vm,
                      const std::vector<std::string> &ceph_global_init_args) {
   size_t arg_index = 0;
@@ -528,6 +531,12 @@ int execute_snapshot(const po::variables_map &vm,
       vm, at::ARGUMENT_MODIFIER_NONE, &arg_index, &pool_name, &namespace_name,
       &image_name, nullptr, true, utils::SNAPSHOT_PRESENCE_NONE,
       utils::SPEC_VALIDATION_NONE);
+  if (r < 0) {
+    return r;
+  }
+
+  uint32_t flags;
+  r = utils::get_snap_create_flags(vm, &flags);
   if (r < 0) {
     return r;
   }
@@ -547,7 +556,7 @@ int execute_snapshot(const po::variables_map &vm,
   }
 
   uint64_t snap_id;
-  r = image.mirror_image_create_snapshot(&snap_id);
+  r = image.mirror_image_create_snapshot2(flags, &snap_id);
   if (r < 0) {
     std::cerr << "rbd: error creating snapshot: " << cpp_strerror(r)
               << std::endl;
@@ -585,7 +594,7 @@ Shell::Action action_status(
 Shell::Action action_snapshot(
   {"mirror", "image", "snapshot"}, {},
   "Create RBD mirroring image snapshot.", "",
-  &get_arguments, &execute_snapshot);
+  &get_snapshot_arguments, &execute_snapshot);
 
 } // namespace mirror_image
 } // namespace action

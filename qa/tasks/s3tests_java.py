@@ -159,30 +159,13 @@ class S3tests_java(Task):
             stdout=BytesIO()
         )
 
-        endpoint = self.ctx.rgw.role_endpoints[client]
-        if endpoint.cert:
-            path = 'lib/security/cacerts'
-            self.ctx.cluster.only(client).run(
-                args=['sudo',
-                      'keytool',
-                      '-import', '-alias', '{alias}'.format(
-                          alias=endpoint.hostname),
-                      '-keystore',
-                      run.Raw(
-                          '$(readlink -e $(dirname $(readlink -e $(which keytool)))/../{path})'.format(path=path)),
-                      '-file', endpoint.cert.certificate,
-                      '-storepass', 'changeit',
-                      ],
-                stdout=BytesIO()
-            )
-
     def create_users(self):
         """
         Create a main and an alternative s3 user.
         Configuration is read from a skelethon config file
         s3tests.teuth.config.yaml in the java-s3tests repository
         and missing information is added from the task.
-        Existing values are NOT overriden unless they are empty!
+        Existing values are NOT overridden unless they are empty!
         """
         log.info("S3 Tests Java: Creating S3 users...")
         testdir = teuthology.get_testdir(self.ctx)
@@ -271,26 +254,13 @@ class S3tests_java(Task):
 
     def _write_cfg_file(self, cfg_dict, client):
         """
-        To write the final s3 tests config file on the remote
-        a temporary one is created on the local machine
+        Write s3 tests java config file on the remote node.
         """
         testdir = teuthology.get_testdir(self.ctx)
         (remote,) = self.ctx.cluster.only(client).remotes.keys()
-        with open('s3_tests_tmp.yaml', 'w') as outfile:
-            yaml.dump(cfg_dict, outfile, default_flow_style=False)
-
-        conf_fp = BytesIO()
-        with open('s3_tests_tmp.yaml', 'rb') as infile:
-            for line in infile:
-                conf_fp.write(line)
-
-        teuthology.write_file(
-            remote=remote,
-            path='{tdir}/archive/s3-tests-java.{client}.conf'.format(
-                tdir=testdir, client=client),
-            data=conf_fp.getvalue(),
-        )
-        os.remove('s3_tests_tmp.yaml')
+        data = yaml.safe_dump(cfg_dict, default_flow_style=False)
+        path = testdir + '/archive/s3-tests-java.' + client + '.conf'
+        remote.write_file(path, data)
 
     def _set_cfg_entry(self, cfg_dict, key, value):
         if not (key in cfg_dict):
@@ -314,6 +284,7 @@ class S3tests_java(Task):
             args = ['cd',
                     '{tdir}/s3-tests-java'.format(tdir=testdir),
                     run.Raw('&&'),
+                    run.Raw('JAVA_HOME=$(alternatives --list | grep jre_1.8.0 | head -n 1 | awk \'{print $3}\')'),
                     '/opt/gradle/gradle/bin/gradle', 'clean', 'test',
                     '--rerun-tasks', '--no-build-cache',
                     ]

@@ -30,11 +30,13 @@
  *
  */
 
-class OSD;
+class MOSDOpReply;
 
-class MOSDOp : public MOSDFastDispatchOp {
+namespace _mosdop {
+template<typename V>
+class MOSDOp final : public MOSDFastDispatchOp {
 private:
-  static constexpr int HEAD_VERSION = 8;
+  static constexpr int HEAD_VERSION = 9;
   static constexpr int COMPAT_VERSION = 3;
 
 private:
@@ -54,7 +56,7 @@ private:
   std::atomic<bool> final_decode_needed;
   //
 public:
-  std::vector<OSDOp> ops;
+  V ops;
 private:
   snapid_t snap_seq;
   std::vector<snapid_t> snaps;
@@ -64,7 +66,7 @@ private:
   osd_reqid_t reqid; // reqid explicitly set by sender
 
 public:
-  friend class MOSDOpReply;
+  friend MOSDOpReply;
 
   ceph_tid_t get_client_tid() { return header.tid; }
   void set_snapid(const snapid_t& s) {
@@ -164,7 +166,11 @@ public:
   uint64_t get_features() const {
     if (features)
       return features;
+#ifdef WITH_CRIMSON
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#else
     return get_connection()->get_features();
+#endif
   }
 
   MOSDOp()
@@ -172,7 +178,7 @@ public:
       partial_decode_needed(true),
       final_decode_needed(true),
       bdata_encode(false) { }
-  MOSDOp(int inc, long tid, const hobject_t& ho, spg_t& _pgid,
+  MOSDOp(int inc, ceph_tid_t tid, const hobject_t& ho, spg_t& _pgid,
 	 epoch_t _osdmap_epoch,
 	 int _flags, uint64_t feat)
     : MOSDFastDispatchOp(CEPH_MSG_OSD_OP, HEAD_VERSION, COMPAT_VERSION),
@@ -191,7 +197,7 @@ public:
     reqid.inc = inc;
   }
 private:
-  ~MOSDOp() override {}
+  ~MOSDOp() final {}
 
 public:
   void set_mtime(utime_t mt) { mtime = mt; }
@@ -209,12 +215,12 @@ public:
   }
   void write(uint64_t off, uint64_t len, ceph::buffer::list& bl) {
     add_simple_op(CEPH_OSD_OP_WRITE, off, len);
-    data.claim(bl);
+    data = std::move(bl);
     header.data_off = off;
   }
   void writefull(ceph::buffer::list& bl) {
     add_simple_op(CEPH_OSD_OP_WRITEFULL, 0, bl.length());
-    data.claim(bl);
+    data = std::move(bl);
     header.data_off = 0;
   }
   void zero(uint64_t off, uint64_t len) {
@@ -358,9 +364,38 @@ struct ceph_osd_request_head {
 
       encode(retry_attempt, payload);
       encode(features, payload);
-    } else {
-      // latest v8 encoding with hobject_t hash separate from pgid, no
+    } else if (!HAVE_FEATURE(features, SERVER_SQUID)) {
+      // v8 encoding with hobject_t hash separate from pgid, no
       // reassert version
+      header.version = 8;
+
+      encode(pgid, payload);
+      encode(hobj.get_hash(), payload);
+      encode(osdmap_epoch, payload);
+      encode(flags, payload);
+      encode(reqid, payload);
+      encode_trace(payload, features);
+
+      // -- above decoded up front; below decoded post-dispatch thread --
+
+      encode(client_inc, payload);
+      encode(mtime, payload);
+      encode(get_object_locator(), payload);
+      encode(hobj.oid, payload);
+
+      __u16 num_ops = ops.size();
+      encode(num_ops, payload);
+      for (unsigned i = 0; i < ops.size(); i++)
+	encode(ops[i].op, payload);
+
+      encode(hobj.snap, payload);
+      encode(snap_seq, payload);
+      encode(snaps, payload);
+
+      encode(retry_attempt, payload);
+      encode(features, payload);
+    } else {
+      // latest v9 opentelemetry trace
       header.version = HEAD_VERSION;
 
       encode(pgid, payload);
@@ -369,6 +404,7 @@ struct ceph_osd_request_head {
       encode(flags, payload);
       encode(reqid, payload);
       encode_trace(payload, features);
+      encode_otel_trace(payload, features);
 
       // -- above decoded up front; below decoded post-dispatch thread --
 
@@ -398,6 +434,16 @@ struct ceph_osd_request_head {
 
     // Always keep here the newest version of decoding order/rule
     if (header.version == HEAD_VERSION) {
+      decode(pgid, p);
+      uint32_t hash;
+      decode(hash, p);
+      hobj.set_hash(hash);
+      decode(osdmap_epoch, p);
+      decode(flags, p);
+      decode(reqid, p);
+      decode_trace(p);
+      decode_otel_trace(p);
+    } else if (header.version == 8) {
       decode(pgid, p);      // actual pgid
       uint32_t hash;
       decode(hash, p); // raw hash value
@@ -598,6 +644,9 @@ private:
   template<class T, typename... Args>
   friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
 };
+}
+
+using MOSDOp = _mosdop::MOSDOp<std::vector<OSDOp>>;
 
 
 #endif

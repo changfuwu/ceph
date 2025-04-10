@@ -3,24 +3,21 @@ import { ComponentFixture, fakeAsync, TestBed, tick } from '@angular/core/testin
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { TabsModule } from 'ngx-bootstrap/tabs';
+import { NgbNavModule } from '@ng-bootstrap/ng-bootstrap';
 import { ToastrModule } from 'ngx-toastr';
 import { of } from 'rxjs';
 
-import {
-  configureTestBed,
-  expectItemTasks,
-  i18nProviders,
-  PermissionHelper
-} from '../../../../testing/unit-test-helper';
-import { NfsService } from '../../../shared/api/nfs.service';
-import { TableActionsComponent } from '../../../shared/datatable/table-actions/table-actions.component';
-import { ExecutingTask } from '../../../shared/models/executing-task';
-import { SummaryService } from '../../../shared/services/summary.service';
-import { TaskListService } from '../../../shared/services/task-list.service';
-import { SharedModule } from '../../../shared/shared.module';
+import { NfsService } from '~/app/shared/api/nfs.service';
+import { TableActionsComponent } from '~/app/shared/datatable/table-actions/table-actions.component';
+import { ExecutingTask } from '~/app/shared/models/executing-task';
+import { Summary } from '~/app/shared/models/summary.model';
+import { SummaryService } from '~/app/shared/services/summary.service';
+import { TaskListService } from '~/app/shared/services/task-list.service';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed, expectItemTasks, PermissionHelper } from '~/testing/unit-test-helper';
 import { NfsDetailsComponent } from '../nfs-details/nfs-details.component';
 import { NfsListComponent } from './nfs-list.component';
+import { SUPPORTED_FSAL } from '../models/nfs.fsal';
 
 describe('NfsListComponent', () => {
   let component: NfsListComponent;
@@ -29,32 +26,30 @@ describe('NfsListComponent', () => {
   let nfsService: NfsService;
   let httpTesting: HttpTestingController;
 
-  const refresh = (data: object) => {
+  const refresh = (data: Summary) => {
     summaryService['summaryDataSource'].next(data);
   };
 
-  configureTestBed(
-    {
-      declarations: [NfsListComponent, NfsDetailsComponent],
-      imports: [
-        BrowserAnimationsModule,
-        HttpClientTestingModule,
-        RouterTestingModule,
-        SharedModule,
-        ToastrModule.forRoot(),
-        TabsModule.forRoot()
-      ],
-      providers: [TaskListService, i18nProviders]
-    },
-    true
-  );
+  configureTestBed({
+    declarations: [NfsListComponent, NfsDetailsComponent],
+    imports: [
+      BrowserAnimationsModule,
+      HttpClientTestingModule,
+      RouterTestingModule,
+      SharedModule,
+      NgbNavModule,
+      ToastrModule.forRoot()
+    ],
+    providers: [TaskListService]
+  });
 
   beforeEach(() => {
     fixture = TestBed.createComponent(NfsListComponent);
     component = fixture.componentInstance;
-    summaryService = TestBed.get(SummaryService);
-    nfsService = TestBed.get(NfsService);
-    httpTesting = TestBed.get(HttpTestingController);
+    component.fsal = SUPPORTED_FSAL.CEPH;
+    summaryService = TestBed.inject(SummaryService);
+    nfsService = TestBed.inject(NfsService);
+    httpTesting = TestBed.inject(HttpTestingController);
   });
 
   it('should create', () => {
@@ -65,17 +60,10 @@ describe('NfsListComponent', () => {
     beforeEach(() => {
       fixture.detectChanges();
       spyOn(nfsService, 'list').and.callThrough();
-      httpTesting.expectOne('api/nfs-ganesha/daemon').flush([]);
     });
 
     afterEach(() => {
       httpTesting.verify();
-    });
-
-    it('should load exports on init', () => {
-      refresh({});
-      httpTesting.expectOne('api/nfs-ganesha/export');
-      expect(nfsService.list).toHaveBeenCalled();
     });
 
     it('should not load images on init because no data', () => {
@@ -97,7 +85,9 @@ describe('NfsListComponent', () => {
       const model = {
         export_id: export_id,
         path: 'path_' + export_id,
-        fsal: 'fsal_' + export_id,
+        fsal: {
+          name: 'CEPH'
+        },
         cluster_id: 'cluster_' + export_id
       };
       exports.push(model);
@@ -110,7 +100,9 @@ describe('NfsListComponent', () => {
         case 'nfs/create':
           task.metadata = {
             path: 'path_' + export_id,
-            fsal: 'fsal_' + export_id,
+            fsal: {
+              name: 'CEPH'
+            },
             cluster_id: 'cluster_' + export_id
           };
           break;
@@ -130,12 +122,9 @@ describe('NfsListComponent', () => {
       addExport('b');
       addExport('c');
       component.exports = exports;
-      refresh({ executing_tasks: [], finished_tasks: [] });
+      refresh(new Summary());
       spyOn(nfsService, 'list').and.callFake(() => of(exports));
       fixture.detectChanges();
-
-      const req = httpTesting.expectOne('api/nfs-ganesha/daemon');
-      req.flush([]);
     });
 
     it('should gets all exports without tasks', () => {
@@ -171,35 +160,75 @@ describe('NfsListComponent', () => {
     expect(tableActions).toEqual({
       'create,update,delete': {
         actions: ['Create', 'Edit', 'Delete'],
-        primary: { multiple: 'Create', executing: 'Edit', single: 'Edit', no: 'Create' }
+        primary: {
+          multiple: 'Create',
+          executing: 'Create',
+          single: 'Create',
+          no: 'Create'
+        }
       },
       'create,update': {
         actions: ['Create', 'Edit'],
-        primary: { multiple: 'Create', executing: 'Edit', single: 'Edit', no: 'Create' }
+        primary: {
+          multiple: 'Create',
+          executing: 'Create',
+          single: 'Create',
+          no: 'Create'
+        }
       },
       'create,delete': {
         actions: ['Create', 'Delete'],
-        primary: { multiple: 'Create', executing: 'Delete', single: 'Delete', no: 'Create' }
+        primary: {
+          multiple: 'Create',
+          executing: 'Create',
+          single: 'Create',
+          no: 'Create'
+        }
       },
       create: {
         actions: ['Create'],
-        primary: { multiple: 'Create', executing: 'Create', single: 'Create', no: 'Create' }
+        primary: {
+          multiple: 'Create',
+          executing: 'Create',
+          single: 'Create',
+          no: 'Create'
+        }
       },
       'update,delete': {
         actions: ['Edit', 'Delete'],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       update: {
         actions: ['Edit'],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: 'Edit',
+          executing: 'Edit',
+          single: 'Edit',
+          no: 'Edit'
+        }
       },
       delete: {
         actions: ['Delete'],
-        primary: { multiple: 'Delete', executing: 'Delete', single: 'Delete', no: 'Delete' }
+        primary: {
+          multiple: 'Delete',
+          executing: 'Delete',
+          single: 'Delete',
+          no: 'Delete'
+        }
       },
       'no-permissions': {
         actions: [],
-        primary: { multiple: '', executing: '', single: '', no: '' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       }
     });
   });

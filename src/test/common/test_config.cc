@@ -19,10 +19,15 @@
  *
  *
  */
+
+#include <iostream> // for std::cout
+
 #include "common/config_proxy.h"
 #include "common/errno.h"
 #include "gtest/gtest.h"
 #include "common/hostname.h"
+
+using namespace std;
 
 extern std::string exec(const char* cmd); // defined in test_hostname.cc
 

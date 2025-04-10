@@ -1,6 +1,7 @@
 """
 rgw routines
 """
+from io import BytesIO
 import argparse
 import contextlib
 import logging
@@ -9,6 +10,7 @@ from teuthology.orchestra import run
 from teuthology import misc as teuthology
 from teuthology import contextutil
 from teuthology.exceptions import ConfigError
+from tasks.ceph_manager import get_valgrind_args
 from tasks.util import get_remote_for_role
 from tasks.util.rgw import rgwadmin, wait_for_radosgw
 from tasks.util.rados import (create_ec_pool,
@@ -60,6 +62,16 @@ def start_rgw(ctx, config, clients):
         log.info("Using %s as radosgw frontend", ctx.rgw.frontend)
 
         endpoint = ctx.rgw.role_endpoints[client]
+
+        # create a file with rgw endpoint in it for test_awssdkv4 workunit
+        url = endpoint.url()
+        # remove trailing slash from the url
+        if url[-1] == '/':
+            url = url[:-1]
+        url_file = '{tdir}/url_file'.format(tdir=testdir)
+        ctx.cluster.only(client).run(args=['sudo', 'echo', '-n', '{url}'.format(url=url), run.Raw('|'), 'sudo', 'tee', url_file])
+        ctx.cluster.only(client).run(args=['sudo', 'chown', 'ceph', url_file])
+
         frontends = ctx.rgw.frontend
         frontend_prefix = client_config.get('frontend_prefix', None)
         if frontend_prefix:
@@ -68,10 +80,22 @@ def start_rgw(ctx, config, clients):
         if endpoint.cert:
             # add the ssl certificate path
             frontends += ' ssl_certificate={}'.format(endpoint.cert.certificate)
-            if ctx.rgw.frontend == 'civetweb':
-                frontends += ' port={}s'.format(endpoint.port)
-            else:
-                frontends += ' ssl_port={}'.format(endpoint.port)
+            frontends += ' ssl_port={}'.format(endpoint.port)
+            path = 'lib/security/cacerts'
+            ctx.cluster.only(client).run(
+                args=['sudo',
+                      'keytool',
+                      '-import', '-alias', '{alias}'.format(
+                          alias=endpoint.hostname),
+                      '-keystore',
+                      run.Raw(
+                          '$(readlink -e $(dirname $(readlink -e $(which keytool)))/../{path})'.format(path=path)),
+                      '-file', endpoint.cert.certificate,
+                      '-storepass', 'changeit',
+                      ],
+                stdout=BytesIO()
+            )
+
         else:
             frontends += ' port={}'.format(endpoint.port)
 
@@ -104,16 +128,17 @@ def start_rgw(ctx, config, clients):
                 ])
 
 
-        if client_config.get('dns-name'):
+        if client_config.get('dns-name') is not None:
             rgw_cmd.extend(['--rgw-dns-name', endpoint.dns_name])
-        if client_config.get('dns-s3website-name'):
+        if client_config.get('dns-s3website-name') is not None:
             rgw_cmd.extend(['--rgw-dns-s3website-name', endpoint.website_dns_name])
 
 
         vault_role = client_config.get('use-vault-role', None)
         barbican_role = client_config.get('use-barbican-role', None)
+        pykmip_role = client_config.get('use-pykmip-role', None)
 
-        token_path = teuthology.get_testdir(ctx) + '/vault-token'
+        token_path = '/etc/ceph/vault-root-token'
         if barbican_role is not None:
             if not hasattr(ctx, 'barbican'):
                 raise ConfigError('rgw must run after the barbican task')
@@ -131,16 +156,57 @@ def start_rgw(ctx, config, clients):
             if not ctx.vault.root_token:
                 raise ConfigError('vault: no "root_token" specified')
             # create token on file
-            ctx.cluster.only(client).run(args=['echo', '-n', ctx.vault.root_token, run.Raw('>'), token_path])
-            log.info("Restrict access to token file")
-            ctx.cluster.only(client).run(args=['chmod', '600', token_path])
+            ctx.rgw.vault_role = vault_role
+            ctx.cluster.only(client).run(args=['sudo', 'echo', '-n', ctx.vault.root_token, run.Raw('|'), 'sudo', 'tee', token_path])
             log.info("Token file content")
             ctx.cluster.only(client).run(args=['cat', token_path])
+            log.info("Restrict access to token file")
+            ctx.cluster.only(client).run(args=['sudo', 'chmod', '600', token_path])
+            ctx.cluster.only(client).run(args=['sudo', 'chown', 'ceph', token_path])
 
+            vault_addr = "{}:{}".format(*ctx.vault.endpoints[vault_role])
             rgw_cmd.extend([
-                '--rgw_crypt_vault_addr', "{}:{}".format(*ctx.vault.endpoints[vault_role]),
-                '--rgw_crypt_vault_token_file', token_path
+                '--rgw_crypt_vault_addr', vault_addr,
+                '--rgw_crypt_vault_token_file', token_path,
+                '--rgw_crypt_sse_s3_vault_addr', vault_addr,
+                '--rgw_crypt_sse_s3_vault_token_file', token_path,
             ])
+        elif pykmip_role is not None:
+            if not hasattr(ctx, 'pykmip'):
+                raise ConfigError('rgw must run after the pykmip task')
+            ctx.rgw.pykmip_role = pykmip_role
+            rgw_cmd.extend([
+                '--rgw_crypt_kmip_addr', "{}:{}".format(*ctx.pykmip.endpoints[pykmip_role]),
+            ])
+
+            clientcert = ctx.ssl_certificates.get('kmip-client')
+            servercert = ctx.ssl_certificates.get('kmip-server')
+            clientca = ctx.ssl_certificates.get('kmiproot')
+
+            clientkey = clientcert.key
+            clientcert = clientcert.certificate
+            serverkey = servercert.key
+            servercert = servercert.certificate
+            rootkey = clientca.key
+            rootcert = clientca.certificate
+
+            cert_path = '/etc/ceph/'
+            ctx.cluster.only(client).run(args=['sudo', 'cp', clientcert, cert_path])
+            ctx.cluster.only(client).run(args=['sudo', 'cp', clientkey, cert_path])
+            ctx.cluster.only(client).run(args=['sudo', 'cp', servercert, cert_path])
+            ctx.cluster.only(client).run(args=['sudo', 'cp', serverkey, cert_path])
+            ctx.cluster.only(client).run(args=['sudo', 'cp', rootkey, cert_path])
+            ctx.cluster.only(client).run(args=['sudo', 'cp', rootcert, cert_path])
+
+            clientcert = cert_path + 'kmip-client.crt'
+            clientkey = cert_path + 'kmip-client.key'
+            servercert = cert_path + 'kmip-server.crt'
+            serverkey = cert_path + 'kmip-server.key'
+            rootkey = cert_path + 'kmiproot.key'
+            rootcert = cert_path + 'kmiproot.crt'
+
+            ctx.cluster.only(client).run(args=['sudo', 'chmod', '600', clientcert, clientkey, servercert, serverkey, rootkey, rootcert])
+            ctx.cluster.only(client).run(args=['sudo', 'chown', 'ceph', clientcert, clientkey, servercert, serverkey, rootkey, rootcert])
 
         rgw_cmd.extend([
             '--foreground',
@@ -152,11 +218,13 @@ def start_rgw(ctx, config, clients):
             ])
 
         if client_config.get('valgrind'):
-            cmd_prefix = teuthology.get_valgrind_args(
+            cmd_prefix = get_valgrind_args(
                 testdir,
                 client_with_cluster,
                 cmd_prefix,
-                client_config.get('valgrind')
+                client_config.get('valgrind'),
+                # see https://github.com/ceph/teuthology/pull/1600
+                exit_on_first_error=False
                 )
 
         run_cmd = list(cmd_prefix)
@@ -165,6 +233,7 @@ def start_rgw(ctx, config, clients):
         ctx.daemons.add_daemon(
             remote, 'rgw', client_with_id,
             cluster=cluster_name,
+            fsid=ctx.ceph[cluster_name].fsid,
             args=run_cmd,
             logger=log.getChild(client),
             stdin=run.PIPE,
@@ -195,7 +264,9 @@ def start_rgw(ctx, config, clients):
                                                              client=client_with_cluster),
                     ],
                 )
-            ctx.cluster.only(client).run(args=['rm', '-f', token_path])
+            ctx.cluster.only(client).run(args=['sudo', 'rm', '-f', token_path])
+            ctx.cluster.only(client).run(args=['sudo', 'rm', '-f', url_file])
+            rgwadmin(ctx, client, cmd=['gc', 'process', '--include-all'], check_status=True)
 
 def assign_endpoints(ctx, config, default_cert):
     role_endpoints = {}
@@ -222,13 +293,49 @@ def assign_endpoints(ctx, config, default_cert):
             dns_name += remote.hostname
 
         website_dns_name = client_config.get('dns-s3website-name')
-        if website_dns_name:
-            if len(website_dns_name) == 0 or website_dns_name.endswith('.'):
-                website_dns_name += remote.hostname
+        if website_dns_name is not None and (len(website_dns_name) == 0 or website_dns_name.endswith('.')):
+            website_dns_name += remote.hostname
 
         role_endpoints[role] = RGWEndpoint(remote.hostname, port, ssl_certificate, dns_name, website_dns_name)
 
     return role_endpoints
+
+@contextlib.contextmanager
+def create_realm(ctx, clients):
+    if ctx.rgw.realm:
+        log.info('Creating realm {}'.format(ctx.rgw.realm))
+
+        client = next(iter(clients))
+        (remote,) = ctx.cluster.only(client).remotes.keys()
+        cluster_name, daemon_type, client_id = teuthology.split_role(client)
+
+        # create the realm/zonegroup/zone and set as default
+        rgwadmin(ctx, client,
+                 cmd=['realm', 'create',
+                      '--rgw-realm', ctx.rgw.realm,
+                      '--default'],
+                 check_status=True)
+        rgwadmin(ctx, client,
+                 cmd=['zonegroup', 'create',
+                      '--rgw-realm', ctx.rgw.realm,
+                      '--rgw-zonegroup', ctx.rgw.zonegroup,
+                      '--master', '--default'],
+                 check_status=True)
+        rgwadmin(ctx, client,
+                 cmd=['zone', 'create',
+                      '--rgw-realm', ctx.rgw.realm,
+                      '--rgw-zonegroup', ctx.rgw.zonegroup,
+                      '--rgw-zone', ctx.rgw.zone,
+                      '--master', '--default'],
+                 check_status=True)
+
+        rgwadmin(ctx, client,
+                 cmd=['period', 'update', '--commit',
+                      '--rgw-realm', ctx.rgw.realm,
+                      '--rgw-zonegroup', ctx.rgw.zonegroup,
+                      '--rgw-zone', ctx.rgw.zone],
+                 check_status=True)
+    yield
 
 @contextlib.contextmanager
 def create_pools(ctx, clients):
@@ -238,7 +345,7 @@ def create_pools(ctx, clients):
     for client in clients:
         log.debug("Obtaining remote for client {}".format(client))
         (remote,) = ctx.cluster.only(client).remotes.keys()
-        data_pool = 'default.rgw.buckets.data'
+        data_pool = '{}.rgw.buckets.data'.format(ctx.rgw.zone)
         cluster_name, daemon_type, client_id = teuthology.split_role(client)
 
         if ctx.rgw.ec_data_pool:
@@ -247,7 +354,7 @@ def create_pools(ctx, clients):
         else:
             create_replicated_pool(remote, data_pool, ctx.rgw.data_pool_pg_size, cluster_name, 'rgw')
 
-        index_pool = 'default.rgw.buckets.index'
+        index_pool = '{}.rgw.buckets.index'.format(ctx.rgw.zone)
         create_replicated_pool(remote, index_pool, ctx.rgw.index_pool_pg_size, cluster_name, 'rgw')
 
         if ctx.rgw.cache_pools:
@@ -261,42 +368,68 @@ def configure_compression(ctx, clients, compression):
     """ set a compression type in the default zone placement """
     log.info('Configuring compression type = %s', compression)
     for client in clients:
-        # XXX: the 'default' zone and zonegroup aren't created until we run RGWRados::init_complete().
-        # issue a 'radosgw-admin user list' command to trigger this
-        rgwadmin(ctx, client, cmd=['user', 'list'], check_status=True)
+        if not ctx.rgw.realm:
+            # XXX: the 'default' zone and zonegroup aren't created until we run RGWRados::init_complete().
+            # issue a 'radosgw-admin user list' command to trigger this
+            rgwadmin(ctx, client, cmd=['user', 'list'], check_status=True)
 
         rgwadmin(ctx, client,
-                cmd=['zone', 'placement', 'modify', '--rgw-zone', 'default',
+                cmd=['zone', 'placement', 'modify', '--rgw-zone', ctx.rgw.zone,
                      '--placement-id', 'default-placement',
                      '--compression', compression],
                 check_status=True)
     yield
 
 @contextlib.contextmanager
-def configure_storage_classes(ctx, clients, storage_classes):
-    """ set a compression type in the default zone placement """
-
-    sc = [s.strip() for s in storage_classes.split(',')]
-
+def disable_inline_data(ctx, clients):
     for client in clients:
-        # XXX: the 'default' zone and zonegroup aren't created until we run RGWRados::init_complete().
-        # issue a 'radosgw-admin user list' command to trigger this
-        rgwadmin(ctx, client, cmd=['user', 'list'], check_status=True)
+        if not ctx.rgw.realm:
+            # XXX: the 'default' zone and zonegroup aren't created until we run RGWRados::init_complete().
+            # issue a 'radosgw-admin user list' command to trigger this
+            rgwadmin(ctx, client, cmd=['user', 'list'], check_status=True)
 
-        for storage_class in sc:
-            log.info('Configuring storage class type = %s', storage_class)
+        rgwadmin(ctx, client,
+                cmd=['zone', 'placement', 'modify', '--rgw-zone', ctx.rgw.zone,
+                     '--placement-id', 'default-placement',
+                     '--placement-inline-data', 'false'],
+                check_status=True)
+    yield
+
+@contextlib.contextmanager
+def configure_datacache(ctx, clients, datacache_path):
+    """ create directory for rgw datacache """
+    log.info('Preparing directory for rgw datacache at %s', datacache_path)
+    for client in clients:
+        if(datacache_path != None):
+            ctx.cluster.only(client).run(args=['mkdir', '-p', datacache_path])
+            ctx.cluster.only(client).run(args=['sudo', 'chmod', 'a+rwx', datacache_path])
+        else:
+            log.info('path for datacache was not provided')
+    yield
+
+@contextlib.contextmanager
+def configure_storage_classes(ctx, clients, storage_classes):
+    """ create additional storage classes in the default zone placement """
+    for client in clients:
+        if not ctx.rgw.realm:
+            # XXX: the 'default' zone and zonegroup aren't created until we run RGWRados::init_complete().
+            # issue a 'radosgw-admin user list' command to trigger this
+            rgwadmin(ctx, client, cmd=['user', 'list'], check_status=True)
+
+        for name, args in storage_classes.items():
+            log.info('Configuring storage class = %s', name)
             rgwadmin(ctx, client,
                     cmd=['zonegroup', 'placement', 'add',
-                        '--rgw-zone', 'default',
+                        '--rgw-zone', ctx.rgw.zone,
                         '--placement-id', 'default-placement',
-                        '--storage-class', storage_class],
+                        '--storage-class', name],
                     check_status=True)
             rgwadmin(ctx, client,
                     cmd=['zone', 'placement', 'add',
-                        '--rgw-zone', 'default',
+                        '--rgw-zone', ctx.rgw.zone,
                         '--placement-id', 'default-placement',
-                        '--storage-class', storage_class,
-                        '--data-pool', 'default.rgw.buckets.data.' + storage_class.lower()],
+                        '--storage-class', name,
+                        '--data-pool', 'default.rgw.buckets.data.' + name.lower()] + (args or []),
                     check_status=True)
     yield
 
@@ -333,6 +466,15 @@ def task(ctx, config):
             client.3:
               valgrind: [--tool=memcheck]
 
+    To create a custom realm, zonegroup and zone:
+
+        tasks:
+        - ceph:
+        - rgw:
+            realm: MyRealm
+            zonegroup: MyZoneGroup
+            zone: MyZone
+
     To configure data or index pool pg_size:
 
         overrides:
@@ -353,16 +495,23 @@ def task(ctx, config):
     teuthology.deep_merge(config, overrides.get('rgw', {}))
 
     ctx.rgw = argparse.Namespace()
+    ctx.rgw_cloudtier = None
 
     ctx.rgw.ec_data_pool = bool(config.pop('ec-data-pool', False))
     ctx.rgw.erasure_code_profile = config.pop('erasure_code_profile', {})
     ctx.rgw.cache_pools = bool(config.pop('cache-pools', False))
-    ctx.rgw.frontend = config.pop('frontend', 'civetweb')
+    ctx.rgw.frontend = config.pop('frontend', 'beast')
     ctx.rgw.compression_type = config.pop('compression type', None)
-    ctx.rgw.storage_classes = config.pop('storage classes', None)
+    ctx.rgw.inline_data = config.pop('inline data', True)
+    storage_classes = config.pop('storage classes', None)
     default_cert = config.pop('ssl certificate', None)
     ctx.rgw.data_pool_pg_size = config.pop('data_pool_pg_size', 64)
     ctx.rgw.index_pool_pg_size = config.pop('index_pool_pg_size', 64)
+    ctx.rgw.datacache = bool(config.pop('datacache', False))
+    ctx.rgw.datacache_path = config.pop('datacache_path', None)
+    ctx.rgw.realm = config.pop('realm', None)
+    ctx.rgw.zonegroup = config.pop('zonegroup', 'default')
+    ctx.rgw.zone = config.pop('zone', 'default')
     ctx.rgw.config = config
 
     log.debug("config is {}".format(config))
@@ -373,15 +522,28 @@ def task(ctx, config):
     subtasks = [
         lambda: create_pools(ctx=ctx, clients=clients),
     ]
+    if ctx.rgw.realm:
+        subtasks.extend([
+            lambda: create_realm(ctx=ctx, clients=clients),
+        ])
     if ctx.rgw.compression_type:
         subtasks.extend([
             lambda: configure_compression(ctx=ctx, clients=clients,
                                           compression=ctx.rgw.compression_type),
         ])
-    if ctx.rgw.storage_classes:
+    if not ctx.rgw.inline_data:
+        subtasks.extend([
+            lambda: disable_inline_data(ctx=ctx, clients=clients),
+        ])
+    if ctx.rgw.datacache:
+        subtasks.extend([
+            lambda: configure_datacache(ctx=ctx, clients=clients,
+                                        datacache_path=ctx.rgw.datacache_path),
+        ])
+    if storage_classes:
         subtasks.extend([
             lambda: configure_storage_classes(ctx=ctx, clients=clients,
-                                              storage_classes=ctx.rgw.storage_classes),
+                                              storage_classes=storage_classes),
         ])
     subtasks.extend([
         lambda: start_rgw(ctx=ctx, config=config, clients=clients),

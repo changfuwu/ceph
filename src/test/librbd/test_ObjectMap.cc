@@ -17,6 +17,8 @@
 #include <boost/accumulators/statistics/stats.hpp>
 #include <boost/accumulators/statistics/rolling_sum.hpp>
 
+#include <shared_mutex> // for std::shared_lock
+
 void register_test_object_map() {
 }
 
@@ -157,6 +159,8 @@ TEST_F(TestObjectMap, AcquireLockInvalidatesWhenTooSmall) {
                                 &flags_set));
   ASSERT_TRUE(flags_set);
 }
+
+namespace chrono = std::chrono;
 
 TEST_F(TestObjectMap, DISABLED_StressTest) {
   REQUIRE_FEATURE(RBD_FEATURE_OBJECT_MAP);

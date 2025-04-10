@@ -1,13 +1,15 @@
 import os
 import pytest
 from ceph_volume.devices.simple import activate
+from unittest.mock import patch
 
 
 class TestActivate(object):
 
-    def test_no_data_uuid(self, factory, tmpfile, is_root, monkeypatch, capture):
-        json_config = tmpfile(contents='{}')
-        args = factory(osd_id='0', osd_fsid='1234', json_config=json_config)
+    @patch('ceph_volume.decorators.os.getuid', return_value=0)
+    def test_no_data_uuid(self, m_getuid, factory, capture, fake_filesystem):
+        fake_filesystem.create_file('/tmp/json-config', contents='{}')
+        args = factory(osd_id='0', osd_fsid='1234', json_config='/tmp/json-config')
         with pytest.raises(RuntimeError):
             activate.Activate([]).activate(args)
 
@@ -22,7 +24,7 @@ class TestActivate(object):
         stdout, stderr = capsys.readouterr()
         assert 'Activate OSDs by mounting devices previously configured' in stdout
 
-    def test_activate_all(self, is_root, monkeypatch):
+    def test_activate_all(self, monkeypatch):
         '''
         make sure Activate calls activate for each file returned by glob
         '''
@@ -45,9 +47,9 @@ class TestActivate(object):
 
 class TestEnableSystemdUnits(object):
 
-    def test_nothing_is_activated(self, tmpfile, is_root, capsys):
-        json_config = tmpfile(contents='{}')
-        activation = activate.Activate(['--no-systemd', '--file', json_config, '0', '1234'], from_trigger=True)
+    def test_nothing_is_activated(self, is_root, capsys, fake_filesystem):
+        fake_filesystem.create_file('/tmp/json-config', contents='{}')
+        activation = activate.Activate(['--no-systemd', '--file', '/tmp/json-config', '0', '1234'], from_trigger=True)
         activation.activate = lambda x: True
         activation.main()
         activation.enable_systemd_units('0', '1234')
@@ -56,69 +58,69 @@ class TestEnableSystemdUnits(object):
         assert 'Skipping masking of ceph-disk' in stderr
         assert 'Skipping enabling and starting OSD simple' in stderr
 
-    def test_no_systemd_flag_is_true(self, tmpfile, is_root):
-        json_config = tmpfile(contents='{}')
-        activation = activate.Activate(['--no-systemd', '--file', json_config, '0', '1234'], from_trigger=True)
+    def test_no_systemd_flag_is_true(self, is_root, fake_filesystem):
+        fake_filesystem.create_file('/tmp/json-config', contents='{}')
+        activation = activate.Activate(['--no-systemd', '--file', '/tmp/json-config', '0', '1234'], from_trigger=True)
         activation.activate = lambda x: True
         activation.main()
         assert activation.skip_systemd is True
 
-    def test_no_systemd_flag_is_false(self, tmpfile, is_root):
-        json_config = tmpfile(contents='{}')
-        activation = activate.Activate(['--file', json_config, '0', '1234'], from_trigger=True)
+    def test_no_systemd_flag_is_false(self, is_root, fake_filesystem):
+        fake_filesystem.create_file('/tmp/json-config', contents='{}')
+        activation = activate.Activate(['--file', '/tmp/json-config', '0', '1234'], from_trigger=True)
         activation.activate = lambda x: True
         activation.main()
         assert activation.skip_systemd is False
 
-    def test_masks_ceph_disk(self, tmpfile, is_root, monkeypatch, capture):
+    def test_masks_ceph_disk(self, is_root, monkeypatch, capture, fake_filesystem):
         monkeypatch.setattr('ceph_volume.systemd.systemctl.mask_ceph_disk', capture)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.enable_volume', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.enable_osd', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.start_osd', lambda *a: True)
 
-        json_config = tmpfile(contents='{}')
-        activation = activate.Activate(['--file', json_config, '0', '1234'], from_trigger=False)
+        fake_filesystem.create_file('/tmp/json-config', contents='{}')
+        activation = activate.Activate(['--file', '/tmp/json-config', '0', '1234'], from_trigger=False)
         activation.activate = lambda x: True
         activation.main()
         activation.enable_systemd_units('0', '1234')
         assert len(capture.calls) == 1
 
-    def test_enables_simple_unit(self, tmpfile, is_root, monkeypatch, capture):
+    def test_enables_simple_unit(self, is_root, monkeypatch, capture, fake_filesystem):
         monkeypatch.setattr('ceph_volume.systemd.systemctl.mask_ceph_disk', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.enable_volume', capture)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.enable_osd', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.start_osd', lambda *a: True)
 
-        json_config = tmpfile(contents='{}')
-        activation = activate.Activate(['--file', json_config, '0', '1234'], from_trigger=False)
+        fake_filesystem.create_file('/tmp/json-config', contents='{}')
+        activation = activate.Activate(['--file', '/tmp/json-config', '0', '1234'], from_trigger=False)
         activation.activate = lambda x: True
         activation.main()
         activation.enable_systemd_units('0', '1234')
         assert len(capture.calls) == 1
         assert capture.calls[0]['args'] == ('0', '1234', 'simple')
 
-    def test_enables_osd_unit(self, tmpfile, is_root, monkeypatch, capture):
+    def test_enables_osd_unit(self, is_root, monkeypatch, capture, fake_filesystem):
         monkeypatch.setattr('ceph_volume.systemd.systemctl.mask_ceph_disk', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.enable_volume', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.enable_osd', capture)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.start_osd', lambda *a: True)
 
-        json_config = tmpfile(contents='{}')
-        activation = activate.Activate(['--file', json_config, '0', '1234'], from_trigger=False)
+        fake_filesystem.create_file('/tmp/json-config', contents='{}')
+        activation = activate.Activate(['--file', '/tmp/json-config', '0', '1234'], from_trigger=False)
         activation.activate = lambda x: True
         activation.main()
         activation.enable_systemd_units('0', '1234')
         assert len(capture.calls) == 1
         assert capture.calls[0]['args'] == ('0',)
 
-    def test_starts_osd_unit(self, tmpfile, is_root, monkeypatch, capture):
+    def test_starts_osd_unit(self, is_root, monkeypatch, capture, fake_filesystem):
         monkeypatch.setattr('ceph_volume.systemd.systemctl.mask_ceph_disk', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.enable_volume', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.enable_osd', lambda *a: True)
         monkeypatch.setattr('ceph_volume.systemd.systemctl.start_osd', capture)
 
-        json_config = tmpfile(contents='{}')
-        activation = activate.Activate(['--file', json_config, '0', '1234'], from_trigger=False)
+        fake_filesystem.create_file('/tmp/json-config', contents='{}')
+        activation = activate.Activate(['--file', '/tmp/json-config', '0', '1234'], from_trigger=False)
         activation.activate = lambda x: True
         activation.main()
         activation.enable_systemd_units('0', '1234')
@@ -127,42 +129,6 @@ class TestEnableSystemdUnits(object):
 
 
 class TestValidateDevices(object):
-
-    def test_filestore_missing_journal(self):
-        activation = activate.Activate([])
-        with pytest.raises(RuntimeError) as error:
-            activation.validate_devices({'type': 'filestore', 'data': {}})
-        assert 'Unable to activate filestore OSD due to missing devices' in str(error.value)
-
-    def test_filestore_missing_data(self):
-        activation = activate.Activate([])
-        with pytest.raises(RuntimeError) as error:
-            activation.validate_devices({'type': 'filestore', 'journal': {}})
-        assert 'Unable to activate filestore OSD due to missing devices' in str(error.value)
-
-    def test_filestore_journal_device_found(self, capsys):
-        activation = activate.Activate([])
-        with pytest.raises(RuntimeError):
-            activation.validate_devices({'type': 'filestore', 'journal': {}})
-        stdout, stderr = capsys.readouterr()
-        assert "devices found: ['journal']" in stderr
-
-    def test_filestore_data_device_found(self, capsys):
-        activation = activate.Activate([])
-        with pytest.raises(RuntimeError):
-            activation.validate_devices({'type': 'filestore', 'data': {}})
-        stdout, stderr = capsys.readouterr()
-        assert "devices found: ['data']" in stderr
-
-    def test_filestore_with_all_devices(self):
-        activation = activate.Activate([])
-        result = activation.validate_devices({'type': 'filestore', 'journal': {}, 'data': {}})
-        assert result is True
-
-    def test_filestore_without_type(self):
-        activation = activate.Activate([])
-        result = activation.validate_devices({'journal': {}, 'data': {}})
-        assert result is True
 
     def test_bluestore_with_all_devices(self):
         activation = activate.Activate([])

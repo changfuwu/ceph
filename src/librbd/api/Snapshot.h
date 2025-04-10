@@ -21,7 +21,7 @@ struct Snapshot {
                                  snap_group_namespace_t *group_snap);
 
   static int get_trash_namespace(ImageCtxT *ictx, uint64_t snap_id,
-                                 std::string *original_name);
+                                 snap_trash_namespace_t *trash_snap);
 
   static int get_mirror_namespace(
       ImageCtxT *ictx, uint64_t snap_id,
@@ -40,6 +40,9 @@ struct Snapshot {
 
   static int exists(ImageCtxT *ictx, const cls::rbd::SnapshotNamespace& snap_namespace,
 		    const char *snap_name, bool *exists);
+
+  static int create(ImageCtxT *ictx, const char *snap_name, uint32_t flags,
+                    ProgressContext& pctx);
 
   static int remove(ImageCtxT *ictx, const char *snap_name, uint32_t flags, ProgressContext& pctx);
 

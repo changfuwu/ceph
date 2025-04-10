@@ -1,21 +1,20 @@
-import { Component, OnInit } from '@angular/core';
+import { Component } from '@angular/core';
 
-import { Icons } from '../../../shared/enum/icons.enum';
-import { Permission } from '../../../shared/models/permissions';
-import { AuthStorageService } from '../../../shared/services/auth-storage.service';
+import { Permission } from '~/app/shared/models/permissions';
+import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 
 @Component({
   selector: 'cd-administration',
   templateUrl: './administration.component.html',
   styleUrls: ['./administration.component.scss']
 })
-export class AdministrationComponent implements OnInit {
+export class AdministrationComponent {
   userPermission: Permission;
-  icons = Icons;
+  configOptPermission: Permission;
 
   constructor(private authStorageService: AuthStorageService) {
-    this.userPermission = this.authStorageService.getPermissions().user;
+    const permissions = this.authStorageService.getPermissions();
+    this.userPermission = permissions.user;
+    this.configOptPermission = permissions.configOpt;
   }
-
-  ngOnInit() {}
 }

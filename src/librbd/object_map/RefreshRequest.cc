@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/object_map/RefreshRequest.h"
@@ -12,6 +12,8 @@
 #include "librbd/object_map/ResizeRequest.h"
 #include "librbd/Utils.h"
 #include "osdc/Striper.h"
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -133,6 +135,11 @@ Context *RefreshRequest<I>::handle_load(int *ret_val) {
     return nullptr;
   } else if (*ret_val < 0) {
     lderr(cct) << "failed to load object map: " << oid << dendl;
+    if (*ret_val == -ETIMEDOUT &&
+        !cct->_conf.get_val<bool>("rbd_invalidate_object_map_on_timeout")) {
+      return m_on_finish;
+    }
+
     send_invalidate();
     return nullptr;
   }
@@ -236,7 +243,7 @@ void RefreshRequest<I>::send_resize() {
 
   librados::ObjectWriteOperation op;
   if (m_snap_id == CEPH_NOSNAP) {
-    rados::cls::lock::assert_locked(&op, RBD_LOCK_NAME, LOCK_EXCLUSIVE, "", "");
+    rados::cls::lock::assert_locked(&op, RBD_LOCK_NAME, ClsLockType::EXCLUSIVE, "", "");
   }
   if (m_truncate_on_disk_object_map) {
     op.truncate(0);

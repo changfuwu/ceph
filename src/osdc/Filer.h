@@ -26,21 +26,26 @@
  * "files" are identified by ino.
  */
 
-
-#include <mutex>
-
+#include "osd/osd_types.h"
+#include "include/fs_types.h"
 #include "include/types.h"
+#include "include/utime.h"
 
 #include "common/ceph_time.h"
 
-#include "osd/OSDMap.h"
 #include "Objecter.h"
 #include "Striper.h"
 
+#include <map>
+#include <mutex>
+#include <set>
+#include <vector>
+
 class Context;
 class Messenger;
-class OSDMap;
 class Finisher;
+struct SnapContext;
+class utime_t;
 
 
 /**** Filer interface ***/
@@ -80,7 +85,7 @@ class Filer {
     int err;
     bool found_size;
 
-    Probe(inodeno_t i, file_layout_t &l, snapid_t sn,
+    Probe(inodeno_t i, const file_layout_t &l, snapid_t sn,
 	  uint64_t f, uint64_t *e, ceph::real_time *m, int fl, bool fw,
 	  Context *c) :
       ino(i), layout(l), snapid(sn),
@@ -88,7 +93,7 @@ class Filer {
       probing_off(f), probing_len(0),
       err(0), found_size(false) {}
 
-    Probe(inodeno_t i, file_layout_t &l, snapid_t sn,
+    Probe(inodeno_t i, const file_layout_t &l, snapid_t sn,
 	  uint64_t f, uint64_t *e, utime_t *m, int fl, bool fw,
 	  Context *c) :
       ino(i), layout(l), snapid(sn),
@@ -118,7 +123,7 @@ class Filer {
   /*** async file interface.  scatter/gather as needed. ***/
 
   void read(inodeno_t ino,
-	   file_layout_t *layout,
+	   const file_layout_t *layout,
 	   snapid_t snap,
 	   uint64_t offset,
 	   uint64_t len,
@@ -133,7 +138,7 @@ class Filer {
   }
 
   void read_trunc(inodeno_t ino,
-		 file_layout_t *layout,
+		 const file_layout_t *layout,
 		 snapid_t snap,
 		 uint64_t offset,
 		 uint64_t len,
@@ -152,7 +157,7 @@ class Filer {
   }
 
   void write(inodeno_t ino,
-	    file_layout_t *layout,
+	    const file_layout_t *layout,
 	    const SnapContext& snapc,
 	    uint64_t offset,
 	    uint64_t len,
@@ -167,7 +172,7 @@ class Filer {
   }
 
   void write_trunc(inodeno_t ino,
-		  file_layout_t *layout,
+		  const file_layout_t *layout,
 		  const SnapContext& snapc,
 		  uint64_t offset,
 		  uint64_t len,
@@ -186,7 +191,7 @@ class Filer {
   }
 
   void truncate(inodeno_t ino,
-	       file_layout_t *layout,
+	       const file_layout_t *layout,
 	       const SnapContext& snapc,
 	       uint64_t offset,
 	       uint64_t len,
@@ -233,7 +238,7 @@ class Filer {
   }
 
   void zero(inodeno_t ino,
-	   file_layout_t *layout,
+	   const file_layout_t *layout,
 	   const SnapContext& snapc,
 	   uint64_t offset,
 	   uint64_t len,
@@ -253,7 +258,7 @@ class Filer {
 		  uint64_t first_obj, uint64_t num_obj,
 		  ceph::real_time mtime,
 		  int flags, Context *oncommit);
-  void _do_purge_range(struct PurgeRange *pr, int fin);
+  void _do_purge_range(struct PurgeRange *pr, int fin, int err);
 
   /*
    * probe
@@ -261,7 +266,7 @@ class Filer {
    *  and whether we stop when we find data, or hole.
    */
   int probe(inodeno_t ino,
-	    file_layout_t *layout,
+	    const file_layout_t *layout,
 	    snapid_t snapid,
 	    uint64_t start_from,
 	    uint64_t *end,
@@ -271,7 +276,7 @@ class Filer {
 	    Context *onfinish);
 
   int probe(inodeno_t ino,
-	    file_layout_t *layout,
+	    const file_layout_t *layout,
 	    snapid_t snapid,
 	    uint64_t start_from,
 	    uint64_t *end,
@@ -283,7 +288,7 @@ class Filer {
   }
 
   int probe(inodeno_t ino,
-	    file_layout_t *layout,
+	    const file_layout_t *layout,
 	    snapid_t snapid,
 	    uint64_t start_from,
 	    uint64_t *end,
@@ -293,7 +298,7 @@ class Filer {
 	    Context *onfinish);
 
 private:
-  int probe_impl(Probe* probe, file_layout_t *layout,
+  int probe_impl(Probe* probe, const file_layout_t *layout,
 		 uint64_t start_from, uint64_t *end);
 };
 

@@ -30,6 +30,8 @@
 #include "global/global_context.h"
 #include "gtest/gtest.h"
 
+using namespace std;
+
 void* thread1(void* pParam);
 void* thread2(void* pParam);
 void* thread3(void* pParam);
@@ -967,15 +969,15 @@ TEST(ErasureCodeShec, minimum_to_decode_8)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode
-  set<int> want_to_decode;
-  set<int> available_chunks;
-  set<int> minimum_chunks;
+  shard_id_set want_to_decode;
+  shard_id_set available_chunks;
+  shard_id_set minimum_chunks;
 
   for (int i = 0; i < 8; ++i) {
-    want_to_decode.insert(i);
+    want_to_decode.insert(shard_id_t(i));
   }
   for (int i = 0; i < 5; ++i) {
-    available_chunks.insert(i);
+    available_chunks.insert(shard_id_t(i));
   }
 
   int r = shec->_minimum_to_decode(want_to_decode, available_chunks,
@@ -1003,15 +1005,15 @@ TEST(ErasureCodeShec, minimum_to_decode_9)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode
-  set<int> want_to_decode;
-  set<int> available_chunks;
-  set<int> minimum_chunks;
+  shard_id_set want_to_decode;
+  shard_id_set available_chunks;
+  shard_id_set minimum_chunks;
 
   for (int i = 0; i < 4; ++i) {
-    want_to_decode.insert(i);
+    want_to_decode.insert(shard_id_t(i));
   }
   for (int i = 0; i < 8; ++i) {
-    available_chunks.insert(i);
+    available_chunks.insert(shard_id_t(i));
   }
 
   int r = shec->_minimum_to_decode(want_to_decode, available_chunks,
@@ -1039,15 +1041,15 @@ TEST(ErasureCodeShec, minimum_to_decode_10)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode
-  set<int> want_to_decode;
-  set<int> available_chunks;
-  set<int> minimum_chunks;
+  shard_id_set want_to_decode;
+  shard_id_set available_chunks;
+  shard_id_set minimum_chunks;
 
   for (int i = 0; i < 7; ++i) {
-    want_to_decode.insert(i);
+    want_to_decode.insert(shard_id_t(i));
   }
   for (int i = 4; i < 7; ++i) {
-    available_chunks.insert(i);
+    available_chunks.insert(shard_id_t(i));
   }
 
   int r = shec->_minimum_to_decode(want_to_decode, available_chunks,
@@ -1075,15 +1077,15 @@ TEST(ErasureCodeShec, minimum_to_decode_11)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode
-  set<int> want_to_decode;
-  set<int> available_chunks;
-  set<int> minimum_chunks;
+  shard_id_set want_to_decode;
+  shard_id_set available_chunks;
+  shard_id_set minimum_chunks;
 
   for (int i = 0; i < 5; ++i) {
-    want_to_decode.insert(i);
+    want_to_decode.insert(shard_id_t(i));
   }
   for (int i = 4; i < 7; ++i) {
-    available_chunks.insert(i);
+    available_chunks.insert(shard_id_t(i));
   }
 
   int r = shec->_minimum_to_decode(want_to_decode, available_chunks,
@@ -1111,13 +1113,13 @@ TEST(ErasureCodeShec, minimum_to_decode_12)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode
-  set<int> want_to_decode;
-  set<int> available_chunks;
+  shard_id_set want_to_decode;
+  shard_id_set available_chunks;
   //minimum_chunks is NULL
 
   for (int i = 0; i < 7; ++i) {
-    want_to_decode.insert(i);
-    available_chunks.insert(i);
+    want_to_decode.insert(shard_id_t(i));
+    available_chunks.insert(shard_id_t(i));
   }
 
   int r = shec->_minimum_to_decode(want_to_decode, available_chunks, NULL);
@@ -1144,18 +1146,18 @@ TEST(ErasureCodeShec, minimum_to_decode_13)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode
-  set<int> want_to_decode;
-  set<int> available_chunks;
-  set<int> minimum_chunks, minimum;
+  shard_id_set want_to_decode;
+  shard_id_set available_chunks;
+  shard_id_set minimum_chunks, minimum;
 
   for (int i = 0; i < 7; ++i) {
-    want_to_decode.insert(i);
-    available_chunks.insert(i);
+    want_to_decode.insert(shard_id_t(i));
+    available_chunks.insert(shard_id_t(i));
   }
   shec->_minimum_to_decode(want_to_decode, available_chunks, &minimum_chunks);
   minimum = minimum_chunks;		//normal value
   for (int i = 100; i < 120; ++i) {
-    minimum_chunks.insert(i);	//insert extra data
+    minimum_chunks.insert(shard_id_t(i));	//insert extra data
   }
 
   int r = shec->_minimum_to_decode(want_to_decode, available_chunks,
@@ -1185,14 +1187,14 @@ TEST(ErasureCodeShec, minimum_to_decode2_1)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode
-  set<int> want_to_decode;
-  set<int> available_chunks;
-  set<int> minimum_chunks;
+  shard_id_set want_to_decode;
+  shard_id_set available_chunks;
+  shard_id_set minimum_chunks;
 
-  want_to_decode.insert(0);
-  available_chunks.insert(0);
-  available_chunks.insert(1);
-  available_chunks.insert(2);
+  want_to_decode.insert(shard_id_t(0));
+  available_chunks.insert(shard_id_t(0));
+  available_chunks.insert(shard_id_t(1));
+  available_chunks.insert(shard_id_t(2));
 
   int r = shec->_minimum_to_decode(want_to_decode, available_chunks,
 				   &minimum_chunks);
@@ -1221,16 +1223,16 @@ TEST(ErasureCodeShec, minimum_to_decode2_3)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode
-  set<int> want_to_decode;
-  set<int> available_chunks;
-  set<int> minimum_chunks;
+  shard_id_set want_to_decode;
+  shard_id_set available_chunks;
+  shard_id_set minimum_chunks;
 
-  want_to_decode.insert(0);
-  want_to_decode.insert(2);
-  available_chunks.insert(0);
-  available_chunks.insert(1);
-  available_chunks.insert(2);
-  available_chunks.insert(3);
+  want_to_decode.insert(shard_id_t(0));
+  want_to_decode.insert(shard_id_t(2));
+  available_chunks.insert(shard_id_t(0));
+  available_chunks.insert(shard_id_t(1));
+  available_chunks.insert(shard_id_t(2));
+  available_chunks.insert(shard_id_t(3));
 
   pthread_t tid;
   g_flag = 0;
@@ -1270,13 +1272,13 @@ TEST(ErasureCodeShec, minimum_to_decode_with_cost_1)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode_with_cost
-  set<int> want_to_decode;
-  map<int, int> available_chunks;
-  set<int> minimum_chunks;
+  shard_id_set want_to_decode;
+  shard_id_map<int> available_chunks(shec->get_chunk_count());
+  shard_id_set minimum_chunks;
 
   for (int i = 0; i < 7; ++i) {
-    want_to_decode.insert(i);
-    available_chunks.insert(make_pair(i, i));
+    want_to_decode.insert(shard_id_t(i));
+    available_chunks.insert(shard_id_t(i), i);
   }
 
   int r = shec->minimum_to_decode_with_cost(want_to_decode, available_chunks,
@@ -1306,16 +1308,16 @@ TEST(ErasureCodeShec, minimum_to_decode_with_cost_2_3)
   shec->init(*profile, &cerr);
 
   //minimum_to_decode_with_cost
-  set<int> want_to_decode;
-  map<int, int> available_chunks;
-  set<int> minimum_chunks;
+  shard_id_set want_to_decode;
+  shard_id_map<int> available_chunks(shec->get_chunk_count());
+  shard_id_set minimum_chunks;
 
-  want_to_decode.insert(0);
-  want_to_decode.insert(2);
-  available_chunks[0] = 0;
-  available_chunks[1] = 1;
-  available_chunks[2] = 2;
-  available_chunks[3] = 3;
+  want_to_decode.insert(shard_id_t(0));
+  want_to_decode.insert(shard_id_t(2));
+  available_chunks[shard_id_t(0)] = 0;
+  available_chunks[shard_id_t(1)] = 1;
+  available_chunks[shard_id_t(2)] = 2;
+  available_chunks[shard_id_t(3)] = 3;
 
   pthread_t tid;
   g_flag = 0;
@@ -1338,6 +1340,7 @@ TEST(ErasureCodeShec, minimum_to_decode_with_cost_2_3)
   delete profile;
 }
 
+IGNORE_DEPRECATED
 TEST(ErasureCodeShec, encode_1)
 {
   //init
@@ -2364,7 +2367,7 @@ TEST(ErasureCodeShec, decode2_4)
 
 TEST(ErasureCodeShec, create_rule_1_2)
 {
-  //create ruleset
+  //create rule
   CrushWrapper *crush = new CrushWrapper;
   crush->create();
   crush->set_type_name(2, "root");
@@ -2422,7 +2425,7 @@ TEST(ErasureCodeShec, create_rule_1_2)
 
 TEST(ErasureCodeShec, create_rule_4)
 {
-  //create ruleset
+  //create rule
   CrushWrapper *crush = new CrushWrapper;
   crush->create();
   crush->set_type_name(2, "root");
@@ -2473,7 +2476,7 @@ TEST(ErasureCodeShec, create_rule_4)
 
 TEST(ErasureCodeShec, create_rule2_1)
 {
-  //create ruleset
+  //create rule
   CrushWrapper *crush = new CrushWrapper;
   crush->create();
   crush->set_type_name(2, "root");
@@ -2532,7 +2535,7 @@ struct CreateRuleset2_3_Param_d {
 
 TEST(ErasureCodeShec, create_rule2_3)
 {
-  //create ruleset
+  //create rule
   CrushWrapper *crush = new CrushWrapper;
   crush->create();
   crush->set_type_name(2, "root");
@@ -2819,3 +2822,4 @@ void* thread5(void* pParam)
 
   return NULL;
 }
+END_IGNORE_DEPRECATED

@@ -1,40 +1,37 @@
 import { Component, Input, OnChanges, OnInit, TemplateRef, ViewChild } from '@angular/core';
-import { Validators } from '@angular/forms';
+import { AbstractControl, Validators } from '@angular/forms';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
-import {
-  ITreeOptions,
-  TreeComponent,
-  TreeModel,
-  TreeNode,
-  TREE_ACTIONS
-} from 'angular-tree-component';
-import * as _ from 'lodash';
-import * as moment from 'moment';
-import { BsModalRef, BsModalService } from 'ngx-bootstrap/modal';
+import { TreeViewComponent } from 'carbon-components-angular';
+import { Node } from 'carbon-components-angular/treeview/tree-node.types';
+import _ from 'lodash';
+import moment from 'moment';
 
-import { CephfsService } from '../../../shared/api/cephfs.service';
-import { ConfirmationModalComponent } from '../../../shared/components/confirmation-modal/confirmation-modal.component';
-import { CriticalConfirmationModalComponent } from '../../../shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
-import { FormModalComponent } from '../../../shared/components/form-modal/form-modal.component';
-import { ActionLabelsI18n } from '../../../shared/constants/app.constants';
-import { Icons } from '../../../shared/enum/icons.enum';
-import { NotificationType } from '../../../shared/enum/notification-type.enum';
-import { CdValidators } from '../../../shared/forms/cd-validators';
-import { CdFormModalFieldConfig } from '../../../shared/models/cd-form-modal-field-config';
-import { CdTableAction } from '../../../shared/models/cd-table-action';
-import { CdTableColumn } from '../../../shared/models/cd-table-column';
-import { CdTableSelection } from '../../../shared/models/cd-table-selection';
+import { CephfsService } from '~/app/shared/api/cephfs.service';
+import { ConfirmationModalComponent } from '~/app/shared/components/confirmation-modal/confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
+import { FormModalComponent } from '~/app/shared/components/form-modal/form-modal.component';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
+import { DeletionImpact } from '~/app/shared/enum/delete-confirmation-modal-impact.enum';
+import { Icons } from '~/app/shared/enum/icons.enum';
+import { NotificationType } from '~/app/shared/enum/notification-type.enum';
+import { CdValidators } from '~/app/shared/forms/cd-validators';
+import { CdFormModalFieldConfig } from '~/app/shared/models/cd-form-modal-field-config';
+import { CdTableAction } from '~/app/shared/models/cd-table-action';
+import { CdTableColumn } from '~/app/shared/models/cd-table-column';
+import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
 import {
   CephfsDir,
   CephfsQuotas,
   CephfsSnapshot
-} from '../../../shared/models/cephfs-directory-models';
-import { Permission } from '../../../shared/models/permissions';
-import { CdDatePipe } from '../../../shared/pipes/cd-date.pipe';
-import { DimlessBinaryPipe } from '../../../shared/pipes/dimless-binary.pipe';
-import { AuthStorageService } from '../../../shared/services/auth-storage.service';
-import { NotificationService } from '../../../shared/services/notification.service';
+} from '~/app/shared/models/cephfs-directory-models';
+import { Permission } from '~/app/shared/models/permissions';
+import { CdDatePipe } from '~/app/shared/pipes/cd-date.pipe';
+import { DimlessBinaryPipe } from '~/app/shared/pipes/dimless-binary.pipe';
+import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
+import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+import { NotificationService } from '~/app/shared/services/notification.service';
+import { TreeViewService } from '~/app/shared/services/tree-view.service';
 
 class QuotaSetting {
   row: {
@@ -51,21 +48,22 @@ class QuotaSetting {
   };
 }
 
+type TQuotaSettings = 'max_bytes' | 'max_files';
+
 @Component({
   selector: 'cd-cephfs-directories',
   templateUrl: './cephfs-directories.component.html',
   styleUrls: ['./cephfs-directories.component.scss']
 })
 export class CephfsDirectoriesComponent implements OnInit, OnChanges {
-  @ViewChild(TreeComponent, { static: false })
-  treeComponent: TreeComponent;
+  @ViewChild(TreeViewComponent)
+  treeComponent: TreeViewComponent;
   @ViewChild('origin', { static: true })
   originTmpl: TemplateRef<any>;
 
   @Input()
   id: number;
 
-  private modalRef: BsModalRef;
   private dirs: CephfsDir[];
   private nodeIds: { [path: string]: CephfsDir };
   private requestedPaths: string[];
@@ -73,20 +71,7 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
 
   icons = Icons;
   loadingIndicator = false;
-  loading = {};
-  treeOptions: ITreeOptions = {
-    useVirtualScroll: true,
-    getChildren: (node: TreeNode): Promise<any[]> => {
-      return this.updateDirectory(node.id);
-    },
-    actionMapping: {
-      mouse: {
-        click: this.selectAndShowNode.bind(this),
-        expanderClick: this.selectAndShowNode.bind(this)
-      }
-    }
-  };
-
+  loading: Record<string, boolean> = {};
   permission: Permission;
   selectedDir: CephfsDir;
   settings: QuotaSetting[];
@@ -102,31 +87,28 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     tableActions: CdTableAction[];
     updateSelection: Function;
   };
-  nodes: any[];
+  nodes: Node[] = [];
+  alreadyExists: boolean;
 
   constructor(
     private authStorageService: AuthStorageService,
-    private modalService: BsModalService,
+    private modalService: ModalCdsService,
     private cephfsService: CephfsService,
     private cdDatePipe: CdDatePipe,
-    private i18n: I18n,
     private actionLabels: ActionLabelsI18n,
     private notificationService: NotificationService,
-    private dimlessBinaryPipe: DimlessBinaryPipe
+    private dimlessBinaryPipe: DimlessBinaryPipe,
+    private treeViewService: TreeViewService
   ) {}
 
-  private selectAndShowNode(tree: TreeModel, node: TreeNode, $event: any) {
-    TREE_ACTIONS.TOGGLE_EXPANDED(tree, node, $event);
-    this.selectNode(node);
-  }
-
-  private selectNode(node: TreeNode) {
-    TREE_ACTIONS.TOGGLE_ACTIVE(undefined, node, undefined);
+  async selectNode(node: Node) {
     this.selectedDir = this.getDirectory(node);
     if (node.id === '/') {
       return;
     }
     this.setSettings(node);
+    await this.updateDirectory(node.id);
+    this.nodes = this.treeViewService.expandNode(this.nodes, node);
   }
 
   ngOnInit() {
@@ -140,18 +122,18 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
       columns: [
         {
           prop: 'row.name',
-          name: this.i18n('Name'),
+          name: $localize`Name`,
           flexGrow: 1
         },
         {
           prop: 'row.value',
-          name: this.i18n('Value'),
+          name: $localize`Value`,
           sortable: false,
           flexGrow: 1
         },
         {
           prop: 'row.originPath',
-          name: this.i18n('Origin'),
+          name: $localize`Origin`,
           sortable: false,
           cellTemplate: this.originTmpl,
           flexGrow: 1
@@ -194,18 +176,18 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
       columns: [
         {
           prop: 'name',
-          name: this.i18n('Name'),
+          name: $localize`Name`,
           flexGrow: 1
         },
         {
           prop: 'path',
-          name: this.i18n('Path'),
-          isHidden: true,
-          flexGrow: 2
+          name: $localize`Path`,
+          flexGrow: 1.5,
+          cellTransformation: CellTemplate.path
         },
         {
           prop: 'created',
-          name: this.i18n('Created'),
+          name: $localize`Created`,
           flexGrow: 1,
           pipe: this.cdDatePipe
         }
@@ -220,18 +202,27 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
           icon: Icons.add,
           permission: 'create',
           canBePrimary: (selection) => !selection.hasSelection,
-          click: () => this.createSnapshot()
+          click: () => this.createSnapshot(),
+          disable: () => this.disableCreateSnapshot()
         },
         {
           name: this.actionLabels.DELETE,
           icon: Icons.destroy,
           permission: 'delete',
-          click: () => this.deleteSnapshotModal(),
-          canBePrimary: (selection) => selection.hasSelection,
-          disable: (selection) => !selection.hasSelection
+          click: () => this.deleteSnapshotModal()
         }
       ]
     };
+  }
+
+  private disableCreateSnapshot(): string | boolean {
+    const folders = this.selectedDir.path.split('/').slice(1);
+    // With depth of 4 or more we have the subvolume files/folders for which we cannot create
+    // a snapshot. Somehow, you can create a snapshot of the subvolume but not its files.
+    if (folders.length >= 4 && folders[0] === 'volumes') {
+      return $localize`Cannot create snapshots for files/folders in the subvolume ${folders[2]}`;
+    }
+    return false;
   }
 
   ngOnChanges() {
@@ -249,20 +240,21 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     this.nodes = [
       {
         name: '/',
+        label: '/',
         id: '/',
-        isExpanded: true
+        expanded: true
       }
     ];
   }
 
   private firstCall() {
     const path = '/';
-    setTimeout(() => {
-      this.getNode(path).loadNodeChildren();
+    setTimeout(async () => {
+      await this.updateDirectory(path);
     }, 10);
   }
 
-  updateDirectory(path: string): Promise<any[]> {
+  updateDirectory(path: string): Promise<Node[]> {
     this.unsetLoadingIndicator();
     if (!this.requestedPaths.includes(path)) {
       this.requestedPaths.push(path);
@@ -277,6 +269,11 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
         this.updateTree();
         resolve(this.getChildren(path));
         this.setLoadingIndicator(path, false);
+
+        const hasActiveNodes = !!this.treeViewService.findNode(true, this.nodes, 'active');
+        if (path === '/' && !hasActiveNodes) {
+          this.treeComponent.select.emit(this.getNode('/'));
+        }
       });
     });
   }
@@ -290,22 +287,34 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     return tree.filter((d) => d.parent === path);
   }
 
-  private getChildren(path: string): any[] {
+  private getChildren(path: string): Node[] {
     const subTree = this.getSubTree(path);
     return _.sortBy(this.getSubDirectories(path), 'path').map((dir) =>
       this.createNode(dir, subTree)
     );
   }
 
-  private createNode(dir: CephfsDir, subTree?: CephfsDir[]): any {
+  private createNode(dir: CephfsDir, subTree?: CephfsDir[]): Node {
     this.nodeIds[dir.path] = dir;
     if (!subTree) {
       this.getSubTree(dir.parent);
     }
+
+    if (dir.path === '/volumes') {
+      const innerNode = this.treeViewService.findNode('/volumes', this.nodes);
+      if (innerNode) {
+        this.treeComponent.select.emit(innerNode);
+      }
+    }
     return {
+      label: dir.name,
       name: dir.name,
       id: dir.path,
-      hasChildren: this.getSubDirectories(dir.path, subTree).length > 0
+      expanded: dir.path === '/volumes',
+      children: this.getSubDirectories(dir.path, subTree).map(this.toNode),
+      value: {
+        parent: dir?.parent
+      }
     };
   }
 
@@ -313,7 +322,7 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     return this.dirs.filter((d) => d.parent && d.parent.startsWith(path));
   }
 
-  private setSettings(node: TreeNode) {
+  private setSettings(node: Node) {
     const readable = (value: number, fn?: (arg0: number) => number | string): number | string =>
       value ? (fn ? fn(value) : value) : '';
 
@@ -326,8 +335,8 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
   }
 
   private getQuota(
-    tree: TreeNode,
-    quotaKey: string,
+    tree: Node,
+    quotaKey: TQuotaSettings,
     valueConvertFn: (number: number) => number | string
   ): QuotaSetting {
     // Get current maximum
@@ -340,18 +349,21 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     let nextMaxValue = value;
     let nextMaxPath = dir.path;
     if (tree.id === currentPath) {
-      if (tree.parent.id === '/') {
+      if (tree.value?.parent === '/') {
         // The value will never inherit any other value, so it has no maximum.
         nextMaxValue = 0;
       } else {
-        const nextMaxDir = this.getDirectory(this.getOrigin(tree.parent, quotaKey));
-        nextMaxValue = nextMaxDir.quotas[quotaKey];
-        nextMaxPath = nextMaxDir.path;
+        const parent = this.getParent(this.dirs, tree.value?.parent);
+        if (parent) {
+          const nextMaxDir = this.getDirectory(this.getOrigin(parent, quotaKey));
+          nextMaxValue = nextMaxDir.quotas[quotaKey];
+          nextMaxPath = nextMaxDir.path;
+        }
       }
     }
     return {
       row: {
-        name: quotaKey === 'max_bytes' ? this.i18n('Max size') : this.i18n('Max files'),
+        name: quotaKey === 'max_bytes' ? $localize`Max size` : $localize`Max files`,
         value: valueConvertFn(value),
         originPath: value ? dir.path : ''
       },
@@ -377,12 +389,13 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
    * | /a (10)       |     4th    |       10 => true      |   /a   |
    *
    */
-  private getOrigin(tree: TreeNode, quotaSetting: string): TreeNode {
-    if (tree.parent && tree.parent.id !== '/') {
+  private getOrigin(tree: Node, quotaSetting: TQuotaSettings): Node {
+    const parent = this.getParent(this.dirs, tree.value?.parent);
+    if (parent && parent?.id !== '/') {
       const current = this.getQuotaFromTree(tree, quotaSetting);
 
       // Get the next used quota and node above the current one (until it hits the root directory)
-      const originTree = this.getOrigin(tree.parent, quotaSetting);
+      const originTree = this.getOrigin(parent, quotaSetting);
       const inherited = this.getQuotaFromTree(originTree, quotaSetting);
 
       // Select if the current quota is in use or the above
@@ -392,21 +405,21 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     return tree;
   }
 
-  private getQuotaFromTree(tree: TreeNode, quotaSetting: string): number {
+  private getQuotaFromTree(tree: Node, quotaSetting: TQuotaSettings): number {
     return this.getDirectory(tree).quotas[quotaSetting];
   }
 
-  private getDirectory(node: TreeNode): CephfsDir {
+  private getDirectory(node: Node): CephfsDir {
     const path = node.id as string;
     return this.nodeIds[path];
   }
 
   selectOrigin(path: string) {
-    this.selectNode(this.getNode(path));
+    this.treeComponent.select.emit(this.getNode(path));
   }
 
-  private getNode(path: string): TreeNode {
-    return this.treeComponent.treeModel.getNodeById(path);
+  private getNode(path: string): Node {
+    return this.treeViewService.findNode(path, this.nodes);
   }
 
   updateQuotaModal() {
@@ -416,33 +429,28 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     const key = selection.quotaKey;
     const value = selection.dirValue;
     this.modalService.show(FormModalComponent, {
-      initialState: {
-        titleText: this.getModalQuotaTitle(
-          value === 0 ? this.actionLabels.SET : this.actionLabels.UPDATE,
-          path
-        ),
-        message: nextMax.value
-          ? this.i18n('The inherited {{quotaValue}} is the maximum value to be used.', {
-              quotaValue: this.getQuotaValueFromPathMsg(nextMax.value, nextMax.path)
-            })
-          : undefined,
-        fields: [this.getQuotaFormField(selection.row.name, key, value, nextMax.value)],
-        submitButtonText: this.i18n('Save'),
-        onSubmit: (values: CephfsQuotas) => this.updateQuota(values)
-      }
+      titleText: this.getModalQuotaTitle(
+        value === 0 ? this.actionLabels.SET : this.actionLabels.UPDATE,
+        path
+      ),
+      message: nextMax.value
+        ? $localize`The inherited ${this.getQuotaValueFromPathMsg(
+            nextMax.value,
+            nextMax.path
+          )} is the maximum value to be used.`
+        : undefined,
+      fields: [this.getQuotaFormField(selection.row.name, key, value, nextMax.value)],
+      submitButtonText: $localize`Save`,
+      onSubmit: (values: CephfsQuotas) => this.updateQuota(values)
     });
   }
 
   private getModalQuotaTitle(action: string, path: string): string {
-    return this.i18n("{{action}} CephFS {{quotaName}} quota for '{{path}}'", {
-      action,
-      quotaName: this.getQuotaName(),
-      path
-    });
+    return $localize`${action} CephFS ${this.getQuotaName()} quota for '${path}'`;
   }
 
   private getQuotaName(): string {
-    return this.isBytesQuotaSelected() ? this.i18n('size') : this.i18n('files');
+    return this.isBytesQuotaSelected() ? $localize`size` : $localize`files`;
   }
 
   private isBytesQuotaSelected(): boolean {
@@ -450,11 +458,9 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
   }
 
   private getQuotaValueFromPathMsg(value: number, path: string): string {
-    return this.i18n("{{quotaName}} quota {{value}} from '{{path}}'", {
-      value: this.isBytesQuotaSelected() ? this.dimlessBinaryPipe.transform(value) : value,
-      quotaName: this.getQuotaName(),
-      path
-    });
+    value = this.isBytesQuotaSelected() ? this.dimlessBinaryPipe.transform(value) : value;
+
+    return $localize`${this.getQuotaName()} quota ${value} from '${path}'`;
   }
 
   private getQuotaFormField(
@@ -478,8 +484,8 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     };
     if (!isBinary) {
       field.errors = {
-        min: this.i18n(`Value has to be at least {{value}} or more`, { value: 0 }),
-        max: this.i18n(`Value has to be at most {{value}} or less`, { value: maxValue })
+        min: $localize`Value has to be at least 0 or more`,
+        max: $localize`Value has to be at most ${maxValue} or less`
       };
     }
     return field;
@@ -487,14 +493,14 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
 
   private updateQuota(values: CephfsQuotas, onSuccess?: Function) {
     const path = this.selectedDir.path;
-    const key = this.quota.selection.first().quotaKey;
+    const key: TQuotaSettings = this.quota.selection.first().quotaKey;
     const action =
       this.selectedDir.quotas[key] === 0
         ? this.actionLabels.SET
         : values[key] === 0
         ? this.actionLabels.UNSET
-        : this.i18n('Updated');
-    this.cephfsService.updateQuota(this.id, path, values).subscribe(() => {
+        : $localize`Updated`;
+    this.cephfsService.quota(this.id, path, values).subscribe(() => {
       if (onSuccess) {
         onSuccess();
       }
@@ -513,26 +519,22 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     const nextMax = selection.nextTreeMaximum;
     const dirValue = selection.dirValue;
 
-    this.modalRef = this.modalService.show(ConfirmationModalComponent, {
-      initialState: {
-        titleText: this.getModalQuotaTitle(this.actionLabels.UNSET, path),
-        buttonText: this.actionLabels.UNSET,
-        description: this.i18n(`{{action}} {{quotaValue}} {{conclusion}}.`, {
-          action: this.actionLabels.UNSET,
-          quotaValue: this.getQuotaValueFromPathMsg(dirValue, path),
-          conclusion:
-            nextMax.value > 0
-              ? nextMax.value > dirValue
-                ? this.i18n('in order to inherit {{quotaValue}}', {
-                    quotaValue: this.getQuotaValueFromPathMsg(nextMax.value, nextMax.path)
-                  })
-                : this.i18n("which isn't used because of the inheritance of {{quotaValue}}", {
-                    quotaValue: this.getQuotaValueFromPathMsg(nextMax.value, nextMax.path)
-                  })
-              : this.i18n('in order to have no quota on the directory')
-        }),
-        onSubmit: () => this.updateQuota({ [key]: 0 }, () => this.modalRef.hide())
-      }
+    const quotaValue = this.getQuotaValueFromPathMsg(nextMax.value, nextMax.path);
+    const conclusion =
+      nextMax.value > 0
+        ? nextMax.value > dirValue
+          ? $localize`in order to inherit ${quotaValue}`
+          : $localize`which isn't used because of the inheritance of ${quotaValue}`
+        : $localize`in order to have no quota on the directory`;
+
+    this.modalService.show(ConfirmationModalComponent, {
+      titleText: this.getModalQuotaTitle(this.actionLabels.UNSET, path),
+      buttonText: this.actionLabels.UNSET,
+      description: $localize`${this.actionLabels.UNSET} ${this.getQuotaValueFromPathMsg(
+        dirValue,
+        path
+      )} ${conclusion}.`,
+      onSubmit: () => this.updateQuota({ [key]: 0 }, () => this.modalService.dismissAll())
     });
   }
 
@@ -540,32 +542,39 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     // Create a snapshot. Auto-generate a snapshot name by default.
     const path = this.selectedDir.path;
     this.modalService.show(FormModalComponent, {
-      initialState: {
-        titleText: this.i18n('Create Snapshot'),
-        message: this.i18n('Please enter the name of the snapshot.'),
-        fields: [
-          {
-            type: 'text',
-            name: 'name',
-            value: `${moment().toISOString(true)}`,
-            required: true
-          }
-        ],
-        submitButtonText: this.i18n('Create Snapshot'),
-        onSubmit: (values: CephfsSnapshot) => {
+      titleText: $localize`Create Snapshot`,
+      message: $localize`Please enter the name of the snapshot.`,
+      fields: [
+        {
+          type: 'text',
+          name: 'name',
+          value: `${moment().toISOString(true)}`,
+          required: true,
+          validators: [this.validateValue.bind(this)]
+        }
+      ],
+      submitButtonText: $localize`Create Snapshot`,
+      onSubmit: (values: CephfsSnapshot) => {
+        if (!this.alreadyExists) {
           this.cephfsService.mkSnapshot(this.id, path, values.name).subscribe((name) => {
             this.notificationService.show(
               NotificationType.success,
-              this.i18n('Created snapshot "{{name}}" for "{{path}}"', {
-                name: name,
-                path: path
-              })
+              $localize`Created snapshot '${name}' for '${path}'`
             );
             this.forceDirRefresh();
           });
+        } else {
+          this.notificationService.show(
+            NotificationType.error,
+            $localize`Snapshot name '${values.name}' is already in use. Please use another name.`
+          );
         }
       }
     });
+  }
+
+  validateValue(control: AbstractControl) {
+    this.alreadyExists = this.selectedDir.snapshots.some((s) => s.name === control.value);
   }
 
   /**
@@ -583,9 +592,14 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
       // Parent has to be called in order to update the object referring
       // to the current selected directory
       path = dir.parent ? dir.parent : dir.path;
+      const node = this.getNode(path);
+      this.treeComponent.select.emit(node);
+      const selectedNode = this.getNode(dir.path);
+      this.treeComponent.select.emit(selectedNode);
+      return;
     }
     const node = this.getNode(path);
-    node.loadNodeChildren();
+    this.treeComponent.select.emit(node);
   }
 
   private updateTreeStructure(dirs: CephfsDir[]) {
@@ -633,13 +647,11 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     }
     const node = this.getNode(parent);
     if (!node) {
-      // Node will not be found for new sub sub directories - this is the intended behaviour
+      // Node will not be found for new sub directories - this is the intended behaviour
       return;
     }
     const children = this.getChildren(parent);
-    node.data.children = children;
-    node.data.hasChildren = children.length > 0;
-    this.treeComponent.treeModel.update();
+    node.children = children;
   }
 
   private addNewDirectory(newDir: CephfsDir) {
@@ -666,20 +678,15 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
       // is omitted and only be called if all updates were loaded.
       return;
     }
-    this.treeComponent.treeModel.update();
     this.nodes = [...this.nodes];
-    this.treeComponent.sizeChanged();
   }
 
   deleteSnapshotModal() {
-    this.modalRef = this.modalService.show(CriticalConfirmationModalComponent, {
-      initialState: {
-        itemDescription: this.i18n('CephFs Snapshot'),
-        itemNames: this.snapshot.selection.selected.map(
-          (snapshot: CephfsSnapshot) => snapshot.name
-        ),
-        submitAction: () => this.deleteSnapshot()
-      }
+    this.modalService.show(DeleteConfirmationModalComponent, {
+      impact: DeletionImpact.high,
+      itemDescription: $localize`CephFs Snapshot`,
+      itemNames: this.snapshot.selection.selected.map((snapshot: CephfsSnapshot) => snapshot.name),
+      submitAction: () => this.deleteSnapshot()
     });
   }
 
@@ -690,14 +697,11 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
       this.cephfsService.rmSnapshot(this.id, path, name).subscribe(() => {
         this.notificationService.show(
           NotificationType.success,
-          this.i18n('Deleted snapshot "{{name}}" for "{{path}}"', {
-            name: name,
-            path: path
-          })
+          $localize`Deleted snapshot '${name}' for '${path}'`
         );
       });
     });
-    this.modalRef.hide();
+    this.modalService.dismissAll();
     this.forceDirRefresh();
   }
 
@@ -729,5 +733,31 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
       // The problem is that we can't subscribe to an useful updated tree event and the time
       // between fetching all calls and rebuilding the tree can take some time
     }, 3000);
+  }
+
+  /**
+   * Converts a CephfsDir object to Node type
+   * @param directory CephfsDir object
+   * @returns Converted Node object
+   */
+  toNode(directory: CephfsDir): Node {
+    return {
+      id: directory.path,
+      label: directory.name,
+      children: [],
+      expanded: false,
+      value: { parent: directory?.parent }
+    };
+  }
+
+  /**
+   * Get parent node for a given CephfsDir directory
+   * @param dirs CephfsDir directories array
+   * @param path Parent path
+   * @returns Parent node
+   */
+  getParent(dirs: CephfsDir[], path: string): Node {
+    const parentNode = dirs?.find?.((dir: CephfsDir) => dir.path === path);
+    return parentNode ? this.toNode(parentNode) : null;
   }
 }

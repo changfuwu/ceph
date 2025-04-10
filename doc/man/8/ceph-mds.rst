@@ -1,5 +1,7 @@
 :orphan:
 
+.. _ceph_mds_man:
+
 =========================================
  ceph-mds -- ceph metadata server daemon
 =========================================
@@ -65,13 +67,18 @@ Options
 
 .. option:: --id/-i ID
 
-   Set ID portion of the MDS name.
+   Set ID portion of the MDS name. The ID should not start with a numeric digit.
+
+.. option:: --name/-n TYPE.ID
+
+   Set the MDS name of the format TYPE.ID. The TYPE is obviously 'mds'.
+   The ID should not start with a numeric digit.
 
 Availability
 ============
 
 **ceph-mds** is part of Ceph, a massively scalable, open-source, distributed storage system. Please refer to the Ceph documentation at
-http://ceph.com/docs for more information.
+https://docs.ceph.com for more information.
 
 
 See also

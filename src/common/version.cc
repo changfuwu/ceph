@@ -14,7 +14,7 @@
 
 #include "common/version.h"
 
-#include <string.h>
+#include <stdlib.h>
 #include <sstream>
 
 #include "ceph_ver.h"
@@ -23,9 +23,14 @@
 #define _STR(x) #x
 #define STRINGIFY(x) _STR(x)
 
-const char *ceph_version_to_str(void)
+const char *ceph_version_to_str()
 {
-  return CEPH_GIT_NICE_VER;
+  char* debug_version_for_testing = getenv("ceph_debug_version_for_testing");
+  if (debug_version_for_testing) {
+    return debug_version_for_testing;
+  } else {
+    return CEPH_GIT_NICE_VER;
+  }
 }
 
 const char *ceph_release_to_str(void)
@@ -44,7 +49,11 @@ std::string const pretty_version_to_str(void)
   oss << "ceph version " << CEPH_GIT_NICE_VER
       << " (" << STRINGIFY(CEPH_GIT_VER) << ") "
       << ceph_release_name(CEPH_RELEASE)
-      << " (" << CEPH_RELEASE_TYPE << ")";
+      << " (" << CEPH_RELEASE_TYPE << ")"
+#ifdef WITH_CRIMSON
+      << " (crimson)"
+#endif
+      ;
   return oss.str();
 }
 

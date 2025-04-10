@@ -3,20 +3,15 @@ import { ComponentFixture, fakeAsync, TestBed, tick } from '@angular/core/testin
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { TabsModule } from 'ngx-bootstrap/tabs';
+import { NgbNavModule } from '@ng-bootstrap/ng-bootstrap';
 import { ToastrModule } from 'ngx-toastr';
 import { of as observableOf, throwError as observableThrowError } from 'rxjs';
 
-import {
-  configureTestBed,
-  i18nProviders,
-  PermissionHelper
-} from '../../../../../testing/unit-test-helper';
-import { MgrModuleService } from '../../../../shared/api/mgr-module.service';
-import { TableActionsComponent } from '../../../../shared/datatable/table-actions/table-actions.component';
-import { CdTableSelection } from '../../../../shared/models/cd-table-selection';
-import { NotificationService } from '../../../../shared/services/notification.service';
-import { SharedModule } from '../../../../shared/shared.module';
+import { MgrModuleService } from '~/app/shared/api/mgr-module.service';
+import { TableActionsComponent } from '~/app/shared/datatable/table-actions/table-actions.component';
+import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed, PermissionHelper } from '~/testing/unit-test-helper';
 import { MgrModuleDetailsComponent } from '../mgr-module-details/mgr-module-details.component';
 import { MgrModuleListComponent } from './mgr-module-list.component';
 
@@ -24,7 +19,6 @@ describe('MgrModuleListComponent', () => {
   let component: MgrModuleListComponent;
   let fixture: ComponentFixture<MgrModuleListComponent>;
   let mgrModuleService: MgrModuleService;
-  let notificationService: NotificationService;
 
   configureTestBed({
     declarations: [MgrModuleListComponent, MgrModuleDetailsComponent],
@@ -33,17 +27,16 @@ describe('MgrModuleListComponent', () => {
       RouterTestingModule,
       SharedModule,
       HttpClientTestingModule,
-      TabsModule.forRoot(),
+      NgbNavModule,
       ToastrModule.forRoot()
     ],
-    providers: [MgrModuleService, NotificationService, i18nProviders]
+    providers: [MgrModuleService]
   });
 
   beforeEach(() => {
     fixture = TestBed.createComponent(MgrModuleListComponent);
     component = fixture.componentInstance;
-    mgrModuleService = TestBed.get(MgrModuleService);
-    notificationService = TestBed.get(NotificationService);
+    mgrModuleService = TestBed.inject(MgrModuleService);
   });
 
   it('should create', () => {
@@ -60,43 +53,86 @@ describe('MgrModuleListComponent', () => {
     expect(tableActions).toEqual({
       'create,update,delete': {
         actions: ['Edit', 'Enable', 'Disable'],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       'create,update': {
         actions: ['Edit', 'Enable', 'Disable'],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       'create,delete': {
         actions: [],
-        primary: { multiple: '', executing: '', single: '', no: '' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
-      create: { actions: [], primary: { multiple: '', executing: '', single: '', no: '' } },
+      create: {
+        actions: [],
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
+      },
       'update,delete': {
         actions: ['Edit', 'Enable', 'Disable'],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       update: {
         actions: ['Edit', 'Enable', 'Disable'],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
-      delete: { actions: [], primary: { multiple: '', executing: '', single: '', no: '' } },
+      delete: {
+        actions: [],
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
+      },
       'no-permissions': {
         actions: [],
-        primary: { multiple: '', executing: '', single: '', no: '' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       }
     });
   });
 
-  describe('should update module state', () => {
+  describe('should update module state and component table', () => {
     beforeEach(() => {
       component.selection = new CdTableSelection();
-      spyOn(notificationService, 'suspendToasties');
-      spyOn(component.blockUI, 'start');
-      spyOn(component.blockUI, 'stop');
       spyOn(component.table, 'refreshBtn');
     });
 
-    it('should enable module', fakeAsync(() => {
+    it('should update selected module and refresh table', fakeAsync(() => {
       spyOn(mgrModuleService, 'enable').and.returnValue(observableThrowError('y'));
       spyOn(mgrModuleService, 'list').and.returnValues(observableThrowError('z'), observableOf([]));
       component.selection.add({
@@ -105,51 +141,11 @@ describe('MgrModuleListComponent', () => {
         always_on: false
       });
       component.updateModuleState();
-      tick(2000);
-      tick(2000);
+      tick(mgrModuleService.REFRESH_INTERVAL);
+      tick(mgrModuleService.REFRESH_INTERVAL);
       expect(mgrModuleService.enable).toHaveBeenCalledWith('foo');
       expect(mgrModuleService.list).toHaveBeenCalledTimes(2);
-      expect(notificationService.suspendToasties).toHaveBeenCalledTimes(2);
-      expect(component.blockUI.start).toHaveBeenCalled();
-      expect(component.blockUI.stop).toHaveBeenCalled();
       expect(component.table.refreshBtn).toHaveBeenCalled();
     }));
-
-    it('should disable module', fakeAsync(() => {
-      spyOn(mgrModuleService, 'disable').and.returnValue(observableThrowError('x'));
-      spyOn(mgrModuleService, 'list').and.returnValue(observableOf([]));
-      component.selection.add({
-        name: 'bar',
-        enabled: true,
-        always_on: false
-      });
-      component.updateModuleState();
-      tick(2000);
-      expect(mgrModuleService.disable).toHaveBeenCalledWith('bar');
-      expect(mgrModuleService.list).toHaveBeenCalledTimes(1);
-      expect(notificationService.suspendToasties).toHaveBeenCalledTimes(2);
-      expect(component.blockUI.start).toHaveBeenCalled();
-      expect(component.blockUI.stop).toHaveBeenCalled();
-      expect(component.table.refreshBtn).toHaveBeenCalled();
-    }));
-
-    it('should not disable module (1)', () => {
-      component.selection.selected = [
-        {
-          name: 'dashboard'
-        }
-      ];
-      expect(component.isTableActionDisabled('enabled')).toBeTruthy();
-    });
-
-    it('should not disable module (2)', () => {
-      component.selection.selected = [
-        {
-          name: 'bar',
-          always_on: true
-        }
-      ];
-      expect(component.isTableActionDisabled('enabled')).toBeTruthy();
-    });
   });
 });

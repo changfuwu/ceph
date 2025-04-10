@@ -45,6 +45,11 @@ enum mds_metric_t {
   MDS_HEALTH_SLOW_REQUEST,
   MDS_HEALTH_CACHE_OVERSIZED,
   MDS_HEALTH_SLOW_METADATA_IO,
+  MDS_HEALTH_CLIENTS_LAGGY,
+  MDS_HEALTH_CLIENTS_LAGGY_MANY,
+  MDS_HEALTH_CLIENTS_BROKEN_ROOTSQUASH,
+  MDS_HEALTH_ESTIMATED_REPLAY_TIME,
+  MDS_HEALTH_DUMMY, // not a real health warning, for testing
 };
 
 inline const char *mds_metric_name(mds_metric_t m)
@@ -62,6 +67,11 @@ inline const char *mds_metric_name(mds_metric_t m)
   case MDS_HEALTH_SLOW_REQUEST: return "MDS_SLOW_REQUEST";
   case MDS_HEALTH_CACHE_OVERSIZED: return "MDS_CACHE_OVERSIZED";
   case MDS_HEALTH_SLOW_METADATA_IO: return "MDS_SLOW_METADATA_IO";
+  case MDS_HEALTH_CLIENTS_LAGGY: return "MDS_CLIENTS_LAGGY";
+  case MDS_HEALTH_CLIENTS_LAGGY_MANY: return "MDS_CLIENTS_LAGGY_MANY";
+  case MDS_HEALTH_CLIENTS_BROKEN_ROOTSQUASH: return "MDS_CLIENTS_BROKEN_ROOTSQUASH";
+  case MDS_HEALTH_ESTIMATED_REPLAY_TIME: return "MDS_ESTIMATED_REPLAY_TIME";
+  case MDS_HEALTH_DUMMY: return "MDS_DUMMY";
   default:
     return "???";
   }
@@ -95,6 +105,12 @@ inline const char *mds_metric_summary(mds_metric_t m)
     return "%num% MDSs report oversized cache";
   case MDS_HEALTH_SLOW_METADATA_IO:
     return "%num% MDSs report slow metadata IOs";
+  case MDS_HEALTH_CLIENTS_LAGGY:
+    return "%num% client(s) laggy due to laggy OSDs";  
+  case MDS_HEALTH_CLIENTS_BROKEN_ROOTSQUASH:
+    return "%num% MDS report clients with broken root_squash implementation";
+  case MDS_HEALTH_ESTIMATED_REPLAY_TIME:
+    return "%num% estimated journal replay time";
   default:
     return "???";
   }
@@ -131,12 +147,35 @@ struct MDSHealthMetric
 
   void decode(ceph::buffer::list::const_iterator& bl) {
     DECODE_START(1, bl);
-    decode((uint16_t&)type, bl);
+    uint16_t raw_type;
+    decode(raw_type, bl);
+    type = (mds_metric_t)raw_type;
     ceph_assert(type != MDS_HEALTH_NULL);
-    decode((uint8_t&)sev, bl);
+    uint8_t raw_sev;
+    decode(raw_sev, bl);
+    sev = (health_status_t)raw_sev;
     decode(message, bl);
     decode(metadata, bl);
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("type", mds_metric_name(type));
+    f->dump_stream("sev") << sev;
+    f->dump_string("message", message);
+    f->open_object_section("metadata");
+    for (auto& i : metadata) {
+      f->dump_string(i.first.c_str(), i.second);
+    }
+    f->close_section();
+  }
+
+  static void generate_test_instances(std::list<MDSHealthMetric*>& ls) {
+    ls.push_back(new MDSHealthMetric());
+    ls.back()->type = MDS_HEALTH_CACHE_OVERSIZED;
+    ls.push_back(new MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN, "MDS is behind on trimming"));
+    ls.back()->metadata["mds"] = "a";
+    ls.back()->metadata["num"] = "1";
   }
 
   bool operator==(MDSHealthMetric const &other) const
@@ -171,6 +210,23 @@ struct MDSHealth
     DECODE_FINISH(bl);
   }
 
+  void dump(ceph::Formatter *f) const {
+    f->open_array_section("metrics");
+    for (auto& i : metrics) {
+      f->open_object_section("metric");
+      i.dump(f);
+      f->close_section();
+    }
+    f->close_section();
+  }
+
+  static void generate_test_instances(std::list<MDSHealth*>& ls) {
+    ls.push_back(new MDSHealth);
+    ls.push_back(new MDSHealth);
+    ls.back()->metrics.push_back(MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN,
+             "MDS is behind on trimming"));
+  }
+
   bool operator==(MDSHealth const &other) const
   {
     return metrics == other.metrics;
@@ -179,7 +235,7 @@ struct MDSHealth
 WRITE_CLASS_ENCODER(MDSHealth)
 
 
-class MMDSBeacon : public PaxosServiceMessage {
+class MMDSBeacon final : public PaxosServiceMessage {
 private:
 
   static constexpr int HEAD_VERSION = 8;
@@ -214,7 +270,7 @@ protected:
     mds_features(feat) {
     set_priority(CEPH_MSG_PRIO_HIGH);
   }
-  ~MMDSBeacon() override {}
+  ~MMDSBeacon() final {}
 
 public:
   const uuid_d& get_fsid() const { return fsid; }
@@ -273,7 +329,9 @@ public:
     paxos_decode(p);
     decode(fsid, p);
     decode(global_id, p);
-    decode((__u32&)state, p);
+    __u32 raw_state;
+    decode(raw_state, p);
+    state = (MDSMap::DaemonState)raw_state;
     decode(seq, p);
     decode(name, p);
     {
@@ -311,6 +369,8 @@ public:
 private:
   template<class T, typename... Args>
   friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
+  template<class T, typename... Args>
+  friend MURef<T> crimson::make_message(Args&&... args);
 };
 
 #endif

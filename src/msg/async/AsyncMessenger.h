@@ -18,12 +18,12 @@
 #define CEPH_ASYNCMESSENGER_H
 
 #include <map>
+#include <optional>
+#include <unordered_map>
 
 #include "include/types.h"
 #include "include/xlist.h"
 #include "include/spinlock.h"
-#include "include/unordered_map.h"
-#include "include/unordered_set.h"
 
 #include "common/ceph_mutex.h"
 #include "common/Cond.h"
@@ -35,6 +35,7 @@
 #include "Event.h"
 
 #include "include/ceph_assert.h"
+#include "common/admin_socket.h"
 
 class AsyncMessenger;
 
@@ -61,6 +62,27 @@ class Processor {
 	   entity_addrvec_t* bound_addrs);
   void start();
   void accept();
+  friend class AsyncMessenger;
+};
+
+class AsyncMessengerSocketHook : public AdminSocketHook {
+  std::map<std::string, AsyncMessenger*> m_msgrs;
+
+ public:
+  static constexpr std::string_view COMMAND =
+      "messenger dump "
+      "name=msgr,type=CephString,req=false "
+      "name=dumpcontents,type=CephChoices,"
+      "strings=all|listen_sockets|connections|anon_conns|accepting_conns|deleted_conns,"
+      "n=N,req=false "
+      "name=tcp_info,type=CephBool,req=false";
+  AsyncMessengerSocketHook(AsyncMessenger& m, const std::string& name);
+  int call(
+      std::string_view command, const cmdmap_t& cmdmap, const bufferlist&,
+      Formatter* f, std::ostream& errss, ceph::buffer::list& out) override;
+  bool add_messenger(const std::string& name, AsyncMessenger& msgr);
+  void remove_messenger(AsyncMessenger& msgr);
+  std::list<std::string> messengers() const;
 };
 
 /*
@@ -94,13 +116,12 @@ public:
    * @{
    */
   bool set_addr_unknowns(const entity_addrvec_t &addr) override;
-  void set_addrs(const entity_addrvec_t &addrs) override;
 
-  int get_dispatch_queue_len() override {
+  int get_dispatch_queue_len() const override {
     return dispatch_queue.get_queue_len();
   }
 
-  double get_dispatch_queue_max_age(utime_t now) override {
+  double get_dispatch_queue_max_age(utime_t now) const override {
     return dispatch_queue.get_max_age(now);
   }
   /** @} Accessors */
@@ -114,9 +135,11 @@ public:
     cluster_protocol = p;
   }
 
-  int bind(const entity_addr_t& bind_addr) override;
+  int bind(const entity_addr_t& bind_addr,
+	   std::optional<entity_addrvec_t> public_addrs=std::nullopt) override;
   int rebind(const std::set<int>& avoid_ports) override;
-  int bindv(const entity_addrvec_t& bind_addrs) override;
+  int bindv(const entity_addrvec_t& bind_addrs,
+	    std::optional<entity_addrvec_t> public_addrs=std::nullopt) override;
 
   int client_bind(const entity_addr_t& bind_addr) override;
 
@@ -133,6 +156,10 @@ public:
   int start() override;
   void wait() override;
   int shutdown() override;
+
+  void dump(
+      Formatter* f, std::function<bool(const std::string&)> filter =
+      [](const std::string&) { return true; }) const override;
 
   /** @} // Startup/Shutdown */
 
@@ -209,8 +236,6 @@ private:
   entity_addrvec_t _filter_addrs(const entity_addrvec_t& addrs);
 
  private:
-  static const uint64_t ReapDeadConnectionThreshold = 5;
-
   NetworkStack *stack;
   std::vector<Processor*> processors;
   friend class Processor;
@@ -222,7 +247,7 @@ private:
   std::string ms_type;
 
   /// overall lock used for AsyncMessenger data structures
-  ceph::mutex lock = ceph::make_mutex("AsyncMessenger::lock");
+  mutable ceph::mutex lock = ceph::make_mutex("AsyncMessenger::lock");
   // AsyncMessenger stuff
   /// approximately unique ID set by the Constructor for use in entity_addr_t
   uint64_t nonce;
@@ -232,10 +257,18 @@ private:
   bool need_addr = true;
 
   /**
-   * set to bind addresses if bind was called before NetworkStack was ready to
-   * bind
+   * set to bind addresses if bind or bindv were called before NetworkStack
+   * was ready to bind
    */
   entity_addrvec_t pending_bind_addrs;
+
+  /**
+   * set to public addresses (those announced by the msgr's protocols).
+   * they are stored to handle the cases when either:
+   *   a) bind or bindv were called before NetworkStack was ready to bind,
+   *   b) rebind is called down the road.
+   */
+  std::optional<entity_addrvec_t> saved_public_addrs;
 
   /**
    * false; set to true if a pending bind exists
@@ -263,7 +296,7 @@ private:
    * NOTE: a Asyncconnection* with state CLOSED may still be in the map but is considered
    * invalid and can be replaced by anyone holding the msgr lock
    */
-  ceph::unordered_map<entity_addrvec_t, AsyncConnectionRef> conns;
+  std::unordered_map<entity_addrvec_t, AsyncConnectionRef> conns;
 
   /**
    * list of connection are in the process of accepting
@@ -311,6 +344,7 @@ private:
     if (p->second->is_unregistered()) {
       std::lock_guard l{deleted_lock};
       if (deleted_conns.erase(p->second)) {
+	p->second->get_perf_counter()->dec(l_msgr_active_connections);
 	conns.erase(p);
 	return nullref;
       }
@@ -399,12 +433,10 @@ public:
    */
   void unregister_conn(const AsyncConnectionRef& conn) {
     std::lock_guard l{deleted_lock};
-    if (!accepting_conns.count(conn) || anon_conns.count(conn))
-      conn->get_perf_counter()->dec(l_msgr_active_connections);
     deleted_conns.emplace(std::move(conn));
     conn->unregister();
 
-    if (deleted_conns.size() >= ReapDeadConnectionThreshold) {
+    if (deleted_conns.size() >= cct->_conf->ms_async_reap_threshold) {
       local_worker->center.dispatch_event_external(reap_handler);
     }
   }

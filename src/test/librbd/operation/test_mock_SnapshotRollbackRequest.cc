@@ -14,6 +14,8 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
+#include <shared_mutex> // for std::shared_lock
+
 namespace librbd {
 
 namespace {
@@ -85,12 +87,12 @@ public:
   typedef ResizeRequest<MockOperationImageCtx> MockResizeRequest;
 
   void expect_block_writes(MockOperationImageCtx &mock_image_ctx, int r) {
-    EXPECT_CALL(*mock_image_ctx.io_work_queue, block_writes(_))
+    EXPECT_CALL(*mock_image_ctx.io_image_dispatcher, block_writes(_))
                   .WillOnce(CompleteContext(r, mock_image_ctx.image_ctx->op_work_queue));
   }
 
   void expect_unblock_writes(MockOperationImageCtx &mock_image_ctx) {
-    EXPECT_CALL(*mock_image_ctx.io_work_queue, unblock_writes())
+    EXPECT_CALL(*mock_image_ctx.io_image_dispatcher, unblock_writes())
                   .Times(1);
   }
 
@@ -187,7 +189,7 @@ public:
 
   void expect_invalidate_cache(MockOperationImageCtx &mock_image_ctx,
                                int r) {
-    EXPECT_CALL(*mock_image_ctx.io_object_dispatcher, invalidate_cache(_))
+    EXPECT_CALL(*mock_image_ctx.io_image_dispatcher, invalidate_cache(_))
                    .WillOnce(CompleteContext(r, mock_image_ctx.image_ctx->op_work_queue));
   }
 

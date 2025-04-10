@@ -1,42 +1,42 @@
-import { Component, OnDestroy, OnInit, TemplateRef } from '@angular/core';
-import { FormGroup } from '@angular/forms';
+import { Component, Inject, OnDestroy, OnInit, Optional, TemplateRef } from '@angular/core';
+import { UntypedFormGroup } from '@angular/forms';
 
-import { BsModalRef, BsModalService } from 'ngx-bootstrap/modal';
-import { Subscription } from 'rxjs';
+import { BaseModal } from 'carbon-components-angular';
 
 @Component({
   selector: 'cd-confirmation-modal',
   templateUrl: './confirmation-modal.component.html',
-  styleUrls: ['./confirmation-modal.component.scss']
+  styleUrls: ['./confirmation-modal.component.scss'],
+  providers: [
+    { provide: 'warning', useValue: false },
+    { provide: 'showSubmit', useValue: true },
+    { provide: 'showCancel', useValue: true }
+  ]
 })
-export class ConfirmationModalComponent implements OnInit, OnDestroy {
-  // Needed
-  buttonText: string;
-  titleText: string;
-  onSubmit: Function;
-
-  // One of them is needed
-  bodyTpl?: TemplateRef<any>;
-  description?: TemplateRef<any>;
-
-  // Optional
-  bodyData?: object;
-  onCancel?: Function;
-  bodyContext?: object;
-
+export class ConfirmationModalComponent extends BaseModal implements OnInit, OnDestroy {
   // Component only
-  boundCancel = this.cancel.bind(this);
-  confirmationForm: FormGroup;
-  private onHide: Subscription;
+  confirmationForm: UntypedFormGroup;
   private canceled = false;
 
-  constructor(public modalRef: BsModalRef, private modalService: BsModalService) {
-    this.confirmationForm = new FormGroup({});
-    this.onHide = this.modalService.onHide.subscribe((e: any) => {
-      if (this.onCancel && (e || this.canceled)) {
-        this.onCancel();
-      }
-    });
+  constructor(
+    @Optional() @Inject('titleText') public titleText: string,
+    @Optional() @Inject('buttonText') public buttonText: string,
+    @Optional() @Inject('onSubmit') public onSubmit: Function,
+
+    // One of them is needed
+    @Optional() @Inject('bodyTpl') public bodyTpl?: TemplateRef<any>,
+    @Optional() @Inject('description') public description?: TemplateRef<any>,
+
+    // Optional
+    @Optional() @Inject('warning') public warning = false,
+    @Optional() @Inject('bodyData') public bodyData?: object,
+    @Optional() @Inject('onCancel') public onCancel?: Function,
+    @Optional() @Inject('bodyContext') public bodyContext?: object,
+    @Optional() @Inject('showSubmit') public showSubmit = true,
+    @Optional() @Inject('showCancel') public showCancel = true
+  ) {
+    super();
+    this.confirmationForm = new UntypedFormGroup({});
   }
 
   ngOnInit() {
@@ -54,12 +54,9 @@ export class ConfirmationModalComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy() {
-    this.onHide.unsubscribe();
-  }
-
-  cancel() {
-    this.canceled = true;
-    this.modalRef.hide();
+    if (this.onCancel && this.canceled) {
+      this.onCancel();
+    }
   }
 
   stopLoadingSpinner() {

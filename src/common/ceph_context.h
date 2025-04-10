@@ -25,12 +25,16 @@
 #include <typeinfo>
 #include <typeindex>
 
-#include "include/common_fwd.h"
+#include <boost/intrusive_ptr.hpp>
+
 #include "include/any.h"
+#include "include/common_fwd.h"
+#include "include/compat.h"
 
 #include "common/cmdparse.h"
 #include "common/code_environment.h"
-#if defined(WITH_SEASTAR) && !defined(WITH_ALIEN)
+#include "msg/msg_types.h"
+#ifdef WITH_CRIMSON
 #include "crimson/common/config_proxy.h"
 #include "crimson/common/perf_counters_collection.h"
 #else
@@ -43,8 +47,10 @@
 #include "crush/CrushLocation.h"
 
 class AdminSocket;
+class AdminSocketHook;
 class CryptoHandler;
 class CryptoRandom;
+class MonMap;
 
 namespace ceph::common {
   class CephContextServiceThread;
@@ -57,10 +63,11 @@ namespace ceph {
   class HeartbeatMap;
   namespace logging {
     class Log;
+    class SubsystemMap;
   }
 }
 
-#if defined(WITH_SEASTAR) && !defined(WITH_ALIEN)
+#ifdef WITH_CRIMSON
 namespace crimson::common {
 class CephContext {
 public:
@@ -78,6 +85,9 @@ public:
     // everything crimson is experimental...
     return true;
   }
+  ceph::PluginRegistry* get_plugin_registry() {
+    return _plugin_registry;
+  }
   CryptoRandom* random() const;
   PerfCountersCollectionImpl* get_perfcounters_collection();
   crimson::common::ConfigProxy& _conf;
@@ -87,6 +97,7 @@ public:
 private:
   std::unique_ptr<CryptoRandom> _crypto_random;
   unsigned nref;
+  ceph::PluginRegistry* _plugin_registry;
 };
 }
 #else
@@ -105,7 +116,13 @@ public:
   CephContext(uint32_t module_type_,
               enum code_environment_t code_env=CODE_ENVIRONMENT_UTILITY,
               int init_flags_ = 0);
-
+  struct create_options {
+    enum code_environment_t code_env=CODE_ENVIRONMENT_UTILITY;
+    int init_flags = 0;
+    std::function<ceph::logging::Log* (const ceph::logging::SubsystemMap *)> create_log;
+  };
+  CephContext(uint32_t module_type_,
+	      const create_options& options);
   CephContext(const CephContext&) = delete;
   CephContext& operator =(const CephContext&) = delete;
   CephContext(CephContext&&) = delete;
@@ -258,6 +275,29 @@ public:
   void notify_pre_fork();
   void notify_post_fork();
 
+  /**
+   * update CephContext with a copy of the passed in MonMap mon addrs
+   *
+   * @param mm MonMap to extract and update mon addrs
+   */
+  void set_mon_addrs(const MonMap& mm);
+  void set_mon_addrs(const std::vector<entity_addrvec_t>& in) {
+    auto ptr = std::make_shared<std::vector<entity_addrvec_t>>(in);
+#ifdef __cpp_lib_atomic_shared_ptr
+    _mon_addrs.store(std::move(ptr), std::memory_order_relaxed);
+#else
+    atomic_store_explicit(&_mon_addrs, std::move(ptr), std::memory_order_relaxed);
+#endif
+  }
+  std::shared_ptr<std::vector<entity_addrvec_t>> get_mon_addrs() const {
+#ifdef __cpp_lib_atomic_shared_ptr
+    auto ptr = _mon_addrs.load(std::memory_order_relaxed);
+#else
+    auto ptr = atomic_load_explicit(&_mon_addrs, std::memory_order_relaxed);
+#endif
+    return ptr;
+  }
+
 private:
 
 
@@ -274,6 +314,12 @@ private:
   std::string _set_gid_string;
 
   int _crypto_inited;
+
+#ifdef __cpp_lib_atomic_shared_ptr
+  std::atomic<std::shared_ptr<std::vector<entity_addrvec_t>>> _mon_addrs;
+#else
+  std::shared_ptr<std::vector<entity_addrvec_t>> _mon_addrs;
+#endif
 
   /* libcommon service thread.
    * SIGHUP wakes this thread, which then reopens logfiles */
@@ -330,11 +376,16 @@ private:
   std::set<std::string> _experimental_features;
 
   ceph::PluginRegistry* _plugin_registry;
-
+#ifdef CEPH_DEBUG_MUTEX
   md_config_obs_t *_lockdep_obs;
+#endif
 
+  std::unique_ptr<AdminSocketHook> _msgr_hook;
+  ceph::mutex _msgr_hook_lock = ceph::make_mutex("CephContext::msgr_hook");
 public:
   TOPNSPC::crush::CrushLocation crush_location;
+  void modify_msgr_hook(std::function<AdminSocketHook*(void)> create,
+			std::function<void(AdminSocketHook*)> add);
 private:
 
   enum {
@@ -373,6 +424,19 @@ private:
 #ifdef __cplusplus
 }
 #endif
-#endif	// WITH_SEASTAR
+#endif	// WITH_CRIMSON
 
+#if !defined(WITH_CRIMSON) && defined(__cplusplus)
+namespace ceph::common {
+inline void intrusive_ptr_add_ref(CephContext* cct)
+{
+  cct->get();
+}
+
+inline void intrusive_ptr_release(CephContext* cct)
+{
+  cct->put();
+}
+}
+#endif // !defined(WITH_CRIMSON) && defined(__cplusplus)
 #endif

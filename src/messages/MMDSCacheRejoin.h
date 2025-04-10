@@ -16,18 +16,15 @@
 #define CEPH_MMDSCACHEREJOIN_H
 
 #include <string_view>
-
-#include "msg/Message.h"
-
 #include "include/types.h"
-
 #include "mds/CInode.h"
 #include "mds/CDir.h"
 #include "mds/mdstypes.h"
+#include "messages/MMDSOp.h"
 
 // sent from replica to auth
 
-class MMDSCacheRejoin : public SafeMessage {
+class MMDSCacheRejoin final : public MMDSOp {
 public:
   static constexpr int OP_WEAK    = 1;  // replica -> auth, i exist, + maybe open files.
   static constexpr int OP_STRONG  = 2;  // replica -> auth, i exist, + open files and lock state.
@@ -66,6 +63,17 @@ public:
       decode(nestlock, bl);
       decode(dftlock, bl);
     }
+    void dump(ceph::Formatter *f) const {
+      f->dump_int("nonce", nonce);
+      f->dump_int("caps_wanted", caps_wanted);
+      f->dump_int("filelock", filelock);
+      f->dump_int("nestlock", nestlock);
+      f->dump_int("dftlock", dftlock);
+    }
+    static void generate_test_instances(std::list<inode_strong*>& ls) {
+      ls.push_back(new inode_strong);
+      ls.push_back(new inode_strong(1, 2, 3, 4, 5));
+    }
   };
   WRITE_CLASS_ENCODER(inode_strong)
 
@@ -84,20 +92,28 @@ public:
       decode(nonce, bl);
       decode(dir_rep, bl);
     }
+    static void generate_test_instances(std::list<dirfrag_strong*>& ls) {
+      ls.push_back(new dirfrag_strong);
+      ls.push_back(new dirfrag_strong(1, 2));
+    }
+    void dump(ceph::Formatter *f) const {
+      f->dump_unsigned("nonce", nonce);
+      f->dump_unsigned("dir_rep", dir_rep);
+    }
   };
   WRITE_CLASS_ENCODER(dirfrag_strong)
 
   struct dn_strong {
     snapid_t first;
-    inodeno_t ino;
-    inodeno_t remote_ino;
-    unsigned char remote_d_type;
-    uint32_t nonce;
-    int32_t lock;
-    dn_strong() : 
-      ino(0), remote_ino(0), remote_d_type(0), nonce(0), lock(0) {}
-    dn_strong(snapid_t f, inodeno_t pi, inodeno_t ri, unsigned char rdt, int n, int l) : 
-      first(f), ino(pi), remote_ino(ri), remote_d_type(rdt), nonce(n), lock(l) {}
+    std::string alternate_name;
+    inodeno_t ino = 0;
+    inodeno_t remote_ino = 0;
+    unsigned char remote_d_type = 0;
+    uint32_t nonce = 0;
+    int32_t lock = 0;
+    dn_strong() = default;
+    dn_strong(snapid_t f, std::string_view altn, inodeno_t pi, inodeno_t ri,  unsigned char rdt, int n, int l) :
+      first(f), alternate_name(altn), ino(pi), remote_ino(ri), remote_d_type(rdt), nonce(n), lock(l) {}
     bool is_primary() const { return ino > 0; }
     bool is_remote() const { return remote_ino > 0; }
     bool is_null() const { return ino == 0 && remote_ino == 0; }
@@ -109,6 +125,7 @@ public:
       encode(remote_d_type, bl);
       encode(nonce, bl);
       encode(lock, bl);
+      encode(alternate_name, bl);
     }
     void decode(ceph::buffer::list::const_iterator &bl) {
       using ceph::decode;
@@ -118,14 +135,85 @@ public:
       decode(remote_d_type, bl);
       decode(nonce, bl);
       decode(lock, bl);
+      decode(alternate_name, bl);
+    }
+    static void generate_test_instances(std::list<dn_strong*>& ls) {
+      ls.push_back(new dn_strong);
+      ls.push_back(new dn_strong(1, "alternate_name", 2, 3, 4, 5, 6));
+    }
+    void dump(ceph::Formatter *f) const {
+      f->dump_unsigned("first", first);
+      f->dump_string("alternate_name", alternate_name);
+      f->dump_unsigned("ino", ino);
+      f->dump_unsigned("remote_ino", remote_ino);
+      f->dump_unsigned("remote_d_type", remote_d_type);
+      f->dump_unsigned("nonce", nonce);
+      f->dump_unsigned("lock", lock);
     }
   };
   WRITE_CLASS_ENCODER(dn_strong)
 
+  struct dn_strong_new {
+    snapid_t first;
+    std::string alternate_name;
+    inodeno_t ino = 0;
+    inodeno_t remote_ino = 0;
+    inodeno_t referent_ino = 0;
+    unsigned char remote_d_type = 0;
+    uint32_t nonce = 0;
+    int32_t lock = 0;
+    dn_strong_new() = default;
+    dn_strong_new(snapid_t f, std::string_view altn, inodeno_t pi, inodeno_t ri, inodeno_t ref_ino, unsigned char rdt, int n, int l) :
+      first(f), alternate_name(altn), ino(pi), remote_ino(ri), referent_ino(ref_ino), remote_d_type(rdt), nonce(n), lock(l) {}
+    bool is_primary() const { return ino > 0; }
+    bool is_remote() const { return remote_ino > 0 && referent_ino == 0; }
+    bool is_referent_remote() const { return remote_ino > 0 && referent_ino > 0; }
+    bool is_null() const { return ino == 0 && remote_ino == 0; }
+    void encode(ceph::buffer::list &bl) const {
+      ENCODE_START(1, 1, bl);
+      encode(first, bl);
+      encode(ino, bl);
+      encode(remote_ino, bl);
+      encode(remote_d_type, bl);
+      encode(nonce, bl);
+      encode(lock, bl);
+      encode(alternate_name, bl);
+      encode(referent_ino, bl);
+      ENCODE_FINISH(bl);
+    }
+    void decode(ceph::buffer::list::const_iterator &bl) {
+      DECODE_START(1, bl);
+      decode(first, bl);
+      decode(ino, bl);
+      decode(remote_ino, bl);
+      decode(remote_d_type, bl);
+      decode(nonce, bl);
+      decode(lock, bl);
+      decode(alternate_name, bl);
+      decode(referent_ino, bl);
+      DECODE_FINISH(bl);
+    }
+    static void generate_test_instances(std::list<dn_strong_new*>& ls) {
+      ls.push_back(new dn_strong_new);
+      ls.push_back(new dn_strong_new(1, "alternate_name", 2, 3, 4, 5, 6, 7));
+    }
+    void dump(ceph::Formatter *f) const {
+      f->dump_unsigned("first", first);
+      f->dump_string("alternate_name", alternate_name);
+      f->dump_unsigned("ino", ino);
+      f->dump_unsigned("referent_ino", referent_ino);
+      f->dump_unsigned("remote_ino", remote_ino);
+      f->dump_unsigned("remote_d_type", remote_d_type);
+      f->dump_unsigned("nonce", nonce);
+      f->dump_unsigned("lock", lock);
+    }
+  };
+  WRITE_CLASS_ENCODER(dn_strong_new)
+
   struct dn_weak {
     snapid_t first;
-    inodeno_t ino;
-    dn_weak() : ino(0) {}
+    inodeno_t ino = 0;
+    dn_weak() = default;
     dn_weak(snapid_t f, inodeno_t pi) : first(f), ino(pi) {}
     void encode(ceph::buffer::list &bl) const {
       using ceph::encode;
@@ -158,11 +246,11 @@ public:
   WRITE_CLASS_ENCODER(lock_bls)
 
   // authpins, xlocks
-  struct slave_reqid {
+  struct peer_reqid {
     metareqid_t reqid;
     __u32 attempt;
-    slave_reqid() : attempt(0) {}
-    slave_reqid(const metareqid_t& r, __u32 a)
+    peer_reqid() : attempt(0) {}
+    peer_reqid(const metareqid_t& r, __u32 a)
       : reqid(r), attempt(a) {}
     void encode(ceph::buffer::list& bl) const {
       using ceph::encode;
@@ -191,30 +279,30 @@ public:
   }
   void add_inode_locks(CInode *in, __u32 nonce, ceph::buffer::list& bl) {
     using ceph::encode;
-    encode(in->inode.ino, inode_locks);
+    encode(in->ino(), inode_locks);
     encode(in->last, inode_locks);
     encode(nonce, inode_locks);
     encode(bl, inode_locks);
   }
   void add_inode_base(CInode *in, uint64_t features) {
     using ceph::encode;
-    encode(in->inode.ino, inode_base);
+    encode(in->ino(), inode_base);
     encode(in->last, inode_base);
     ceph::buffer::list bl;
     in->_encode_base(bl, features);
     encode(bl, inode_base);
   }
   void add_inode_authpin(vinodeno_t ino, const metareqid_t& ri, __u32 attempt) {
-    authpinned_inodes[ino].push_back(slave_reqid(ri, attempt));
+    authpinned_inodes[ino].push_back(peer_reqid(ri, attempt));
   }
   void add_inode_frozen_authpin(vinodeno_t ino, const metareqid_t& ri, __u32 attempt) {
-    frozen_authpin_inodes[ino] = slave_reqid(ri, attempt);
+    frozen_authpin_inodes[ino] = peer_reqid(ri, attempt);
   }
   void add_inode_xlock(vinodeno_t ino, int lt, const metareqid_t& ri, __u32 attempt) {
-    xlocked_inodes[ino][lt] = slave_reqid(ri, attempt);
+    xlocked_inodes[ino][lt] = peer_reqid(ri, attempt);
   }
   void add_inode_wrlock(vinodeno_t ino, int lt, const metareqid_t& ri, __u32 attempt) {
-    wrlocked_inodes[ino][lt].push_back(slave_reqid(ri, attempt));
+    wrlocked_inodes[ino][lt].push_back(peer_reqid(ri, attempt));
   }
 
   void add_scatterlock_state(CInode *in) {
@@ -244,16 +332,19 @@ public:
   void add_weak_primary_dentry(inodeno_t dirino, std::string_view dname, snapid_t first, snapid_t last, inodeno_t ino) {
     weak[dirino][string_snap_t(dname, last)] = dn_weak(first, ino);
   }
-  void add_strong_dentry(dirfrag_t df, std::string_view dname, snapid_t first, snapid_t last, inodeno_t pi, inodeno_t ri, unsigned char rdt, int n, int ls) {
-    strong_dentries[df][string_snap_t(dname, last)] = dn_strong(first, pi, ri, rdt, n, ls);
+  void add_strong_dentry(dirfrag_t df, std::string_view dname, std::string_view altn, snapid_t first, snapid_t last, inodeno_t pi, inodeno_t ri, inodeno_t ref_ino, unsigned char rdt, int n, int ls) {
+    auto& m = strong_dentries[df];
+    m.insert_or_assign(string_snap_t(dname, last), dn_strong(first, altn, pi, ri, rdt, n, ls));
+    auto& m1 = strong_dentries_new[df];
+    m1.insert_or_assign(string_snap_t(dname, last), dn_strong_new(first, altn, pi, ri, ref_ino, rdt, n, ls));
   }
   void add_dentry_authpin(dirfrag_t df, std::string_view dname, snapid_t last,
 			  const metareqid_t& ri, __u32 attempt) {
-    authpinned_dentries[df][string_snap_t(dname, last)].push_back(slave_reqid(ri, attempt));
+    authpinned_dentries[df][string_snap_t(dname, last)].push_back(peer_reqid(ri, attempt));
   }
   void add_dentry_xlock(dirfrag_t df, std::string_view dname, snapid_t last,
 			const metareqid_t& ri, __u32 attempt) {
-    xlocked_dentries[df][string_snap_t(dname, last)] = slave_reqid(ri, attempt);
+    xlocked_dentries[df][string_snap_t(dname, last)] = peer_reqid(ri, attempt);
   }
 
   // -- encoding --
@@ -280,6 +371,7 @@ public:
     encode(authpinned_dentries, payload);
     encode(xlocked_dentries, payload);
     encode(client_metadata_map, payload);
+    encode(strong_dentries_new, payload);
   }
   void decode_payload() override {
     auto p = payload.cbegin();
@@ -306,6 +398,8 @@ public:
     decode(xlocked_dentries, p);
     if (header.version >= 2)
       decode(client_metadata_map, p);
+    if (header.version >= 3 )
+      decode(strong_dentries_new, p);
   }
 
   // -- data --
@@ -320,6 +414,7 @@ public:
   // strong
   std::map<dirfrag_t, dirfrag_strong> strong_dirfrags;
   std::map<dirfrag_t, std::map<string_snap_t, dn_strong> > strong_dentries;
+  std::map<dirfrag_t, std::map<string_snap_t, dn_strong_new> > strong_dentries_new;
   std::map<vinodeno_t, inode_strong> strong_inodes;
 
   // open
@@ -333,23 +428,25 @@ public:
   ceph::buffer::list inode_locks;
   std::map<dirfrag_t, ceph::buffer::list> dirfrag_bases;
 
-  std::map<vinodeno_t, std::list<slave_reqid> > authpinned_inodes;
-  std::map<vinodeno_t, slave_reqid> frozen_authpin_inodes;
-  std::map<vinodeno_t, std::map<__s32, slave_reqid> > xlocked_inodes;
-  std::map<vinodeno_t, std::map<__s32, std::list<slave_reqid> > > wrlocked_inodes;
-  std::map<dirfrag_t, std::map<string_snap_t, std::list<slave_reqid> > > authpinned_dentries;
-  std::map<dirfrag_t, std::map<string_snap_t, slave_reqid> > xlocked_dentries;
+  std::map<vinodeno_t, std::list<peer_reqid> > authpinned_inodes;
+  std::map<vinodeno_t, peer_reqid> frozen_authpin_inodes;
+  std::map<vinodeno_t, std::map<__s32, peer_reqid> > xlocked_inodes;
+  std::map<vinodeno_t, std::map<__s32, std::list<peer_reqid> > > wrlocked_inodes;
+  std::map<dirfrag_t, std::map<string_snap_t, std::list<peer_reqid> > > authpinned_dentries;
+  std::map<dirfrag_t, std::map<string_snap_t, peer_reqid> > xlocked_dentries;
 
 private:
   template<class T, typename... Args>
   friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
+  template<class T, typename... Args>
+  friend MURef<T> crimson::make_message(Args&&... args);
 
-  static constexpr int HEAD_VERSION = 2;
+  static constexpr int HEAD_VERSION = 3;
   static constexpr int COMPAT_VERSION = 1;
 
   MMDSCacheRejoin(int o) : MMDSCacheRejoin() { op = o; }
-  MMDSCacheRejoin() : SafeMessage{MSG_MDS_CACHEREJOIN, HEAD_VERSION, COMPAT_VERSION} {}
-  ~MMDSCacheRejoin() override {}
+  MMDSCacheRejoin() : MMDSOp{MSG_MDS_CACHEREJOIN, HEAD_VERSION, COMPAT_VERSION} {}
+  ~MMDSCacheRejoin() final {}
 };
 
 WRITE_CLASS_ENCODER(MMDSCacheRejoin::inode_strong)
@@ -357,9 +454,10 @@ WRITE_CLASS_ENCODER(MMDSCacheRejoin::dirfrag_strong)
 WRITE_CLASS_ENCODER(MMDSCacheRejoin::dn_strong)
 WRITE_CLASS_ENCODER(MMDSCacheRejoin::dn_weak)
 WRITE_CLASS_ENCODER(MMDSCacheRejoin::lock_bls)
-WRITE_CLASS_ENCODER(MMDSCacheRejoin::slave_reqid)
+WRITE_CLASS_ENCODER(MMDSCacheRejoin::peer_reqid)
+WRITE_CLASS_ENCODER(MMDSCacheRejoin::dn_strong_new)
 
-inline std::ostream& operator<<(std::ostream& out, const MMDSCacheRejoin::slave_reqid& r) {
+inline std::ostream& operator<<(std::ostream& out, const MMDSCacheRejoin::peer_reqid& r) {
   return out << r.reqid << '.' << r.attempt;
 }
 

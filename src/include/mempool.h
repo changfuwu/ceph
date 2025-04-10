@@ -26,11 +26,16 @@
 #include <boost/container/flat_set.hpp>
 #include <boost/container/flat_map.hpp>
 
+#if defined(_GNU_SOURCE)
+#  define MEMPOOL_SCHED_GETCPU
+#  include <sched.h>
+#endif
+
 #include "common/Formatter.h"
-#include "common/ceph_atomic.h"
 #include "include/ceph_assert.h"
 #include "include/compact_map.h"
 #include "include/compact_set.h"
+#include "include/compat.h"
 
 
 /*
@@ -150,12 +155,20 @@ namespace mempool {
   f(bluestore_alloc)		      \
   f(bluestore_cache_data)	      \
   f(bluestore_cache_onode)	      \
+  f(bluestore_cache_meta)	      \
   f(bluestore_cache_other)	      \
+  f(bluestore_cache_buffer)	      \
+  f(bluestore_extent)		      \
+  f(bluestore_blob)		      \
+  f(bluestore_shared_blob)	      \
+  f(bluestore_inline_bl)	      \
   f(bluestore_fsck)		      \
   f(bluestore_txc)		      \
-  f(bluestore_writing_deferred)	      \
+  f(bluestore_writing_deferred)      \
   f(bluestore_writing)		      \
   f(bluefs)			      \
+  f(bluefs_file_reader)              \
+  f(bluefs_file_writer)              \
   f(buffer_anon)		      \
   f(buffer_meta)		      \
   f(osd)			      \
@@ -183,27 +196,23 @@ extern void set_debug_mode(bool d);
 // --------------------------------------------------------------
 class pool_t;
 
-// we shard pool stats across many shard_t's to reduce the amount
-// of cacheline ping pong.
 enum {
-  num_shard_bits = 5
-};
-enum {
-  num_shards = 1 << num_shard_bits
+#if defined(MEMPOOL_SCHED_GETCPU)
+  MIN_SHARDS = 1,        //1
+#else
+  MIN_SHARDS = 1<<5,     //32
+#endif
+  DEFAULT_SHARDS = 1<<5, //32
+  MAX_SHARDS = 1<<7      //128
 };
 
-// align shard to a cacheline
-struct shard_t {
-  ceph::atomic<size_t> bytes = {0};
-  ceph::atomic<size_t> items = {0};
-  char __padding[128 - sizeof(ceph::atomic<size_t>)*2];
-} __attribute__ ((aligned (128)));
-
-static_assert(sizeof(shard_t) == 128, "shard_t should be cacheline-sized");
+int pick_a_shard_int(void);
+size_t get_num_shards(void);
 
 struct stats_t {
-  ssize_t items = 0;
-  ssize_t bytes = 0;
+  std::atomic<size_t> items = {0};
+  std::atomic<size_t> bytes = {0};
+
   void dump(ceph::Formatter *f) const {
     f->dump_int("items", items);
     f->dump_int("bytes", bytes);
@@ -216,13 +225,36 @@ struct stats_t {
   }
 };
 
+// Align shard to a cacheline, group stats for all mempools in the
+// same shard to improve cache line density.
+//
+// It would be possible to retrieve the value at runtime (for instance
+// with getconf LEVEL1_DCACHE_LINESIZE or grep -m1 cache_alignment
+// /proc/cpuinfo). It is easier to hard code the largest cache
+// linesize for all known processors (128 bytes). If the actual cache
+// linesize is smaller on a given processor, it will just waste a few
+// bytes.
+//
+struct shard_t {
+  stats_t pool[num_pools];
+} __attribute__ ((aligned (128)));
+static_assert(sizeof(shard_t)%128 == 0, "shard_t should be cacheline-sized");
+
+extern std::unique_ptr<shard_t[]> shards;
+
 pool_t& get_pool(pool_index_t ix);
 const char *get_pool_name(pool_index_t ix);
 
 struct type_t {
   const char *type_name;
   size_t item_size;
-  ceph::atomic<ssize_t> items = {0};  // signed
+  struct type_shard_t {
+    std::atomic<ssize_t> items = {0}; // signed
+    char __padding[128 - sizeof(std::atomic<ssize_t>)];
+  } __attribute__ ((aligned (128)));
+  static_assert(sizeof(type_shard_t) == 128,
+                "type_shard_t should be cacheline-sized");
+  std::unique_ptr<type_shard_t[]> shards = std::make_unique<type_shard_t[]>(get_num_shards());
 };
 
 struct type_info_hash {
@@ -232,12 +264,14 @@ struct type_info_hash {
 };
 
 class pool_t {
-  shard_t shard[num_shards];
-
   mutable std::mutex lock;  // only used for types list
   std::unordered_map<const char *, type_t> type_map;
 
+  template<pool_index_t, typename T>
+  friend class pool_allocator;
 public:
+  pool_index_t pool_index;
+
   //
   // How much this pool consumes. O(<num_shards>)
   //
@@ -245,14 +279,6 @@ public:
   size_t allocated_items() const;
 
   void adjust_count(ssize_t items, ssize_t bytes);
-
-  shard_t* pick_a_shard() {
-    // Dirt cheap, see:
-    //   http://fossies.org/dox/glibc-2.24/pthread__self_8c_source.html
-    size_t me = (size_t)pthread_self();
-    size_t i = (me >> 3) & ((1 << num_shard_bits) - 1);
-    return &shard[i];
-  }
 
   type_t *get_type(const std::type_info& ti, size_t size) {
     std::lock_guard<std::mutex> l(lock);
@@ -316,11 +342,12 @@ public:
 
   T* allocate(size_t n, void *p = nullptr) {
     size_t total = sizeof(T) * n;
-    shard_t *shard = pool->pick_a_shard();
-    shard->bytes += total;
-    shard->items += n;
+    const auto shid = pick_a_shard_int();
+    auto& shard = shards[shid].pool[pool->pool_index];
+    shard.bytes += total;
+    shard.items += n;
     if (type) {
-      type->items += n;
+      type->shards[shid].items += n;
     }
     T* r = reinterpret_cast<T*>(new char[total]);
     return r;
@@ -328,22 +355,24 @@ public:
 
   void deallocate(T* p, size_t n) {
     size_t total = sizeof(T) * n;
-    shard_t *shard = pool->pick_a_shard();
-    shard->bytes -= total;
-    shard->items -= n;
+    const auto shid = pick_a_shard_int();
+    auto& shard = shards[shid].pool[pool->pool_index];
+    shard.bytes -= total;
+    shard.items -= n;
     if (type) {
-      type->items -= n;
+      type->shards[shid].items -= n;
     }
     delete[] reinterpret_cast<char*>(p);
   }
 
   T* allocate_aligned(size_t n, size_t align, void *p = nullptr) {
     size_t total = sizeof(T) * n;
-    shard_t *shard = pool->pick_a_shard();
-    shard->bytes += total;
-    shard->items += n;
+    const auto shid = pick_a_shard_int();
+    auto& shard = shards[shid].pool[pool->pool_index];
+    shard.bytes += total;
+    shard.items += n;
     if (type) {
-      type->items += n;
+      type->shards[shid].items += n;
     }
     char *ptr;
     int rc = ::posix_memalign((void**)(void*)&ptr, align, total);
@@ -355,13 +384,14 @@ public:
 
   void deallocate_aligned(T* p, size_t n) {
     size_t total = sizeof(T) * n;
-    shard_t *shard = pool->pick_a_shard();
-    shard->bytes -= total;
-    shard->items -= n;
+    const auto shid = pick_a_shard_int();
+    auto& shard = shards[shid].pool[pool->pool_index];
+    shard.bytes -= total;
+    shard.items -= n;
     if (type) {
-      type->items -= n;
+      type->shards[shid].items -= n;
     }
-    ::free(p);
+    aligned_free(p);
   }
 
   void destroy(T* p) {

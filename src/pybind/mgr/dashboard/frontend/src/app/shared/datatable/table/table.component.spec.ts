@@ -1,18 +1,23 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { FormsModule } from '@angular/forms';
+import { By } from '@angular/platform-browser';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { NgxDatatableModule } from '@swimlane/ngx-datatable';
-import * as _ from 'lodash';
-import { BsDropdownModule } from 'ngx-bootstrap/dropdown';
+import { NgbDropdownModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
+import _ from 'lodash';
 
-import { configureTestBed } from '../../../../testing/unit-test-helper';
-import { ComponentsModule } from '../../components/components.module';
-import { CdTableColumnFilter } from '../../models/cd-table-column-filter';
-import { CdTableFetchDataContext } from '../../models/cd-table-fetch-data-context';
-import { PipesModule } from '../../pipes/pipes.module';
+import { ComponentsModule } from '~/app/shared/components/components.module';
+import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
+import { CdTableColumnFilter } from '~/app/shared/models/cd-table-column-filter';
+import { CdTableFetchDataContext } from '~/app/shared/models/cd-table-fetch-data-context';
+import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
+import { PipesModule } from '~/app/shared/pipes/pipes.module';
+import { configureTestBed } from '~/testing/unit-test-helper';
+import { TablePaginationComponent } from '../table-pagination/table-pagination.component';
 import { TableComponent } from './table.component';
+import { TableModule } from 'carbon-components-angular';
+import { NO_ERRORS_SCHEMA } from '@angular/core';
 
 describe('TableComponent', () => {
   let component: TableComponent;
@@ -35,16 +40,18 @@ describe('TableComponent', () => {
   };
 
   configureTestBed({
-    declarations: [TableComponent],
+    declarations: [TableComponent, TablePaginationComponent],
     imports: [
       BrowserAnimationsModule,
-      NgxDatatableModule,
       FormsModule,
       ComponentsModule,
       RouterTestingModule,
-      BsDropdownModule.forRoot(),
-      PipesModule
-    ]
+      NgbDropdownModule,
+      PipesModule,
+      TableModule,
+      NgbTooltipModule
+    ],
+    schemas: [NO_ERRORS_SCHEMA]
   });
 
   beforeEach(() => {
@@ -52,11 +59,13 @@ describe('TableComponent', () => {
     component = fixture.componentInstance;
 
     component.data = createFakeData(10);
-    component.columns = [
+    component.localColumns = component.columns = [
       { prop: 'a', name: 'Index', filterable: true },
       { prop: 'b', name: 'Index times ten' },
       { prop: 'c', name: 'Odd?', filterable: true }
     ];
+    component.ngAfterViewInit();
+    fixture.detectChanges();
   });
 
   it('should create', () => {
@@ -91,17 +100,12 @@ describe('TableComponent', () => {
     expect(component.userConfig.limit).toBe(1);
   });
 
-  it('should prevent propagation of mouseenter event', (done) => {
-    let wasCalled = false;
-    const mouseEvent = new MouseEvent('mouseenter');
-    mouseEvent.stopPropagation = () => {
-      wasCalled = true;
-    };
-    spyOn(component.table.element, 'addEventListener').and.callFake((eventName, fn) => {
-      fn(mouseEvent);
-      expect(eventName).toBe('mouseenter');
-      expect(wasCalled).toBe(true);
-      done();
+  it('should call updateSelection on init', () => {
+    component.updateSelection.subscribe((selection: CdTableSelection) => {
+      expect(selection.hasSelection).toBeFalsy();
+      expect(selection.hasSingleSelection).toBeFalsy();
+      expect(selection.hasMultiSelection).toBeFalsy();
+      expect(selection.selected.length).toBe(0);
     });
     component.ngOnInit();
   });
@@ -129,10 +133,8 @@ describe('TableComponent', () => {
     ) => {
       component.search = search;
       _.forEach(changes, (change) => {
-        component.onChangeFilter(
-          change.filter,
-          change.value ? { raw: change.value, formatted: change.value } : undefined
-        );
+        component.onSelectFilter(change.filter.column.name);
+        component.onChangeFilter(change.value || undefined);
       });
       expect(component.rows).toEqual(results);
       component.onClearSearch();
@@ -281,6 +283,9 @@ describe('TableComponent', () => {
     const expectSearch = (keyword: string, expectedResult: object[]) => {
       component.search = keyword;
       component.updateFilter();
+      component.useData();
+      component.ngAfterViewInit();
+      fixture.detectChanges();
       expect(component.rows).toEqual(expectedResult);
       component.onClearSearch();
     };
@@ -295,7 +300,7 @@ describe('TableComponent', () => {
 
       beforeEach(() => {
         component.data = [testObject];
-        component.columns = [{ prop: 'obj', name: 'Object' }];
+        component.localColumns = [{ prop: 'obj', name: 'Object' }];
       });
 
       it('should not search through objects as default case', () => {
@@ -366,7 +371,7 @@ describe('TableComponent', () => {
     });
 
     it('should search through arrays', () => {
-      component.columns = [
+      component.localColumns = [
         { prop: 'a', name: 'Index' },
         { prop: 'b', name: 'ArrayColumn' }
       ];
@@ -424,15 +429,21 @@ describe('TableComponent', () => {
       component.onClearSearch();
       expect(component.rows.length).toBe(10);
     });
+
+    it('should work with undefined data', () => {
+      component.data = [];
+      component.search = '3';
+      component.updateFilter();
+      expect(component.rows?.length).toBeFalsy();
+    });
   });
 
   describe('after ngInit', () => {
     const toggleColumn = (prop: string, checked: boolean) => {
       component.toggleColumn({
-        target: {
-          name: prop,
-          checked: checked
-        }
+        data: prop,
+        prop: prop,
+        isHidden: checked
       });
     };
 
@@ -444,18 +455,20 @@ describe('TableComponent', () => {
 
     beforeEach(() => {
       component.ngOnInit();
+      component.ngAfterViewInit();
+      fixture.detectChanges();
     });
 
     it('should have updated the column definitions', () => {
-      expect(component.columns[0].flexGrow).toBe(1);
-      expect(component.columns[1].flexGrow).toBe(2);
-      expect(component.columns[2].flexGrow).toBe(2);
-      expect(component.columns[2].resizeable).toBe(false);
+      expect(component.localColumns[0].flexGrow).toBe(1);
+      expect(component.localColumns[1].flexGrow).toBe(2);
+      expect(component.localColumns[2].flexGrow).toBe(2);
+      expect(component.localColumns[2].resizeable).toBe(false);
     });
 
     it('should have table columns', () => {
       expect(component.tableColumns.length).toBe(3);
-      expect(component.tableColumns).toEqual(component.columns);
+      expect(component.tableColumns).toEqual(component.localColumns);
     });
 
     it('should have a unique identifier which it searches for', () => {
@@ -466,10 +479,18 @@ describe('TableComponent', () => {
     });
 
     it('should remove column "a"', () => {
+      const expectedData = [
+        { a: 0, b: 0, c: false },
+        { a: 1, b: 10, c: true },
+        { a: 2, b: 20, c: false }
+      ];
+      component.data = _.clone(expectedData);
+      fixture.detectChanges();
+
       expect(component.userConfig.sorts[0].prop).toBe('a');
       toggleColumn('a', false);
       expect(component.userConfig.sorts[0].prop).toBe('b');
-      expect(component.tableColumns.length).toBe(2);
+      expect(component.visibleColumns.length).toBe(2);
       equalStorageConfig();
     });
 
@@ -479,7 +500,7 @@ describe('TableComponent', () => {
       toggleColumn('b', false);
       toggleColumn('c', false);
       expect(component.userConfig.sorts[0].prop).toBe('c');
-      expect(component.tableColumns.length).toBe(1);
+      expect(component.visibleColumns.length).toBe(1);
       equalStorageConfig();
     });
 
@@ -488,12 +509,85 @@ describe('TableComponent', () => {
       toggleColumn('a', false);
       toggleColumn('a', true);
       expect(component.userConfig.sorts[0].prop).toBe('b');
-      expect(component.tableColumns.length).toBe(3);
+      expect(component.visibleColumns.length).toBe(3);
       equalStorageConfig();
+    });
+
+    it('should toggle on off columns', () => {
+      for (const column of component.columns) {
+        component.toggleColumn(column);
+        expect(column.isHidden).toBeTruthy();
+        component.toggleColumn(column);
+        expect(column.isHidden).toBeFalsy();
+      }
     });
 
     afterEach(() => {
       clearLocalStorage();
+    });
+  });
+
+  describe('test cell transformations', () => {
+    interface ExecutingTemplateConfig {
+      valueClass?: string;
+      executingClass?: string;
+    }
+
+    const testExecutingTemplate = (templateConfig?: ExecutingTemplateConfig) => {
+      const state = 'updating';
+      const value = component.data[0].a;
+
+      component.autoReload = -1;
+      component.columns[0].cellTransformation = CellTemplate.executing;
+      if (templateConfig) {
+        component.columns[0].customTemplateConfig = templateConfig;
+      }
+
+      const data = createFakeData(10);
+      const firstRow = {
+        ...data[0],
+        cdExecuting: state,
+        customTemplateConfig: templateConfig || undefined
+      };
+      component.data = [firstRow, data.filter((x) => x.a !== firstRow.a)];
+      component.localColumns = component.columns = [
+        { prop: 'a', name: 'Index', filterable: true, cellTransformation: CellTemplate.executing },
+        { prop: 'b', name: 'Index times ten' },
+        { prop: 'c', name: 'Odd?', filterable: true }
+      ];
+      component.ngOnInit();
+      component.ngAfterViewInit();
+      fixture.detectChanges();
+
+      const elements = fixture.debugElement
+        .query(By.css('[cdstablerow] [cdstabledata]'))
+        .queryAll(By.css('span'));
+      expect(elements.length).toBe(2);
+
+      // Value
+      const valueElement = elements[0];
+      if (templateConfig?.valueClass) {
+        templateConfig.valueClass.split(' ').forEach((clz) => {
+          expect(valueElement.classes).toHaveProperty(clz);
+        });
+      }
+      expect(valueElement.nativeElement.textContent.trim()).toBe(`${value}`);
+      // Executing state
+      const executingElement = elements[1];
+      if (templateConfig?.executingClass) {
+        templateConfig.executingClass.split(' ').forEach((clz) => {
+          expect(executingElement.classes).toHaveProperty(clz);
+        });
+      }
+      expect(executingElement.nativeElement.textContent.trim()).toBe(`(${state})`);
+    };
+
+    it('should display executing template', () => {
+      testExecutingTemplate();
+    });
+
+    it('should display executing template with custom classes', () => {
+      testExecutingTemplate({ valueClass: 'a b', executingClass: 'c d' });
     });
   });
 
@@ -515,7 +609,7 @@ describe('TableComponent', () => {
       component.data = createFakeData(5);
       component.fetchData.subscribe((context: any) => {
         context.error();
-        expect(component.loadingError).toBeTruthy();
+        expect(component.status.type).toBe('danger');
         expect(component.data.length).toBe(0);
         expect(component.loadingIndicator).toBeFalsy();
         expect(component['updating']).toBeFalsy();
@@ -529,7 +623,7 @@ describe('TableComponent', () => {
         context.errorConfig.resetData = false;
         context.errorConfig.displayError = false;
         context.error();
-        expect(component.loadingError).toBeFalsy();
+        expect(component.status.type).toBe('danger');
         expect(component.data.length).toBe(10);
         expect(component.loadingIndicator).toBeFalsy();
         expect(component['updating']).toBeFalsy();
@@ -538,39 +632,39 @@ describe('TableComponent', () => {
     });
 
     it('should update selection on refresh - "onChange"', () => {
-      spyOn(component, 'onSelect').and.callThrough();
+      spyOn(component.updateSelection, 'emit');
       component.data = createFakeData(10);
       component.selection.selected = [_.clone(component.data[1])];
       component.updateSelectionOnRefresh = 'onChange';
       component.updateSelected();
-      expect(component.onSelect).toHaveBeenCalledTimes(0);
+      expect(component.updateSelection.emit).toHaveBeenCalledTimes(0);
       component.data[1].d = !component.data[1].d;
       component.updateSelected();
-      expect(component.onSelect).toHaveBeenCalled();
+      expect(component.updateSelection.emit).toHaveBeenCalled();
     });
 
     it('should update selection on refresh - "always"', () => {
-      spyOn(component, 'onSelect').and.callThrough();
+      spyOn(component.updateSelection, 'emit');
       component.data = createFakeData(10);
       component.selection.selected = [_.clone(component.data[1])];
       component.updateSelectionOnRefresh = 'always';
       component.updateSelected();
-      expect(component.onSelect).toHaveBeenCalled();
+      expect(component.updateSelection.emit).toHaveBeenCalled();
       component.data[1].d = !component.data[1].d;
       component.updateSelected();
-      expect(component.onSelect).toHaveBeenCalled();
+      expect(component.updateSelection.emit).toHaveBeenCalled();
     });
 
     it('should update selection on refresh - "never"', () => {
-      spyOn(component, 'onSelect').and.callThrough();
+      spyOn(component.updateSelection, 'emit');
       component.data = createFakeData(10);
       component.selection.selected = [_.clone(component.data[1])];
       component.updateSelectionOnRefresh = 'never';
       component.updateSelected();
-      expect(component.onSelect).toHaveBeenCalledTimes(0);
+      expect(component.updateSelection.emit).toHaveBeenCalledTimes(0);
       component.data[1].d = !component.data[1].d;
       component.updateSelected();
-      expect(component.onSelect).toHaveBeenCalledTimes(0);
+      expect(component.updateSelection.emit).toHaveBeenCalledTimes(0);
     });
 
     afterEach(() => {
@@ -613,6 +707,96 @@ describe('TableComponent', () => {
 
     it('should match against multiple functions and return the corresponding classes', () => {
       expect(component.useCustomClass('https://secure.it')).toBe('btn secure');
+    });
+  });
+
+  describe('test expand and collapse feature', () => {
+    beforeEach(() => {
+      spyOn(component.setExpandedRow, 'emit');
+
+      // Setup table
+      component.identifier = 'a';
+      component.data = createFakeData(10);
+
+      // Select item
+      component.expanded = _.clone(component.data[1]);
+    });
+
+    describe('update expanded on refresh', () => {
+      const updateExpendedOnState = (state: 'always' | 'never' | 'onChange') => {
+        component.updateExpandedOnRefresh = state;
+        component.updateExpanded();
+      };
+
+      beforeEach(() => {
+        // Mock change
+        component.data[1].b = 'test';
+      });
+
+      it('refreshes "always"', () => {
+        updateExpendedOnState('always');
+        expect(component.expanded.b).toBe('test');
+        expect(component.setExpandedRow.emit).toHaveBeenCalled();
+      });
+
+      it('refreshes "onChange"', () => {
+        updateExpendedOnState('onChange');
+        expect(component.expanded.b).toBe('test');
+        expect(component.setExpandedRow.emit).toHaveBeenCalled();
+      });
+
+      it('does not refresh "onChange" if data is equal', () => {
+        component.data[1].b = 10; // Reverts change
+        updateExpendedOnState('onChange');
+        expect(component.expanded.b).toBe(10);
+        // setExpandRow is called to reset the expanded state.
+        // Commeting out the line below because this might be reversed on next iteration
+        // expect(component.setExpandedRow.emit).not.toHaveBeenCalled();
+      });
+
+      it('"never" refreshes', () => {
+        updateExpendedOnState('never');
+        expect(component.expanded.b).toBe(10);
+        // setExpandRow is called to reset the expanded state.
+        // Commeting out the line below because this might be reversed on next iteration
+        // expect(component.setExpandedRow.emit).not.toHaveBeenCalled();
+      });
+    });
+
+    it('should open the table details and close other expanded rows', () => {
+      component.data = [{ a: 1, b: 10, c: true }];
+      component.useData();
+      component.ngAfterViewInit();
+      fixture.detectChanges();
+      component.toggleExpandRow();
+      expect(component.expanded).toEqual({ a: 1, b: 10, c: true });
+      expect(component.model.rowsExpanded.every((x) => x)).toBeTruthy();
+    });
+
+    it('should close the current table details expansion', () => {
+      component.useData();
+      component.model.rowsExpanded = component.model.rowsIndices.map((_) => false);
+      component.model.rowsIndices.forEach((i) => component.model.expandRow(i, false));
+      expect(component.expanded).toBeUndefined();
+      expect(component.setExpandedRow.emit).toHaveBeenCalledWith(undefined);
+      expect(component.model.rowsExpanded.every((x) => x)).toBeFalsy();
+    });
+
+    it('should not select the row when the row is expanded', () => {
+      expect(component.selection.selected).toEqual([]);
+      component.toggleExpandRow();
+      expect(component.selection.selected).toEqual([]);
+    });
+
+    it('should not change selection when expanding different row', () => {
+      component.useData();
+      expect(component.selection.selected).toEqual([]);
+      expect(component.expanded).toEqual(component.data[1]);
+      component.selection.selected = [component.data[2]];
+      component.model.rowsExpanded = component.model.rowsIndices.map((i) => i === 3);
+      component.model.expandRow(3, true);
+      expect(component.selection.selected).toEqual([component.data[2]]);
+      expect(component.expanded).toEqual(component.data[3]);
     });
   });
 });

@@ -1,22 +1,21 @@
 import { Component, EventEmitter, Output } from '@angular/core';
 import { Validators } from '@angular/forms';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
-import * as _ from 'lodash';
-import { BsModalRef } from 'ngx-bootstrap/modal';
+import _ from 'lodash';
 
-import { ActionLabelsI18n } from '../../../shared/constants/app.constants';
-import { CdFormBuilder } from '../../../shared/forms/cd-form-builder';
-import { CdFormGroup } from '../../../shared/forms/cd-form-group';
-import { CdValidators } from '../../../shared/forms/cd-validators';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { CdFormBuilder } from '~/app/shared/forms/cd-form-builder';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { CdValidators } from '~/app/shared/forms/cd-validators';
 import { RgwUserS3Key } from '../models/rgw-user-s3-key';
+import { BaseModal } from 'carbon-components-angular';
 
 @Component({
   selector: 'cd-rgw-user-s3-key-modal',
   templateUrl: './rgw-user-s3-key-modal.component.html',
   styleUrls: ['./rgw-user-s3-key-modal.component.scss']
 })
-export class RgwUserS3KeyModalComponent {
+export class RgwUserS3KeyModalComponent extends BaseModal {
   /**
    * The event that is triggered when the 'Add' button as been pressed.
    */
@@ -29,13 +28,9 @@ export class RgwUserS3KeyModalComponent {
   resource: string;
   action: string;
 
-  constructor(
-    private formBuilder: CdFormBuilder,
-    public bsModalRef: BsModalRef,
-    private i18n: I18n,
-    public actionLabels: ActionLabelsI18n
-  ) {
-    this.resource = this.i18n('S3 Key');
+  constructor(private formBuilder: CdFormBuilder, public actionLabels: ActionLabelsI18n) {
+    super();
+    this.resource = $localize`S3 Key`;
     this.createForm();
   }
 
@@ -81,6 +76,6 @@ export class RgwUserS3KeyModalComponent {
   onSubmit() {
     const key: RgwUserS3Key = this.formGroup.value;
     this.submitAction.emit(key);
-    this.bsModalRef.hide();
+    this.closeModal();
   }
 }

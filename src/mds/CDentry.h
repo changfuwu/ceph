@@ -17,7 +17,6 @@
 
 #include <string>
 #include <string_view>
-#include <set>
 
 #include "include/counter.h"
 #include "include/types.h"
@@ -25,12 +24,13 @@
 #include "include/lru.h"
 #include "include/elist.h"
 #include "include/filepath.h"
+#include <boost/intrusive/set.hpp>
 
 #include "BatchOp.h"
 #include "MDSCacheObject.h"
 #include "MDSContext.h"
 #include "SimpleLock.h"
-#include "LocalLock.h"
+#include "LocalLockC.h"
 #include "ScrubHeader.h"
 
 class CInode;
@@ -38,8 +38,34 @@ class CDir;
 class Locker;
 class CDentry;
 class LogSegment;
-
 class Session;
+
+struct ClientLease : public boost::intrusive::set_base_hook<>
+{
+  MEMPOOL_CLASS_HELPERS();
+
+  ClientLease(CDentry *p, Session *s) :
+    parent(p), session(s),
+    item_session_lease(this),
+    item_lease(this) { }
+  ClientLease() = delete;
+  client_t get_client() const;
+
+  CDentry *parent;
+  Session *session;
+
+  ceph_seq_t seq = 0;
+  utime_t ttl;
+  xlist<ClientLease*>::item item_session_lease; // per-session list
+  xlist<ClientLease*>::item item_lease;         // global list
+};
+struct client_is_key
+{
+  typedef client_t type;
+  const type operator() (const ClientLease& l) const {
+    return l.get_client();
+  }
+};
 
 // define an ordering
 bool operator<(const CDentry& l, const CDentry& r);
@@ -54,27 +80,32 @@ public:
     CInode *inode = nullptr;
     inodeno_t remote_ino = 0;
     unsigned char remote_d_type = 0;
+    CInode *referent_inode = nullptr;
+    inodeno_t referent_ino = 0;
     
     linkage_t() {}
 
     // dentry type is primary || remote || null
     // inode ptr is required for primary, optional for remote, undefined for null
     bool is_primary() const { return remote_ino == 0 && inode != 0; }
-    bool is_remote() const { return remote_ino > 0; }
-    bool is_null() const { return remote_ino == 0 && inode == 0; }
+    bool is_remote() const { return remote_ino > 0 && referent_inode == nullptr && referent_ino == 0; }
+    bool is_null() const { return remote_ino == 0 && inode == 0 && referent_ino == 0 && referent_inode == nullptr; }
+    bool is_referent_remote() const {return remote_ino > 0 && referent_ino != 0 && referent_inode != nullptr;}
 
     CInode *get_inode() { return inode; }
     const CInode *get_inode() const { return inode; }
     inodeno_t get_remote_ino() const { return remote_ino; }
     unsigned char get_remote_d_type() const { return remote_d_type; }
     std::string get_remote_d_type_string() const;
+    CInode *get_referent_inode() { return referent_inode; }
+    const CInode *get_referent_inode() const { return referent_inode; }
+    inodeno_t get_referent_ino() const { return referent_ino; }
 
-    void set_remote(inodeno_t ino, unsigned char d_type) { 
+    void set_remote(inodeno_t ino, unsigned char d_type) {
       remote_ino = ino;
       remote_d_type = d_type;
       inode = 0;
     }
-    void link_remote(CInode *in);
   };
 
 
@@ -100,25 +131,31 @@ public:
 
 
   CDentry(std::string_view n, __u32 h,
+          mempool::mds_co::string alternate_name,
 	  snapid_t f, snapid_t l) :
     hash(h),
     first(f), last(l),
     item_dirty(this),
     lock(this, &lock_type),
     versionlock(this, &versionlock_type),
-    name(n)
+    name(n),
+    alternate_name(std::move(alternate_name))
   {}
-  CDentry(std::string_view n, __u32 h, inodeno_t ino, unsigned char dt,
-	  snapid_t f, snapid_t l) :
+  CDentry(std::string_view n, __u32 h,
+          mempool::mds_co::string alternate_name,
+          inodeno_t ino, inodeno_t referent_ino,
+	  unsigned char dt, snapid_t f, snapid_t l) :
     hash(h),
     first(f), last(l),
     item_dirty(this),
     lock(this, &lock_type),
     versionlock(this, &versionlock_type),
-    name(n)
+    name(n),
+    alternate_name(std::move(alternate_name))
   {
     linkage.remote_ino = ino;
     linkage.remote_d_type = dt;
+    linkage.referent_ino = referent_ino;
   }
 
   ~CDentry() override {
@@ -148,9 +185,20 @@ public:
     return dentry_key_t(last, name.c_str(), hash);
   }
 
+  bool check_corruption(bool load);
+
   const CDir *get_dir() const { return dir; }
   CDir *get_dir() { return dir; }
   std::string_view get_name() const { return std::string_view(name); }
+  std::string_view get_alternate_name() const {
+    return std::string_view(alternate_name);
+  }
+  void set_alternate_name(mempool::mds_co::string altn) {
+    alternate_name = std::move(altn);
+  }
+  void set_alternate_name(std::string_view altn) {
+    alternate_name = mempool::mds_co::string(altn);
+  }
 
   __u32 get_hash() const { return hash; }
 
@@ -169,6 +217,7 @@ public:
     p->remote_d_type = d_type;
   }
   void push_projected_linkage(CInode *inode); 
+  void push_projected_linkage(CInode *referent_inode, inodeno_t remote_ino, inodeno_t referent_ino);
   linkage_t *pop_projected_linkage();
 
   bool is_projected() const { return !projected.empty(); }
@@ -191,7 +240,7 @@ public:
 
   bool use_projected(client_t client, const MutationRef& mut) const {
     return lock.can_read_projected(client) || 
-      lock.get_xlock_by() == mut;
+      lock.is_xlocked_by(mut);
   }
   linkage_t *get_linkage(client_t client, const MutationRef& mut) {
     return use_projected(client, mut) ? get_projected_linkage() : get_linkage();
@@ -216,7 +265,7 @@ public:
   int get_num_dir_auth_pins() const;
   
   // remote links
-  void link_remote(linkage_t *dnl, CInode *in);
+  void link_remote(linkage_t *dnl, CInode *remote_in, CInode *ref_in=nullptr);
   void unlink_remote(linkage_t *dnl);
   
   // copy cons
@@ -237,13 +286,18 @@ public:
 
   version_t pre_dirty(version_t min=0);
   void _mark_dirty(LogSegment *ls);
-  void mark_dirty(version_t projected_dirv, LogSegment *ls);
+  void mark_dirty(version_t pv, LogSegment *ls);
   void mark_clean();
 
   void mark_new();
   bool is_new() const { return state_test(STATE_NEW); }
   void clear_new() { state_clear(STATE_NEW); }
+
+  void mark_auth();
+  void clear_auth();
   
+  bool scrub(snapid_t next_seq);
+
   // -- exporting
   // note: this assumes the dentry already exists.  
   // i.e., the name is already extracted... so we just need the other state.
@@ -262,7 +316,7 @@ public:
     // twiddle
     clear_replica_map();
     replica_nonce = EXPORT_NONCE;
-    state_clear(CDentry::STATE_AUTH);
+    clear_auth();
     if (is_dirty())
       mark_clean();
     put(PIN_TEMPEXPORTING);
@@ -282,7 +336,7 @@ public:
 
     // twiddle
     state &= MASK_STATE_IMPORT_KEPT;
-    state_set(CDentry::STATE_AUTH);
+    mark_auth();
     if (nstate & STATE_DIRTY)
       _mark_dirty(ls);
     if (is_replicated())
@@ -304,50 +358,60 @@ public:
   // replicas (on clients)
 
   bool is_any_leases() const {
-    return !client_lease_map.empty();
+    return !client_leases.empty();
   }
   const ClientLease *get_client_lease(client_t c) const {
-    if (client_lease_map.count(c))
-      return client_lease_map.find(c)->second;
-    return 0;
+    auto it = client_leases.find(c);
+    if (it != client_leases.end())
+      return &(*it);
+    return nullptr;
   }
   ClientLease *get_client_lease(client_t c) {
-    if (client_lease_map.count(c))
-      return client_lease_map.find(c)->second;
-    return 0;
+    auto it = client_leases.find(c);
+    if (it != client_leases.end())
+      return &(*it);
+    return nullptr;
   }
   bool have_client_lease(client_t c) const {
-    const ClientLease *l = get_client_lease(c);
-    if (l) 
-      return true;
-    else
-      return false;
+    return client_leases.count(c);
   }
 
-  ClientLease *add_client_lease(client_t c, Session *session);
+  ClientLease *add_client_lease(Session *session);
   void remove_client_lease(ClientLease *r, Locker *locker);  // returns remaining mask (if any), and kicks locker eval_gathers
   void remove_client_leases(Locker *locker);
 
-  std::ostream& print_db_line_prefix(std::ostream& out) override;
-  void print(std::ostream& out) override;
+  std::ostream& print_db_line_prefix(std::ostream& out) const override;
+  void print(std::ostream& out) const override;
   void dump(ceph::Formatter *f) const;
 
+  static void encode_remote(inodeno_t& ino, unsigned char d_type,
+                            std::string_view alternate_name,
+                            bufferlist &bl);
+  static void decode_remote(char icode, inodeno_t& ino, unsigned char& d_type,
+                            mempool::mds_co::string& alternate_name,
+                            ceph::buffer::list::const_iterator& bl);
 
   __u32 hash;
   snapid_t first, last;
+  bool corrupt_first_loaded = false; /* for Postgres corruption detection */
 
   elist<CDentry*>::item item_dirty, item_dir_dirty;
   elist<CDentry*>::item item_stray;
 
   // lock
-  static LockType lock_type;
-  static LockType versionlock_type;
+  static const LockType lock_type;
+  static const LockType versionlock_type;
 
   SimpleLock lock; // FIXME referenced containers not in mempool
-  LocalLock versionlock; // FIXME referenced containers not in mempool
+  LocalLockC versionlock; // FIXME referenced containers not in mempool
 
-  mempool::mds_co::map<client_t,ClientLease*> client_lease_map;
+  typedef boost::intrusive::set<
+    ClientLease, boost::intrusive::key_of_value<client_is_key>> ClientLeaseMap;
+  ClientLeaseMap client_leases;
+
   std::map<int, std::unique_ptr<BatchOp>> batch_ops;
+
+  ceph_tid_t reintegration_reqid = 0;
 
 
 protected:
@@ -359,7 +423,7 @@ protected:
   friend class C_MDC_XlockRequest;
 
   CDir *dir = nullptr;     // containing dirfrag
-  linkage_t linkage;
+  linkage_t linkage; /* durable */
   mempool::mds_co::list<linkage_t> projected;
 
   version_t version = 0;  // dir version when last touched.
@@ -367,6 +431,7 @@ protected:
 
 private:
   mempool::mds_co::string name;
+  mempool::mds_co::string alternate_name;
 };
 
 std::ostream& operator<<(std::ostream& out, const CDentry& dn);

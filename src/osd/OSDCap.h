@@ -29,13 +29,14 @@
 #include <ostream>
 using std::ostream;
 
-#include "include/types.h"
-#include "OpRequest.h"
-
 #include <list>
 #include <vector>
 #include <boost/optional.hpp>
 #include <boost/fusion/include/adapt_struct.hpp>
+
+#include "include/types.h"
+#include "osd/osd_op_util.h"
+
 
 static const __u8 OSD_CAP_R     = (1 << 1);      // read
 static const __u8 OSD_CAP_W     = (1 << 2);      // write
@@ -216,6 +217,7 @@ struct OSDCapGrant {
                   std::vector<bool>* class_allowed) const;
 
   void expand_profile();
+  std::string to_string();
 };
 
 ostream& operator<<(ostream& out, const OSDCapGrant& g);
@@ -230,6 +232,8 @@ struct OSDCap {
   bool allow_all() const;
   void set_allow_all();
   bool parse(const std::string& str, ostream *err=NULL);
+  bool merge(OSDCap newcap);
+  std::string to_string();
 
   /**
    * check if we are capable of something
@@ -243,7 +247,7 @@ struct OSDCap {
    * @param object name of the object we are accessing
    * @param op_may_read whether the operation may need to read
    * @param op_may_write whether the operation may need to write
-   * @param classes (class-name, rd, wr, whitelisted-flag) tuples
+   * @param classes (class-name, rd, wr, allowed-flag) tuples
    * @return true if the operation is allowed, false otherwise
    */
   bool is_capable(const std::string& pool_name, const std::string& ns,

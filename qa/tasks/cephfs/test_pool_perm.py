@@ -6,7 +6,7 @@ import os
 
 class TestPoolPerm(CephFSTestCase):
     def test_pool_perm(self):
-        self.mount_a.run_shell(["touch", "test_file"])
+        self.mount_a.run_shell_payload("dd if=/dev/urandom of=test_file bs=4k count=1")
 
         file_path = os.path.join(self.mount_a.mountpoint, "test_file")
 
@@ -14,12 +14,12 @@ class TestPoolPerm(CephFSTestCase):
             import os
             import errno
 
-            fd = os.open("{path}", os.O_RDWR)
+            fd = os.open("{path}", os.O_RDWR | os.O_SYNC)
             try:
                 if {check_read}:
                     ret = os.read(fd, 1024)
                 else:
-                    os.write(fd, b'content')
+                    os.pwrite(fd, b'content', 0)
             except OSError as e:
                 if e.errno != errno.EPERM:
                     raise
@@ -30,25 +30,23 @@ class TestPoolPerm(CephFSTestCase):
         client_name = "client.{0}".format(self.mount_a.client_id)
 
         # set data pool read only
-        self.fs.mon_manager.raw_cluster_cmd_result(
-            'auth', 'caps', client_name, 'mds', 'allow', 'mon', 'allow r', 'osd',
-            'allow r pool={0}'.format(self.fs.get_data_pool_name()))
+        self.get_ceph_cmd_result(
+            'auth', 'caps', client_name, 'mds', 'allow', 'mon', 'allow r',
+            'osd', 'allow r pool={0}'.format(self.fs.get_data_pool_name()))
 
         self.mount_a.umount_wait()
-        self.mount_a.mount()
-        self.mount_a.wait_until_mounted()
+        self.mount_a.mount_wait()
 
         # write should fail
         self.mount_a.run_python(remote_script.format(path=file_path, check_read=str(False)))
 
         # set data pool write only
-        self.fs.mon_manager.raw_cluster_cmd_result(
-            'auth', 'caps', client_name, 'mds', 'allow', 'mon', 'allow r', 'osd',
-            'allow w pool={0}'.format(self.fs.get_data_pool_name()))
+        self.get_ceph_cmd_result(
+            'auth', 'caps', client_name, 'mds', 'allow', 'mon', 'allow r',
+            'osd', 'allow w pool={0}'.format(self.fs.get_data_pool_name()))
 
         self.mount_a.umount_wait()
-        self.mount_a.mount()
-        self.mount_a.wait_until_mounted()
+        self.mount_a.mount_wait()
 
         # read should fail
         self.mount_a.run_python(remote_script.format(path=file_path, check_read=str(True)))
@@ -68,7 +66,7 @@ class TestPoolPerm(CephFSTestCase):
         self.mount_a.run_shell(["mkdir", "layoutdir"])
 
         # Set MDS 'rw' perms: missing 'p' means no setting pool layouts
-        self.fs.mon_manager.raw_cluster_cmd_result(
+        self.get_ceph_cmd_result(
             'auth', 'caps', client_name, 'mds', 'allow rw', 'mon', 'allow r',
             'osd',
             'allow rw pool={0},allow rw pool={1}'.format(
@@ -77,8 +75,7 @@ class TestPoolPerm(CephFSTestCase):
             ))
 
         self.mount_a.umount_wait()
-        self.mount_a.mount()
-        self.mount_a.wait_until_mounted()
+        self.mount_a.mount_wait()
 
         with self.assertRaises(CommandFailedError):
             self.mount_a.setfattr("layoutfile", "ceph.file.layout.pool",
@@ -89,15 +86,14 @@ class TestPoolPerm(CephFSTestCase):
         self.mount_a.umount_wait()
 
         # Set MDS 'rwp' perms: should now be able to set layouts
-        self.fs.mon_manager.raw_cluster_cmd_result(
+        self.get_ceph_cmd_result(
             'auth', 'caps', client_name, 'mds', 'allow rwp', 'mon', 'allow r',
             'osd',
             'allow rw pool={0},allow rw pool={1}'.format(
                 self.fs.get_data_pool_names()[0],
                 self.fs.get_data_pool_names()[1],
             ))
-        self.mount_a.mount()
-        self.mount_a.wait_until_mounted()
+        self.mount_a.mount_wait()
         self.mount_a.setfattr("layoutfile", "ceph.file.layout.pool",
                               new_pool_name)
         self.mount_a.setfattr("layoutdir", "ceph.dir.layout.pool",
@@ -105,7 +101,7 @@ class TestPoolPerm(CephFSTestCase):
         self.mount_a.umount_wait()
 
     def tearDown(self):
-        self.fs.mon_manager.raw_cluster_cmd_result(
+        self.get_ceph_cmd_result(
             'auth', 'caps', "client.{0}".format(self.mount_a.client_id),
             'mds', 'allow', 'mon', 'allow r', 'osd',
             'allow rw pool={0}'.format(self.fs.get_data_pool_names()[0]))

@@ -5,6 +5,8 @@
 #include "rgw_dmclock_async_scheduler.h"
 #include "rgw_dmclock_scheduler.h"
 
+using namespace std::literals;
+
 namespace rgw::dmclock {
 
 AsyncScheduler::~AsyncScheduler()
@@ -15,15 +17,13 @@ AsyncScheduler::~AsyncScheduler()
   }
 }
 
-const char** AsyncScheduler::get_tracked_conf_keys() const
+std::vector<std::string> AsyncScheduler::get_tracked_keys() const noexcept
 {
   if (observer) {
-    return observer->get_tracked_conf_keys();
+    return observer->get_tracked_keys();
   }
-  static const char* keys[] = { "rgw_max_concurrent_requests", nullptr };
-  return keys;
+  return {"rgw_max_concurrent_requests"s};
 }
-
 void AsyncScheduler::handle_conf_change(const ConfigProxy& conf,
                                         const std::set<std::string>& changed)
 {
@@ -62,6 +62,9 @@ int AsyncScheduler::schedule_request_impl(const client_id& client,
 void AsyncScheduler::request_complete()
 {
   --outstanding_requests;
+  if(auto c = counters(client_id::count)){
+    c->inc(throttle_counters::l_outstanding, -1);
+  }
   schedule(crimson::dmclock::TimeZero);
 }
 
@@ -138,6 +141,9 @@ void AsyncScheduler::process(const Time& now)
       break;
     }
     ++outstanding_requests;
+    if(auto c = counters(client_id::count)){
+      c->inc(throttle_counters::l_outstanding);
+    }
 
     // complete the request
     auto& r = pull.get_retn();

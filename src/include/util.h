@@ -17,6 +17,10 @@
 #include "common/Formatter.h"
 #include "include/types.h"
 
+#include <list>
+#include <map>
+#include <string>
+
 std::string bytes2str(uint64_t count);
 
 struct ceph_data_stats
@@ -78,6 +82,11 @@ int get_cgroup_memory_limit(uint64_t *limit);
 
 /// collect info from @p uname(2), @p /proc/meminfo and @p /proc/cpuinfo
 void collect_sys_info(std::map<std::string, std::string> *m, CephContext *cct);
+
+#ifdef _WIN32
+/// Retrieve the actual Windows version, regardless of the app manifest.
+int get_windows_version(POSVERSIONINFOEXW ver);
+#endif
 
 /// dump service ids grouped by their host to the specified formatter
 /// @param f formatter for the output

@@ -15,22 +15,26 @@
 #ifndef CEPH_MONMAP_H
 #define CEPH_MONMAP_H
 
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
 #include <seastar/core/future.hh>
 #endif
 
 #include "common/config_fwd.h"
 #include "common/ceph_releases.h"
+#include "include/uuid.h" // for uuid_d
 
-#include "include/err.h"
-#include "include/types.h"
+#include "mon/mon_types.h" // for mon_feature_t
 
-#include "mon/mon_types.h"
-#include "msg/Message.h"
+#include <iosfwd>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 
+class health_check_map_t;
 
-#ifdef WITH_SEASTAR
-namespace ceph::common {
+#ifdef WITH_CRIMSON
+namespace crimson::common {
   class ConfigProxy;
 }
 #endif
@@ -59,6 +63,11 @@ struct mon_info_t {
   uint16_t priority{0};
   uint16_t weight{0};
 
+  /**
+   * The location of the monitor, in CRUSH hierarchy terms
+   */
+  std::map<std::string,std::string> crush_loc;
+
   // <REMOVE ME>
   mon_info_t(const std::string& n, const entity_addr_t& p_addr, uint16_t p)
     : name(n), public_addrs(p_addr), priority(p)
@@ -79,6 +88,8 @@ struct mon_info_t {
   void encode(ceph::buffer::list& bl, uint64_t features) const;
   void decode(ceph::buffer::list::const_iterator& p);
   void print(std::ostream& out) const;
+  void dump(ceph::Formatter *f) const;
+  static void generate_test_instances(std::list<mon_info_t*>& ls);
 };
 WRITE_CLASS_ENCODER_FEATURES(mon_info_t)
 
@@ -98,6 +109,10 @@ class MonMap {
   std::map<entity_addr_t, std::string> addr_mons;
 
   std::vector<std::string> ranks;
+  /* ranks which were removed when this map took effect.
+     There should only be one at a time, but leave support
+     for arbitrary numbers just to be safe. */
+  std::set<unsigned> removed_ranks;
 
   /**
    * Persistent Features are all those features that once set on a
@@ -142,6 +157,19 @@ class MonMap {
                            int priority,
                            int weight,
                            bool for_mkfs);
+
+  enum election_strategy {
+			  // Keep in sync with ElectionLogic.h!
+    CLASSIC = 1, // the original rank-based one
+    DISALLOW = 2, // disallow a set from being leader
+    CONNECTIVITY = 3 // includes DISALLOW, extends to prefer stronger connections
+  };
+  election_strategy strategy = CLASSIC;
+  std::set<std::string> disallowed_leaders; // can't be leader under CONNECTIVITY/DISALLOW
+  bool stretch_mode_enabled = false;
+  std::string tiebreaker_mon;
+  std::set<std::string> stretch_marked_down_mons; // can't be leader or taken proposal in CONNECTIVITY 
+                                                  // seriously until fully recovered
 
 public:
   void calc_legacy_ranks();
@@ -226,9 +254,15 @@ public:
    * @param name Monitor name (i.e., 'foo' in 'mon.foo')
    */
   void remove(const std::string &name) {
+    // this must match what we do in ConnectionTracker::notify_rank_removed
     ceph_assert(mon_info.count(name));
+    int rank = get_rank(name);
     mon_info.erase(name);
+    disallowed_leaders.erase(name);
     ceph_assert(mon_info.count(name) == 0);
+    if (rank >= 0 ) {
+      removed_ranks.insert(rank);
+    }
     if (get_required_features().contains_all(
 	  ceph::features::mon::FEATURE_NAUTILUS)) {
       ranks.erase(std::find(ranks.begin(), ranks.end(), name));
@@ -425,7 +459,7 @@ public:
    * @param cct context (and associated config)
    * @param errout std::ostream to send error messages too
    */
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
   seastar::future<> build_initial(const crimson::common::ConfigProxy& conf, bool for_mkfs);
 #else
   int build_initial(CephContext *cct, bool for_mkfs, std::ostream& errout);
@@ -454,8 +488,21 @@ public:
   void dump(ceph::Formatter *f) const;
   void dump_summary(ceph::Formatter *f) const;
 
+  void check_health(health_check_map_t *checks) const;
+
   static void generate_test_instances(std::list<MonMap*>& o);
 protected:
+  /**
+   * build a monmap from a list of entity_addrvec_t's
+   *
+   * Give mons dummy names.
+   *
+   * @param addrs  list of entity_addrvec_t's
+   * @param prefix prefix to prepend to generated mon names
+   */
+  void init_with_addrs(const std::vector<entity_addrvec_t>& addrs,
+                       bool for_mkfs,
+                       std::string_view prefix);
   /**
    * build a monmap from a list of ips
    *
@@ -467,7 +514,7 @@ protected:
    */
   int init_with_ips(const std::string& ips,
 		    bool for_mkfs,
-		    const std::string &prefix);
+		    std::string_view prefix);
   /**
    * build a monmap from a list of hostnames
    *
@@ -479,15 +526,17 @@ protected:
    */
   int init_with_hosts(const std::string& hostlist,
 		      bool for_mkfs,
-		      const std::string& prefix);
+		      std::string_view prefix);
   int init_with_config_file(const ConfigProxy& conf, std::ostream& errout);
-#if WITH_SEASTAR
+#if WITH_CRIMSON
   seastar::future<> read_monmap(const std::string& monmap);
   /// try to build monmap with different settings, like
   /// mon_host, mon* sections, and mon_dns_srv_name
   seastar::future<> build_monmap(const crimson::common::ConfigProxy& conf, bool for_mkfs);
   /// initialize monmap by resolving given service name
   seastar::future<> init_with_dns_srv(bool for_mkfs, const std::string& name);
+  /// initialize monmap with `mon_host` or `mon_host_override`
+  bool maybe_init_with_mon_host(const std::string& mon_host, bool for_mkfs);
 #else
   /// read from encoded monmap file
   int init_with_monmap(const std::string& monmap, std::ostream& errout);

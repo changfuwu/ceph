@@ -26,7 +26,9 @@
 
 class MonClient;
 
-std::string handle_pyerror();
+std::string handle_pyerror(bool generate_crash_dump = false,
+			   std::string module = {},
+			   std::string caller = {});
 
 std::string peek_pyerror();
 
@@ -49,7 +51,6 @@ class PyModule
   mutable ceph::mutex lock = ceph::make_mutex("PyModule::lock");
 private:
   const std::string module_name;
-  std::string get_site_packages();
   int load_subclass_of(const char* class_name, PyObject** py_class);
 
   // Did the MgrMap identify this module as one that should run?
@@ -85,8 +86,11 @@ private:
   int load_options();
   std::map<std::string, MgrMap::ModuleOption> options;
 
+  int load_notify_types();
+  std::set<std::string> notify_types;
+
 public:
-  static std::string config_prefix;
+  static std::string mgr_store_prefix;
 
   SafeThreadState pMyThreadState;
   PyObject *pClass = nullptr;
@@ -109,13 +113,8 @@ public:
     const std::string& value);
 
   int load(PyThreadState *pMainThreadState);
-#if PY_MAJOR_VERSION >= 3
   static PyObject* init_ceph_logger();
   static PyObject* init_ceph_module();
-#else
-  static void init_ceph_logger();
-  static void init_ceph_module();
-#endif
 
   void set_enabled(const bool enabled_)
   {
@@ -157,10 +156,14 @@ public:
   bool is_loaded() const { std::lock_guard l(lock) ; return loaded; }
   bool is_always_on() const { std::lock_guard l(lock) ; return always_on; }
 
-  const std::string &get_name() const {
-    std::lock_guard l(lock) ; return module_name;
+  bool should_notify(const std::string& notify_type) const {
+    return notify_types.count(notify_type);
   }
-  const std::string &get_error_string() const {
+
+  const std::string &get_name() const {
+    return module_name;
+  }
+  std::string get_error_string() const {
     std::lock_guard l(lock) ; return error_string;
   }
   bool get_can_run() const {
@@ -181,9 +184,9 @@ public:
   
   ~PyModuleConfig();
 
-  void set_config(
+  std::pair<int, std::string> set_config(
     MonClient *monc,
     const std::string &module_name,
-    const std::string &key, const boost::optional<std::string>& val);
+    const std::string &key, const std::optional<std::string>& val);
 
 };

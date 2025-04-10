@@ -83,7 +83,6 @@ void cls_rgw_gc_list_ret::generate_test_instances(list<cls_rgw_gc_list_ret*>& ls
   ls.back()->truncated = true;
 }
 
-
 void cls_rgw_gc_remove_op::dump(Formatter *f) const
 {
   encode_json("tags", tags, f);
@@ -95,6 +94,18 @@ void cls_rgw_gc_remove_op::generate_test_instances(list<cls_rgw_gc_remove_op*>& 
   ls.push_back(new cls_rgw_gc_remove_op);
   ls.back()->tags.push_back("tag1");
   ls.back()->tags.push_back("tag2");
+}
+
+void cls_rgw_lc_get_entry_ret::dump(Formatter *f) const
+{
+  encode_json("entry", entry, f);
+}
+
+void cls_rgw_lc_get_entry_ret::generate_test_instances(list<cls_rgw_lc_get_entry_ret*>& ls)
+{
+  cls_rgw_lc_entry entry("bucket1", 6000, 0);
+  ls.push_back(new cls_rgw_lc_get_entry_ret);
+  ls.back()->entry = entry;
 }
 
 void rgw_cls_obj_prepare_op::generate_test_instances(list<rgw_cls_obj_prepare_op*>& o)
@@ -114,9 +125,6 @@ void rgw_cls_obj_prepare_op::dump(Formatter *f) const
   f->dump_string("name", key.name);
   f->dump_string("tag", tag);
   f->dump_string("locator", locator);
-  f->dump_bool("log_op", log_op);
-  f->dump_int("bilog_flags", bilog_flags);
-  encode_json("zones_trace", zones_trace, f);
 }
 
 void rgw_cls_obj_complete_op::generate_test_instances(list<rgw_cls_obj_complete_op*>& o)
@@ -362,6 +370,10 @@ void rgw_cls_bucket_update_stats_op::generate_test_instances(list<rgw_cls_bucket
   s.total_size = 1;
   s.total_size_rounded = 4096;
   s.num_entries = 1;
+  rgw_bucket_category_stats& dec_s = r->dec_stats[RGWObjCategory::None];
+  dec_s.total_size = 1;
+  dec_s.total_size_rounded = 4096;
+  dec_s.num_entries = 1;
   o.push_back(r);
 
   o.push_back(new rgw_cls_bucket_update_stats_op);
@@ -375,6 +387,11 @@ void rgw_cls_bucket_update_stats_op::dump(Formatter *f) const
     s[(int)entry.first] = entry.second;
   }
   encode_json("stats", s, f);
+  map<int, rgw_bucket_category_stats> dec_s;
+  for (auto& entry : dec_stats) {
+    dec_s[(int)entry.first] = entry.second;
+  }
+  encode_json("dec_stats", dec_s, f);
 }
 
 void cls_rgw_bi_log_list_op::dump(Formatter *f) const
@@ -417,6 +434,21 @@ void cls_rgw_bi_log_list_ret::generate_test_instances(list<cls_rgw_bi_log_list_r
   ls.push_back(new cls_rgw_bi_log_list_ret);
   ls.back()->entries.push_back(rgw_bi_log_entry());
   ls.back()->truncated = true;
+}
+
+void cls_rgw_mp_upload_part_info_update_op::generate_test_instances(std::list<cls_rgw_mp_upload_part_info_update_op*>& ls)
+{
+  ls.push_back(new cls_rgw_mp_upload_part_info_update_op);
+  ls.back()->part_key = "part1";
+  ls.push_back(new cls_rgw_mp_upload_part_info_update_op);
+  ls.back()->part_key = "part2";
+}
+
+void cls_rgw_mp_upload_part_info_update_op::dump(Formatter* f) const
+{
+  encode_json("part_key", part_key, f);
+  encode_json("part_num", info.num, f);
+  encode_json("part_prefix", info.manifest.get_prefix(), f);
 }
 
 void cls_rgw_reshard_add_op::generate_test_instances(list<cls_rgw_reshard_add_op*>& ls)
@@ -544,4 +576,10 @@ void cls_rgw_get_bucket_resharding_op::generate_test_instances(
 
 void cls_rgw_get_bucket_resharding_op::dump(Formatter *f) const
 {
+}
+
+void rgw_cls_bi_put_entries_op::dump(Formatter *f) const
+{
+  encode_json("entries", entries, f);
+  encode_json("check_existing", check_existing, f);
 }

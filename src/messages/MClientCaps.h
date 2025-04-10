@@ -19,10 +19,10 @@
 #include "mds/mdstypes.h"
 #include "include/ceph_features.h"
 
-class MClientCaps : public SafeMessage {
+class MClientCaps final : public SafeMessage {
 private:
 
-  static constexpr int HEAD_VERSION = 11;
+  static constexpr int HEAD_VERSION = 12;
   static constexpr int COMPAT_VERSION = 1;
 
  public:
@@ -57,7 +57,10 @@ private:
   uint32_t caller_gid = 0;
 
   /* advisory CLIENT_CAPS_* flags to send to mds */
-  unsigned flags = 0;
+  uint32_t flags = 0;
+
+  std::vector<uint8_t> fscrypt_auth;
+  std::vector<uint8_t> fscrypt_file;
 
   int      get_caps() const { return head.caps; }
   int      get_wanted() const { return head.wanted; }
@@ -114,9 +117,9 @@ private:
   void set_ctime(const utime_t &t) { ctime = t; }
   void set_atime(const utime_t &t) { atime = t; }
 
-  void set_cap_peer(uint64_t id, ceph_seq_t seq, ceph_seq_t mseq, int mds, int flags) {
+  void set_cap_peer(uint64_t id, ceph_seq_t issue_seq, ceph_seq_t mseq, int mds, int flags) {
     peer.cap_id = id;
-    peer.seq = seq;
+    peer.issue_seq = issue_seq;
     peer.mseq = mseq;
     peer.mds = mds;
     peer.flags = flags;
@@ -134,11 +137,12 @@ protected:
 	      inodeno_t ino,
 	      inodeno_t realm,
 	      uint64_t id,
-	      long seq,
+	      ceph_seq_t seq,
 	      int caps,
 	      int wanted,
 	      int dirty,
-	      int mseq,
+	      ceph_seq_t mseq,
+              ceph_seq_t issue_seq,
               epoch_t oeb)
     : SafeMessage{CEPH_MSG_CLIENT_CAPS, HEAD_VERSION, COMPAT_VERSION},
       osd_epoch_barrier(oeb) {
@@ -152,11 +156,12 @@ protected:
     head.wanted = wanted;
     head.dirty = dirty;
     head.migrate_seq = mseq;
+    head.issue_seq = issue_seq;
     memset(&peer, 0, sizeof(peer));
   }
   MClientCaps(int op,
 	      inodeno_t ino, inodeno_t realm,
-	      uint64_t id, int mseq, epoch_t oeb)
+	      uint64_t id, ceph_seq_t mseq, epoch_t oeb)
     : SafeMessage{CEPH_MSG_CLIENT_CAPS, HEAD_VERSION, COMPAT_VERSION},
       osd_epoch_barrier(oeb) {
     memset(&head, 0, sizeof(head));
@@ -167,7 +172,7 @@ protected:
     head.migrate_seq = mseq;
     memset(&peer, 0, sizeof(peer));
   }
-  ~MClientCaps() override {}
+  ~MClientCaps() final {}
 
 private:
   file_layout_t layout;
@@ -178,7 +183,8 @@ public:
     out << "client_caps(" << ceph_cap_op_name(head.op)
 	<< " ino " << inodeno_t(head.ino)
 	<< " " << head.cap_id
-	<< " seq " << head.seq;
+	<< " seq " << head.seq
+	<< " issue_seq " << head.issue_seq;
     if (get_tid())
       out << " tid " << get_tid();
     out << " caps=" << ccap_string(head.caps)
@@ -191,7 +197,9 @@ public:
     out << " size " << size << "/" << max_size;
     if (truncate_seq)
       out << " ts " << truncate_seq << "/" << truncate_size;
-    out << " mtime " << mtime;
+    out << " mtime " << mtime
+        << " ctime " << ctime
+        << " change_attr " << change_attr;
     if (time_warp_seq)
       out << " tws " << time_warp_seq;
 
@@ -205,11 +213,15 @@ public:
     using ceph::decode;
     auto p = payload.cbegin();
     decode(head, p);
-    ceph_mds_caps_body_legacy body;
-    decode(body, p);
     if (head.op == CEPH_CAP_OP_EXPORT) {
+      ceph_mds_caps_export_body body;
+      decode(body, p);
       peer = body.peer;
+      p += (sizeof(ceph_mds_caps_non_export_body) -
+	    sizeof(ceph_mds_caps_export_body));
     } else {
+      ceph_mds_caps_non_export_body body;
+      decode(body, p);
       size = body.size;
       max_size = body.max_size;
       truncate_size = body.truncate_size;
@@ -266,6 +278,10 @@ public:
       decode(nfiles, p);
       decode(nsubdirs, p);
     }
+    if (header.version >= 12) {
+      decode(fscrypt_auth, p);
+      decode(fscrypt_file, p);
+    }
   }
   void encode_payload(uint64_t features) override {
     using ceph::encode;
@@ -274,11 +290,16 @@ public:
     head.xattr_len = xattrbl.length();
 
     encode(head, payload);
-    ceph_mds_caps_body_legacy body;
+    static_assert(sizeof(ceph_mds_caps_non_export_body) >
+		  sizeof(ceph_mds_caps_export_body));
     if (head.op == CEPH_CAP_OP_EXPORT) {
-      memset(&body, 0, sizeof(body));
+      ceph_mds_caps_export_body body;
       body.peer = peer;
+      encode(body, payload);
+      payload.append_zero(sizeof(ceph_mds_caps_non_export_body) -
+			  sizeof(ceph_mds_caps_export_body));
     } else {
+      ceph_mds_caps_non_export_body body;
       body.size = size;
       body.max_size = max_size;
       body.truncate_size = truncate_size;
@@ -288,8 +309,8 @@ public:
       ctime.encode_timeval(&body.ctime);
       layout.to_legacy(&body.layout);
       body.time_warp_seq = time_warp_seq;
+      encode(body, payload);
     }
-    encode(body, payload);
     ceph::encode_nohead(snapbl, payload);
 
     middle = xattrbl;
@@ -329,10 +350,14 @@ public:
     encode(flags, payload);
     encode(nfiles, payload);
     encode(nsubdirs, payload);
+    encode(fscrypt_auth, payload);
+    encode(fscrypt_file, payload);
   }
 private:
   template<class T, typename... Args>
   friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
+  template<class T, typename... Args>
+  friend MURef<T> crimson::make_message(Args&&... args);
 };
 
 #endif

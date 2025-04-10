@@ -25,15 +25,6 @@ TMPDIR=${TMPDIR:-/tmp}
 CEPH_BUILD_VIRTUALENV=${TMPDIR}
 TESTDIR=${TESTDIR:-${TMPDIR}}
 
-if type xmlstarlet > /dev/null 2>&1; then
-    XMLSTARLET=xmlstarlet
-elif type xml > /dev/null 2>&1; then
-    XMLSTARLET=xml
-else
-	echo "Missing xmlstarlet binary!"
-	exit 1
-fi
-
 if [ `uname` = FreeBSD ]; then
     SED=gsed
     AWK=gawk
@@ -274,7 +265,7 @@ function kill_daemon() {
 function test_kill_daemon() {
     local dir=$1
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
 
@@ -365,7 +356,7 @@ function kill_daemons() {
 function test_kill_daemons() {
     local dir=$1
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     #
@@ -481,6 +472,7 @@ function run_mon() {
 	--mon-allow-pool-size-one \
 	--osd-pool-default-pg-autoscale-mode off \
 	--mon-osd-backfillfull-ratio .99 \
+	--mon-warn-on-insecure-global-id-reclaim-allowed=false \
         "$@" || return 1
 
     cat > $dir/ceph.conf <<EOF
@@ -495,7 +487,7 @@ function test_run_mon() {
 
     setup $dir || return 1
 
-    run_mon $dir a --mon-initial-members=a || return 1
+    run_mon $dir a || return 1
     ceph mon dump | grep "mon.a" || return 1
     kill_daemons $dir || return 1
 
@@ -514,7 +506,7 @@ function test_run_mon() {
 
     kill_daemons $dir || return 1
 
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     local size=$(CEPH_ARGS='' ceph --format=json daemon $(get_asok_path mon.a) \
         config get osd_pool_default_size)
     test "$size" = '{"osd_pool_default_size":"1"}' || return 1
@@ -555,7 +547,7 @@ function run_mgr() {
     shift
     local data=$dir/$id
 
-    ceph config set mgr mgr/devicehealth/enable_monitoring off --force
+    ceph config set mgr mgr_pool false --force
     ceph-mgr \
         --id $id \
         $EXTRA_OPTS \
@@ -653,6 +645,7 @@ function run_osd() {
     ceph_args+=" --osd-max-object-name-len=460"
     ceph_args+=" --osd-max-object-namespace-len=64"
     ceph_args+=" --enable-experimental-unrecoverable-data-corrupting-features=*"
+    ceph_args+=" --osd-mclock-profile=high_recovery_ops"
     ceph_args+=" "
     ceph_args+="$@"
     mkdir -p $osd_data
@@ -863,6 +856,7 @@ function activate_osd() {
     ceph_args+=" --osd-max-object-name-len=460"
     ceph_args+=" --osd-max-object-namespace-len=64"
     ceph_args+=" --enable-experimental-unrecoverable-data-corrupting-features=*"
+    ceph_args+=" --osd-mclock-profile=high_recovery_ops"
     ceph_args+=" "
     ceph_args+="$@"
     mkdir -p $osd_data
@@ -902,6 +896,65 @@ function test_activate_osd() {
     teardown $dir || return 1
 }
 
+function test_activate_osd_after_mark_down() {
+    local dir=$1
+
+    setup $dir || return 1
+
+    run_mon $dir a || return 1
+    run_mgr $dir x || return 1
+
+    run_osd $dir 0 || return 1
+    local backfills=$(CEPH_ARGS='' ceph --format=json daemon $(get_asok_path osd.0) \
+        config get osd_max_backfills)
+    echo "$backfills" | grep --quiet 'osd_max_backfills' || return 1
+
+    kill_daemons $dir TERM osd || return 1
+    ceph osd down 0 || return 1
+    wait_for_osd down 0 || return 1
+
+    activate_osd $dir 0 --osd-max-backfills 20 || return 1
+    local backfills=$(CEPH_ARGS='' ceph --format=json daemon $(get_asok_path osd.0) \
+        config get osd_max_backfills)
+    test "$backfills" = '{"osd_max_backfills":"20"}' || return 1
+
+    teardown $dir || return 1
+}
+
+function test_activate_osd_skip_benchmark() {
+    local dir=$1
+
+    setup $dir || return 1
+
+    run_mon $dir a || return 1
+    run_mgr $dir x || return 1
+
+    # Skip the osd benchmark during first osd bring-up.
+    run_osd $dir 0 --osd-op-queue=mclock_scheduler \
+        --osd-mclock-skip-benchmark=true || return 1
+    local max_iops_hdd_def=$(CEPH_ARGS='' ceph --format=json daemon \
+        $(get_asok_path osd.0) config get osd_mclock_max_capacity_iops_hdd)
+    local max_iops_ssd_def=$(CEPH_ARGS='' ceph --format=json daemon \
+        $(get_asok_path osd.0) config get osd_mclock_max_capacity_iops_ssd)
+
+    kill_daemons $dir TERM osd || return 1
+    ceph osd down 0 || return 1
+    wait_for_osd down 0 || return 1
+
+    # Skip the osd benchmark during activation as well. Validate that
+    # the max osd capacities are left unchanged.
+    activate_osd $dir 0 --osd-op-queue=mclock_scheduler \
+        --osd-mclock-skip-benchmark=true || return 1
+    local max_iops_hdd_after_boot=$(CEPH_ARGS='' ceph --format=json daemon \
+        $(get_asok_path osd.0) config get osd_mclock_max_capacity_iops_hdd)
+    local max_iops_ssd_after_boot=$(CEPH_ARGS='' ceph --format=json daemon \
+        $(get_asok_path osd.0) config get osd_mclock_max_capacity_iops_ssd)
+
+    test "$max_iops_hdd_def" = "$max_iops_hdd_after_boot" || return 1
+    test "$max_iops_ssd_def" = "$max_iops_ssd_after_boot" || return 1
+
+    teardown $dir || return 1
+}
 #######################################################################
 
 ##
@@ -932,7 +985,7 @@ function wait_for_osd() {
 function test_wait_for_osd() {
     local dir=$1
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1  --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     run_osd $dir 1 || return 1
@@ -1038,7 +1091,7 @@ function test_get_pg() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1  --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -1075,7 +1128,7 @@ function test_get_config() {
 
     # override the default config using command line arg and check it
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     test $(get_config mon a osd_pool_default_size) = 1 || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 --osd_max_scrubs=3 || return 1
@@ -1110,7 +1163,7 @@ function test_set_config() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     test $(get_config mon a ms_crc_header) = true || return 1
     set_config mon a ms_crc_header false || return 1
     test $(get_config mon a ms_crc_header) = false || return 1
@@ -1142,7 +1195,7 @@ function test_get_primary() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     local osd=0
     run_mgr $dir x || return 1
     run_osd $dir $osd || return 1
@@ -1245,7 +1298,7 @@ function test_objectstore_tool() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     local osd=0
     run_mgr $dir x || return 1
     run_osd $dir $osd || return 1
@@ -1310,7 +1363,7 @@ function test_get_num_active_clean() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -1340,7 +1393,7 @@ function test_get_num_active_or_peered() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -1367,7 +1420,7 @@ function test_get_num_pgs() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -1397,7 +1450,7 @@ function test_get_osd_id_used_by_pgs() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -1439,7 +1492,7 @@ function test_wait_osd_id_used_by_pgs() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -1471,7 +1524,7 @@ function test_get_last_scrub_stamp() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -1499,13 +1552,27 @@ function test_is_clean() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
     wait_for_clean || return 1
     is_clean || return 1
     teardown $dir || return 1
+}
+
+#######################################################################
+
+##
+# Predicate checking if the named PG is in state "active+clean"
+#
+# @return 0 if the PG is active & clean, 1 otherwise
+#
+function is_pg_clean() {
+    local pgid=$1
+    local pg_state
+    pg_state=$(ceph pg $pgid query 2>/dev/null | jq -r ".state ")
+    [[ "$pg_state" == "active+clean"* ]]
 }
 
 #######################################################################
@@ -1626,6 +1693,33 @@ function test_wait_for_clean() {
 }
 
 ##
+# Wait until the named PG becomes clean or until a timeout of
+# $WAIT_FOR_CLEAN_TIMEOUT seconds.
+#
+# @return 0 if the PG is clean, 1 otherwise
+#
+function wait_for_pg_clean() {
+    local pg_id=$1
+    local -a delays=($(get_timeout_delays $WAIT_FOR_CLEAN_TIMEOUT 1 3))
+    local -i loop=0
+
+    flush_pg_stats || return 1
+
+    while true ; do
+        echo "#---------- $pgid loop $loop"
+        is_pg_clean $pg_id && break
+        if (( $loop >= ${#delays[*]} )) ; then
+            ceph report
+            echo "PG $pg_id is not clean after $loop iterations"
+            return 1
+        fi
+        sleep ${delays[$loop]}
+        loop+=1
+    done
+    return 0
+}
+
+##
 # Wait until the cluster becomes peered or if it does not make progress
 # for $WAIT_FOR_CLEAN_TIMEOUT seconds.
 # Progress is measured either via the **get_is_making_recovery_progress**
@@ -1682,8 +1776,47 @@ function test_wait_for_peered() {
     teardown $dir || return 1
 }
 
+function wait_for_string() {
+    local logfile=$1
+    local searchstr=$2
+
+    status=1
+    for ((i=0; i < $TIMEOUT; i++)); do
+        echo $i
+        if ! grep "$searchstr" $logfile; then
+            sleep 1
+        else
+            status=0
+            break
+        fi
+    done
+    return $status
+}
 
 #######################################################################
+
+##
+# Wait until the cluster's health condition disappeared.
+# $TIMEOUT default
+#
+# @param string to grep for in health detail
+# @return 0 if the cluster health doesn't matches request,
+# 1 otherwise if after $TIMEOUT seconds health condition remains.
+#
+function wait_for_health_gone() {
+    local grepstr=$1
+    local -a delays=($(get_timeout_delays $TIMEOUT .1))
+    local -i loop=0
+
+    while ceph health detail | grep "$grepstr" ; do
+	if (( $loop >= ${#delays[*]} )) ; then
+            ceph health detail
+            return 1
+        fi
+        sleep ${delays[$loop]}
+        loop+=1
+    done
+}
 
 ##
 # Wait until the cluster has health condition passed as arg
@@ -1761,14 +1894,14 @@ function test_repair() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1  --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
     wait_for_clean || return 1
     repair 1.0 || return 1
     kill_daemons $dir KILL osd || return 1
-    ! TIMEOUT=1 repair 1.0 || return 1
+    ! TIMEOUT=2 repair 1.0 || return 1
     teardown $dir || return 1
 }
 #######################################################################
@@ -1780,11 +1913,16 @@ function test_repair() {
 # **get_last_scrub_stamp** function reports a timestamp different from
 # the one stored before starting the scrub.
 #
+# The scrub is initiated using the "operator initiated" method, and
+# the scrub triggered is not subject to no-scrub flags etc.
+#
 # @param pgid the id of the PG
 # @return 0 on success, 1 on error
 #
 function pg_scrub() {
     local pgid=$1
+    # do not issue the scrub command unless the PG is clean
+    wait_for_pg_clean $pgid || return 1
     local last_scrub=$(get_last_scrub_stamp $pgid)
     ceph pg scrub $pgid
     wait_for_scrub $pgid "$last_scrub"
@@ -1792,6 +1930,8 @@ function pg_scrub() {
 
 function pg_deep_scrub() {
     local pgid=$1
+    # do not issue the scrub command unless the PG is clean
+    wait_for_pg_clean $pgid || return 1
     local last_scrub=$(get_last_scrub_stamp $pgid last_deep_scrub_stamp)
     ceph pg deep-scrub $pgid
     wait_for_scrub $pgid "$last_scrub" last_deep_scrub_stamp
@@ -1801,14 +1941,58 @@ function test_pg_scrub() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
     wait_for_clean || return 1
     pg_scrub 1.0 || return 1
     kill_daemons $dir KILL osd || return 1
-    ! TIMEOUT=1 pg_scrub 1.0 || return 1
+    ! TIMEOUT=2 pg_scrub 1.0 || return 1
+    teardown $dir || return 1
+}
+
+#######################################################################
+
+##
+# Trigger a "scheduled" scrub on **pgid** (by mnaually modifying the relevant
+# last-scrub stamp) and wait until it completes. The pg_scrub
+# function will fail if scrubbing does not complete within $TIMEOUT
+# seconds. The pg_scrub is complete whenever the
+# **get_last_scrub_stamp** function reports a timestamp different from
+# the one stored before starting the scrub.
+#
+# @param pgid the id of the PG
+# @return 0 on success, 1 on error
+#
+function pg_schedule_scrub() {
+    local pgid=$1
+    # do not issue the scrub command unless the PG is clean
+    wait_for_pg_clean $pgid || return 1
+    local last_scrub=$(get_last_scrub_stamp $pgid)
+    ceph tell $pgid schedule-scrub
+    wait_for_scrub $pgid "$last_scrub"
+}
+
+function pg_schedule_deep_scrub() {
+    local pgid=$1
+    # do not issue the scrub command unless the PG is clean
+    wait_for_pg_clean $pgid || return 1
+    local last_scrub=$(get_last_scrub_stamp $pgid last_deep_scrub_stamp)
+    ceph tell $pgid schedule-deep-scrub
+    wait_for_scrub $pgid "$last_scrub" last_deep_scrub_stamp
+}
+
+function test_pg_schedule_scrub() {
+    local dir=$1
+
+    setup $dir || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
+    run_mgr $dir x  --mgr_stats_period=1 || return 1
+    run_osd $dir 0 || return 1
+    create_rbd_pool || return 1
+    wait_for_clean || return 1
+    pg_schedule_scrub 1.0 || return 1
     teardown $dir || return 1
 }
 
@@ -1893,7 +2077,7 @@ function test_wait_for_scrub() {
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -1904,7 +2088,7 @@ function test_wait_for_scrub() {
     wait_for_scrub $pgid "$last_scrub" || return 1
     kill_daemons $dir KILL osd || return 1
     last_scrub=$(get_last_scrub_stamp $pgid)
-    ! TIMEOUT=1 wait_for_scrub $pgid "$last_scrub" || return 1
+    ! TIMEOUT=2 wait_for_scrub $pgid "$last_scrub" || return 1
     teardown $dir || return 1
 }
 
@@ -1916,7 +2100,6 @@ function test_wait_for_scrub() {
 # @param plugin erasure code plugin
 # @return 0 on success, 1 on error
 #
-
 function erasure_code_plugin_exists() {
     local plugin=$1
     local status
@@ -1931,10 +2114,13 @@ function erasure_code_plugin_exists() {
     local status=$?
     if [ $status -eq 0 ]; then
         ceph osd erasure-code-profile rm TESTPROFILE
-    elif ! echo $s | grep --quiet "$grepstr" ; then
+    elif echo $s | grep --quiet "$grepstr" ; then
+        # expected error when the plugin doesn't exist
         status=1
-        # display why the string was rejected.
+    else
+        # any other error means plugin exists but can't initialize
         echo $s
+        status=0
     fi
     return $status
 }
@@ -1998,7 +2184,7 @@ function run_in_background() {
     shift
     # Execute the command and prepend the output with its pid
     # We enforce to return the exit status of the command and not the sed one.
-    ("$@" |& sed 's/^/'$$': /'; return "${PIPESTATUS[0]}") >&2 &
+    ("$@" |& sed 's/^/'$BASHPID': /'; return "${PIPESTATUS[0]}") >&2 &
     eval "$pid_variable+=\" $!\""
 }
 
@@ -2070,6 +2256,10 @@ function flush_pg_stats()
     seqs=''
     for osd in $ids; do
 	    seq=`ceph tell osd.$osd flush_pg_stats`
+	    if test -z "$seq"
+	    then
+		continue
+	    fi
 	    seqs="$seqs $osd-$seq"
     done
 
@@ -2091,7 +2281,7 @@ function test_flush_pg_stats()
     local dir=$1
 
     setup $dir || return 1
-    run_mon $dir a --osd_pool_default_size=1 || return 1
+    run_mon $dir a --osd_pool_default_size=1 --mon_allow_pool_size_one=true || return 1
     run_mgr $dir x || return 1
     run_osd $dir 0 || return 1
     create_rbd_pool || return 1
@@ -2104,6 +2294,70 @@ function test_flush_pg_stats()
     test $stored == $stored_raw || return 1
     teardown $dir
 }
+
+########################################################################
+##
+# Get the current op scheduler enabled on an osd by reading the
+# osd_op_queue config option
+#
+# Example:
+#   get_op_scheduler $osdid
+#
+# @param id the id of the OSD
+# @return the name of the op scheduler enabled for the OSD
+#
+function get_op_scheduler() {
+   local id=$1
+
+   get_config osd $id osd_op_queue
+}
+
+function test_get_op_scheduler() {
+    local dir=$1
+
+    setup $dir || return 1
+
+    run_mon $dir a || return 1
+    run_mgr $dir x || return 1
+
+    run_osd $dir 0 --osd_op_queue=wpq || return 1
+    test $(get_op_scheduler 0) = "wpq" || return 1
+
+    run_osd $dir 1 --osd_op_queue=mclock_scheduler || return 1
+    test $(get_op_scheduler 1) = "mclock_scheduler" || return 1
+    teardown $dir || return 1
+}
+
+########################################################################
+##
+# Create a temporary file with random data and return its name. The file
+# should be removed by the caller.
+#
+# Example:
+#   testdata=$(file_with_random_data 1024)
+#
+# @param the size of the file created in bytes. As in most use cases
+#     the size is meaningless, a default (512) is used if not specified
+# @return the name of the file created
+#
+function file_with_random_data() {
+  local size_bytes=${1:-512}
+  local file=$(mktemp)
+  dd if=/dev/urandom of=$file bs=$size_bytes count=1
+  printf '%s' "$file"
+}
+
+function test_file_with_random_data() {
+    local dir=$1
+
+    setup $dir || return 1
+    local file=$(file_with_random_data 4000)
+    test -f $file || return 1
+    test $(stat -c %s $file) = 4000 || return 1
+    rm $file
+    teardown $dir || return 1
+}
+
 
 #######################################################################
 
@@ -2158,7 +2412,7 @@ function run_tests() {
     shopt -s -o xtrace
     PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 
-    export .:$PATH # make sure program from sources are preferred
+    export PATH=./bin:.:$PATH # make sure program from sources are preferred
 
     export CEPH_MON="127.0.0.1:7109" # git grep '\<7109\>' : there must be only one
     export CEPH_ARGS

@@ -14,8 +14,8 @@
 struct rgw_rest_obj {
   rgw_obj_key key;
   uint64_t content_len;
-  std::map<string, string> attrs;
-  std::map<string, string> custom_attrs;
+  std::map<std::string, std::string> attrs;
+  std::map<std::string, std::string> custom_attrs;
   RGWAccessControlPolicy acls;
 
   void init(const rgw_obj_key& _key) {
@@ -24,42 +24,44 @@ struct rgw_rest_obj {
 };
 
 class RGWReadRawRESTResourceCR : public RGWSimpleCoroutine {
+  static constexpr int NUM_ENPOINT_IOERROR_RETRIES = 20;
+
   bufferlist *result;
  protected:
   RGWRESTConn *conn;
   RGWHTTPManager *http_manager;
-  string path;
+  std::string path;
   param_vec_t params;
   param_vec_t extra_headers;
 public:
   boost::intrusive_ptr<RGWRESTReadResource> http_op;
   RGWReadRawRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
-                           RGWHTTPManager *_http_manager, const string& _path,
+                           RGWHTTPManager *_http_manager, const std::string& _path,
                            rgw_http_param_pair *params, bufferlist *_result)
-    : RGWSimpleCoroutine(_cct), result(_result), conn(_conn), http_manager(_http_manager),
+    : RGWSimpleCoroutine(_cct, NUM_ENPOINT_IOERROR_RETRIES), result(_result), conn(_conn), http_manager(_http_manager),
     path(_path), params(make_param_list(params))
   {}
 
  RGWReadRawRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
-                          RGWHTTPManager *_http_manager, const string& _path,
+                          RGWHTTPManager *_http_manager, const std::string& _path,
                           rgw_http_param_pair *params)
-   : RGWSimpleCoroutine(_cct), conn(_conn), http_manager(_http_manager),
+   : RGWSimpleCoroutine(_cct, NUM_ENPOINT_IOERROR_RETRIES), conn(_conn), http_manager(_http_manager),
     path(_path), params(make_param_list(params))
   {}
 
   RGWReadRawRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
-                           RGWHTTPManager *_http_manager, const string& _path,
+                           RGWHTTPManager *_http_manager, const std::string& _path,
                            rgw_http_param_pair *params, param_vec_t &hdrs)
-    : RGWSimpleCoroutine(_cct), conn(_conn), http_manager(_http_manager),
+    : RGWSimpleCoroutine(_cct, NUM_ENPOINT_IOERROR_RETRIES), conn(_conn), http_manager(_http_manager),
       path(_path), params(make_param_list(params)),
       extra_headers(hdrs)
   {}
 
  RGWReadRawRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
-                          RGWHTTPManager *_http_manager, const string& _path,
+                          RGWHTTPManager *_http_manager, const std::string& _path,
                           rgw_http_param_pair *params,
                           std::map <std::string, std::string> *hdrs)
-   : RGWSimpleCoroutine(_cct), conn(_conn), http_manager(_http_manager),
+   : RGWSimpleCoroutine(_cct, NUM_ENPOINT_IOERROR_RETRIES), conn(_conn), http_manager(_http_manager),
     path(_path), params(make_param_list(params)),
     extra_headers(make_param_list(hdrs))
     {}
@@ -69,13 +71,13 @@ public:
     request_cleanup();
   }
 
-  int send_request() override {
+  int send_request(const DoutPrefixProvider *dpp) override {
     auto op = boost::intrusive_ptr<RGWRESTReadResource>(
         new RGWRESTReadResource(conn, path, params, &extra_headers, http_manager));
 
     init_new_io(op.get());
 
-    int ret = op->aio_read();
+    int ret = op->aio_read(dpp);
     if (ret < 0) {
       log_error() << "failed to send http operation: " << op->to_str()
           << " ret=" << ret << std::endl;
@@ -88,14 +90,13 @@ public:
 
 
 
-  virtual int wait_result() {
-    return http_op->wait(result, null_yield);
+  virtual int wait_result(const DoutPrefixProvider* dpp) {
+    return http_op->wait(dpp, result, null_yield);
   }
 
   int request_complete() override {
-    int ret;
-
-    ret = wait_result();
+    auto dpp = NoDoutPrefix{cct, ceph_subsys_rgw};
+    int ret = wait_result(&dpp);
 
     auto op = std::move(http_op); // release ref on return
     if (ret < 0) {
@@ -123,35 +124,37 @@ class RGWReadRESTResourceCR : public RGWReadRawRESTResourceCR {
   T *result;
  public:
  RGWReadRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
-                       RGWHTTPManager *_http_manager, const string& _path,
+                       RGWHTTPManager *_http_manager, const std::string& _path,
                        rgw_http_param_pair *params, T *_result)
    : RGWReadRawRESTResourceCR(_cct, _conn, _http_manager, _path, params), result(_result)
   {}
 
   RGWReadRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
-                        RGWHTTPManager *_http_manager, const string& _path,
+                        RGWHTTPManager *_http_manager, const std::string& _path,
                         rgw_http_param_pair *params,
                         std::map <std::string, std::string> *hdrs,
                         T *_result)
     : RGWReadRawRESTResourceCR(_cct, _conn, _http_manager, _path, params, hdrs), result(_result)
   {}
 
-  int wait_result() override {
-    return http_op->wait(result, null_yield);
+  int wait_result(const DoutPrefixProvider* dpp) override {
+    return http_op->wait(dpp, result, null_yield);
   }
 
 };
 
 template <class T, class E = int>
 class RGWSendRawRESTResourceCR: public RGWSimpleCoroutine {
+  static constexpr int NUM_ENPOINT_IOERROR_RETRIES = 20;
+
  protected:
   RGWRESTConn *conn;
   RGWHTTPManager *http_manager;
-  string method;
-  string path;
+  std::string method;
+  std::string path;
   param_vec_t params;
   param_vec_t headers;
-  map<string, string> *attrs;
+  std::map<std::string, std::string> *attrs;
   T *result;
   E *err_result;
   bufferlist input_bl;
@@ -161,13 +164,13 @@ class RGWSendRawRESTResourceCR: public RGWSimpleCoroutine {
  public:
  RGWSendRawRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                           RGWHTTPManager *_http_manager,
-                          const string& _method, const string& _path,
+                          const std::string& _method, const std::string& _path,
                           rgw_http_param_pair *_params,
-                          map<string, string> *_attrs,
+                          std::map<std::string, std::string> *_attrs,
                           bufferlist& _input, T *_result,
                           bool _send_content_length,
                           E *_err_result = nullptr)
-   : RGWSimpleCoroutine(_cct), conn(_conn), http_manager(_http_manager),
+   : RGWSimpleCoroutine(_cct, NUM_ENPOINT_IOERROR_RETRIES), conn(_conn), http_manager(_http_manager),
      method(_method), path(_path), params(make_param_list(_params)),
      headers(make_param_list(_attrs)), attrs(_attrs),
      result(_result), err_result(_err_result),
@@ -175,10 +178,10 @@ class RGWSendRawRESTResourceCR: public RGWSimpleCoroutine {
 
   RGWSendRawRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                           RGWHTTPManager *_http_manager,
-                          const string& _method, const string& _path,
-                          rgw_http_param_pair *_params, map<string, string> *_attrs,
+                          const std::string& _method, const std::string& _path,
+                          rgw_http_param_pair *_params, std::map<std::string, std::string> *_attrs,
                           T *_result, E *_err_result = nullptr)
-   : RGWSimpleCoroutine(_cct), conn(_conn), http_manager(_http_manager),
+   : RGWSimpleCoroutine(_cct, NUM_ENPOINT_IOERROR_RETRIES), conn(_conn), http_manager(_http_manager),
     method(_method), path(_path), params(make_param_list(_params)), headers(make_param_list(_attrs)), attrs(_attrs), result(_result),
     err_result(_err_result) {}
 
@@ -186,15 +189,15 @@ class RGWSendRawRESTResourceCR: public RGWSimpleCoroutine {
     request_cleanup();
   }
 
-  int send_request() override {
+  int send_request(const DoutPrefixProvider *dpp) override {
     auto op = boost::intrusive_ptr<RGWRESTSendResource>(
         new RGWRESTSendResource(conn, method, path, params, &headers, http_manager));
 
     init_new_io(op.get());
 
-    int ret = op->aio_send(input_bl);
+    int ret = op->aio_send(dpp, input_bl);
     if (ret < 0) {
-      lsubdout(cct, rgw, 0) << "ERROR: failed to send request" << dendl;
+      ldpp_subdout(dpp, rgw, 0) << "ERROR: failed to send request" << dendl;
       op->put();
       return ret;
     }
@@ -203,12 +206,13 @@ class RGWSendRawRESTResourceCR: public RGWSimpleCoroutine {
   }
 
   int request_complete() override {
+    auto dpp = NoDoutPrefix{cct, ceph_subsys_rgw};
     int ret;
     if (result || err_result) {
-      ret = http_op->wait(result, null_yield, err_result);
+      ret = http_op->wait(&dpp, result, null_yield, err_result);
     } else {
       bufferlist bl;
-      ret = http_op->wait(&bl, null_yield);
+      ret = http_op->wait(&dpp, &bl, null_yield);
     }
     auto op = std::move(http_op); // release ref on return
     if (ret < 0) {
@@ -236,8 +240,8 @@ class RGWSendRESTResourceCR : public RGWSendRawRESTResourceCR<T, E> {
  public:
   RGWSendRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                            RGWHTTPManager *_http_manager,
-                           const string& _method, const string& _path,
-                        rgw_http_param_pair *_params, map<string, string> *_attrs,
+                           const std::string& _method, const std::string& _path,
+                        rgw_http_param_pair *_params, std::map<std::string, std::string> *_attrs,
                         S& _input, T *_result, E *_err_result = nullptr)
     : RGWSendRawRESTResourceCR<T, E>(_cct, _conn, _http_manager, _method, _path, _params, _attrs, _result, _err_result) {
 
@@ -256,7 +260,7 @@ class RGWPostRESTResourceCR : public RGWSendRESTResourceCR<S, T, E> {
 public:
   RGWPostRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                         RGWHTTPManager *_http_manager,
-                        const string& _path,
+                        const std::string& _path,
                         rgw_http_param_pair *_params, S& _input,
                         T *_result, E *_err_result = nullptr)
     : RGWSendRESTResourceCR<S, T, E>(_cct, _conn, _http_manager,
@@ -270,7 +274,7 @@ class RGWPutRawRESTResourceCR: public RGWSendRawRESTResourceCR <T, E> {
  public:
   RGWPutRawRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                           RGWHTTPManager *_http_manager,
-                          const string& _path,
+                          const std::string& _path,
                           rgw_http_param_pair *_params, bufferlist& _input,
                           T *_result, E *_err_result = nullptr)
     : RGWSendRawRESTResourceCR<T, E>(_cct, _conn, _http_manager, "PUT", _path,
@@ -283,9 +287,9 @@ class RGWPostRawRESTResourceCR: public RGWSendRawRESTResourceCR <T, E> {
  public:
   RGWPostRawRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                           RGWHTTPManager *_http_manager,
-                          const string& _path,
+                          const std::string& _path,
                           rgw_http_param_pair *_params,
-                          map<string, string> * _attrs,
+                          std::map<std::string, std::string> * _attrs,
                           bufferlist& _input,
                           T *_result, E *_err_result = nullptr)
     : RGWSendRawRESTResourceCR<T, E>(_cct, _conn, _http_manager, "POST", _path,
@@ -299,7 +303,7 @@ class RGWPutRESTResourceCR : public RGWSendRESTResourceCR<S, T, E> {
 public:
   RGWPutRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                         RGWHTTPManager *_http_manager,
-                        const string& _path,
+                        const std::string& _path,
                         rgw_http_param_pair *_params, S& _input,
                         T *_result, E *_err_result = nullptr)
     : RGWSendRESTResourceCR<S, T, E>(_cct, _conn, _http_manager,
@@ -309,9 +313,9 @@ public:
 
   RGWPutRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                        RGWHTTPManager *_http_manager,
-                       const string& _path,
+                       const std::string& _path,
                        rgw_http_param_pair *_params,
-                       map <string, string> *_attrs,
+                       std::map<std::string, std::string> *_attrs,
                        S& _input, T *_result, E *_err_result = nullptr)
     : RGWSendRESTResourceCR<S, T, E>(_cct, _conn, _http_manager,
                                   "PUT", _path,
@@ -321,9 +325,11 @@ public:
 };
 
 class RGWDeleteRESTResourceCR : public RGWSimpleCoroutine {
+  static constexpr int NUM_ENPOINT_IOERROR_RETRIES = 20;
+
   RGWRESTConn *conn;
   RGWHTTPManager *http_manager;
-  string path;
+  std::string path;
   param_vec_t params;
 
   boost::intrusive_ptr<RGWRESTDeleteResource> http_op;
@@ -331,9 +337,9 @@ class RGWDeleteRESTResourceCR : public RGWSimpleCoroutine {
 public:
   RGWDeleteRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                         RGWHTTPManager *_http_manager,
-                        const string& _path,
+                        const std::string& _path,
                         rgw_http_param_pair *_params)
-    : RGWSimpleCoroutine(_cct), conn(_conn), http_manager(_http_manager),
+    : RGWSimpleCoroutine(_cct, NUM_ENPOINT_IOERROR_RETRIES), conn(_conn), http_manager(_http_manager),
       path(_path), params(make_param_list(_params))
   {}
 
@@ -341,7 +347,7 @@ public:
     request_cleanup();
   }
 
-  int send_request() override {
+  int send_request(const DoutPrefixProvider *dpp) override {
     auto op = boost::intrusive_ptr<RGWRESTDeleteResource>(
         new RGWRESTDeleteResource(conn, path, params, nullptr, http_manager));
 
@@ -349,9 +355,9 @@ public:
 
     bufferlist bl;
 
-    int ret = op->aio_send(bl);
+    int ret = op->aio_send(dpp, bl);
     if (ret < 0) {
-      lsubdout(cct, rgw, 0) << "ERROR: failed to send DELETE request" << dendl;
+      ldpp_subdout(dpp, rgw, 0) << "ERROR: failed to send DELETE request" << dendl;
       op->put();
       return ret;
     }
@@ -360,9 +366,9 @@ public:
   }
 
   int request_complete() override {
-    int ret;
+    auto dpp = NoDoutPrefix{cct, ceph_subsys_rgw};
     bufferlist bl;
-    ret = http_op->wait(&bl, null_yield);
+    int ret = http_op->wait(&dpp, &bl, null_yield);
     auto op = std::move(http_op); // release ref on return
     if (ret < 0) {
       error_stream << "http operation failed: " << op->to_str()
@@ -421,11 +427,11 @@ protected:
   boost::asio::coroutine read_state;
 
 public:
-  virtual int init() = 0;
-  virtual int read(bufferlist *data, uint64_t max, bool *need_retry) = 0; /* reentrant */
-  virtual int decode_rest_obj(map<string, string>& headers, bufferlist& extra_data) = 0;
+  virtual int init(const DoutPrefixProvider *dpp) = 0;
+  virtual int read(const DoutPrefixProvider *dpp, bufferlist *data, uint64_t max, bool *need_retry) = 0; /* reentrant */
+  virtual int decode_rest_obj(const DoutPrefixProvider *dpp, std::map<std::string, std::string>& headers, bufferlist& extra_data) = 0;
   virtual bool has_attrs() = 0;
-  virtual void get_attrs(std::map<string, string> *attrs) = 0;
+  virtual void get_attrs(std::map<std::string, std::string> *attrs) = 0;
   virtual ~RGWStreamReadResourceCRF() = default;
 };
 
@@ -436,11 +442,11 @@ protected:
 
 public:
   virtual int init() = 0;
-  virtual void send_ready(const rgw_rest_obj& rest_obj) = 0;
+  virtual void send_ready(const DoutPrefixProvider *dpp, const rgw_rest_obj& rest_obj) = 0;
   virtual int send() = 0;
   virtual int write(bufferlist& data, bool *need_retry) = 0; /* reentrant */
   virtual int drain_writes(bool *need_retry) = 0; /* reentrant */
-  
+
   virtual ~RGWStreamWriteResourceCRF() = default;
 };
 
@@ -471,7 +477,7 @@ protected:
   } range;
 
   ceph::real_time mtime;
-  string etag;
+  std::string etag;
 
 public:
   RGWStreamReadHTTPResourceCRF(CephContext *_cct,
@@ -486,11 +492,11 @@ public:
   }
   ~RGWStreamReadHTTPResourceCRF();
 
-  int init() override;
-  int read(bufferlist *data, uint64_t max, bool *need_retry) override; /* reentrant */
-  int decode_rest_obj(map<string, string>& headers, bufferlist& extra_data) override;
+  int init(const DoutPrefixProvider *dpp) override;
+  int read(const DoutPrefixProvider *dpp, bufferlist *data, uint64_t max, bool *need_retry) override; /* reentrant */
+  int decode_rest_obj(const DoutPrefixProvider *dpp, std::map<std::string, std::string>& headers, bufferlist& extra_data) override;
   bool has_attrs() override;
-  void get_attrs(std::map<string, string> *attrs) override;
+  void get_attrs(std::map<std::string, std::string> *attrs) override;
   bool is_done();
   virtual bool need_extra_data() { return false; }
 
@@ -511,6 +517,7 @@ public:
 
 class RGWStreamWriteHTTPResourceCRF : public RGWStreamWriteResourceCRF {
 protected:
+  CephContext *cct;
   RGWCoroutinesEnv *env;
   RGWCoroutine *caller;
   RGWHTTPManager *http_manager;
@@ -524,7 +531,7 @@ protected:
 
   struct multipart_info {
     bool is_multipart{false};
-    string upload_id;
+    std::string upload_id;
     int part_num{0};
     uint64_t part_size;
   } multipart;
@@ -540,28 +547,31 @@ public:
   RGWStreamWriteHTTPResourceCRF(CephContext *_cct,
                                RGWCoroutinesEnv *_env,
                                RGWCoroutine *_caller,
-                               RGWHTTPManager *_http_manager) : env(_env),
-                                                               caller(_caller),
-                                                               http_manager(_http_manager),
-                                                               write_drain_notify_cb(this) {}
+                               RGWHTTPManager *_http_manager)
+    : cct(_cct),
+      env(_env),
+      caller(_caller),
+      http_manager(_http_manager),
+      write_drain_notify_cb(this)
+  {}
   virtual ~RGWStreamWriteHTTPResourceCRF();
 
   int init() override {
     return 0;
   }
-  void send_ready(const rgw_rest_obj& rest_obj) override;
+  void send_ready(const DoutPrefixProvider *dpp, const rgw_rest_obj& rest_obj) override;
   int send() override;
   int write(bufferlist& data, bool *need_retry) override; /* reentrant */
   void write_drain_notify(uint64_t pending_size);
   int drain_writes(bool *need_retry) override; /* reentrant */
 
-  virtual void handle_headers(const std::map<string, string>& headers) {}
+  virtual void handle_headers(const std::map<std::string, std::string>& headers) {}
 
   void set_req(RGWHTTPStreamRWRequest *r) {
     req = r;
   }
 
-  void set_multipart(const string& upload_id, int part_num, uint64_t part_size) {
+  void set_multipart(const std::string& upload_id, int part_num, uint64_t part_size) {
     multipart.is_multipart = true;
     multipart.upload_id = upload_id;
     multipart.part_num = part_num;
@@ -572,7 +582,7 @@ public:
 class RGWStreamSpliceCR : public RGWCoroutine {
   CephContext *cct;
   RGWHTTPManager *http_manager;
-  string url;
+  std::string url;
   std::shared_ptr<RGWStreamReadHTTPResourceCRF> in_crf;
   std::shared_ptr<RGWStreamWriteHTTPResourceCRF> out_crf;
   bufferlist bl;
@@ -586,5 +596,5 @@ public:
                     std::shared_ptr<RGWStreamWriteHTTPResourceCRF>& _out_crf);
   ~RGWStreamSpliceCR();
 
-  int operate() override;
+  int operate(const DoutPrefixProvider *dpp) override;
 };

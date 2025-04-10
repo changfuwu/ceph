@@ -8,6 +8,7 @@
 #include "objclass/objclass.h"
 #include "cls/journal/cls_journal_types.h"
 #include <errno.h>
+#include <iomanip>
 #include <map>
 #include <string>
 #include <sstream>
@@ -271,11 +272,12 @@ int find_min_commit_position(cls_method_context_t hctx,
     }
 
     start_after = batch.rbegin()->id;
-
     // update the (minimum) commit position from this batch of clients
-    for(std::set<cls::journal::Client>::iterator it = batch.begin();
-        it != batch.end(); ++it) {
-      cls::journal::ObjectSetPosition object_set_position = (*it).commit_position;
+    for (const auto &client : batch) {
+      if (client.state == cls::journal::CLIENT_STATE_DISCONNECTED) {
+        continue;
+      }
+      const auto &object_set_position = client.commit_position;
       if (object_set_position.object_positions.empty()) {
 	*minset = cls::journal::ObjectSetPosition();
 	break;
@@ -1181,6 +1183,11 @@ int journal_object_append(cls_method_context_t hctx, bufferlist *in,
   auto min_alloc_size = cls_get_osd_min_alloc_size(hctx);
   if (min_alloc_size == 0) {
     min_alloc_size = 8;
+  }
+
+  auto stripe_width = cls_get_pool_stripe_width(hctx);
+  if (stripe_width > 0) {
+    min_alloc_size = round_up_to(min_alloc_size, stripe_width);
   }
 
   CLS_LOG(20, "pad to %" PRIu64, min_alloc_size);

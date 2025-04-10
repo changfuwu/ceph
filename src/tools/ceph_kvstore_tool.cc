@@ -20,15 +20,18 @@
 #include "common/errno.h"
 #include "common/strtol.h"
 #include "common/url_escape.h"
+#include "include/types.h" // for struct byte_u_t
 
 #include "global/global_context.h"
 #include "global/global_init.h"
 
 #include "kvstore_tool.h"
 
+using namespace std;
+
 void usage(const char *pname)
 {
-  std::cout << "Usage: " << pname << " <leveldb|rocksdb|bluestore-kv> <store path> command [args...]\n"
+  std::cout << "Usage: " << pname << " <rocksdb|bluestore-kv> <store path> command [args...]\n"
     << "\n"
     << "Commands:\n"
     << "  list [prefix]\n"
@@ -41,20 +44,20 @@ void usage(const char *pname)
     << "  set <prefix> <key> [ver <N>|in <file>]\n"
     << "  rm <prefix> <key>\n"
     << "  rm-prefix <prefix>\n"
-    << "  store-copy <path> [num-keys-per-tx] [leveldb|rocksdb|...] \n"
+    << "  store-copy <path> [num-keys-per-tx] [rocksdb|...] \n"
     << "  store-crc <path>\n"
     << "  compact\n"
     << "  compact-prefix <prefix>\n"
     << "  compact-range <prefix> <start> <end>\n"
     << "  destructive-repair  (use only as last resort! may corrupt healthy data)\n"
     << "  stats\n"
+    << "  histogram [prefix]\n"
     << std::endl;
 }
 
 int main(int argc, const char *argv[])
 {
-  vector<const char*> args;
-  argv_to_vec(argc, argv, args);
+  auto args = argv_to_vec(argc, argv);
   if (args.empty()) {
     cerr << argv[0] << ": -h or --help for usage" << std::endl;
     exit(1);
@@ -88,8 +91,7 @@ int main(int argc, const char *argv[])
   string path(args[1]);
   string cmd(args[2]);
 
-  if (type != "leveldb" &&
-      type != "rocksdb" &&
+  if (type != "rocksdb" &&
       type != "bluestore-kv")  {
 
     std::cerr << "Unrecognized type: " << args[0] << std::endl;
@@ -97,9 +99,20 @@ int main(int argc, const char *argv[])
     return 1;
   }
 
-  bool need_open_db = (cmd != "destructive-repair");
+  bool read_only =
+    cmd == "list" ||
+    cmd == "list-crc" ||
+    cmd == "dump" ||
+    cmd == "exists" ||
+    cmd == "get" ||
+    cmd == "crc" ||
+    cmd == "get-size" ||
+    cmd == "store-crc" ||
+    cmd == "stats" ||
+    cmd == "histogram";
+  bool to_repair = (cmd == "destructive-repair");
   bool need_stats = (cmd == "stats");
-  StoreTool st(type, path, need_open_db, need_stats);
+  StoreTool st(type, path, read_only, to_repair, need_stats);
 
   if (cmd == "destructive-repair") {
     int ret = st.destructive_repair();
@@ -347,6 +360,11 @@ int main(int argc, const char *argv[])
     st.compact_range(prefix, start, end);
   } else if (cmd == "stats") {
     st.print_stats();
+  } else if (cmd == "histogram") {
+    string prefix;
+    if (argc > 4)
+      prefix = url_unescape(argv[4]);
+    st.build_size_histogram(prefix);
   } else {
     std::cerr << "Unrecognized command: " << cmd << std::endl;
     return 1;

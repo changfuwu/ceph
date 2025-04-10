@@ -13,18 +13,22 @@
  */
 
 #include "MDSMap.h"
+#include "MDSContext.h"
 #include "MDSRank.h"
 #include "msg/Messenger.h"
 #include "messages/MMDSTableRequest.h"
 #include "SnapClient.h"
 
 #include "common/config.h"
+#include "common/debug.h"
 #include "include/ceph_assert.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << mds->get_nodeid() << ".snapclient "
+
+using namespace std;
 
 void SnapClient::resend_queries()
 {

@@ -3,19 +3,15 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { ReactiveFormsModule } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { BsModalRef, BsModalService } from 'ngx-bootstrap/modal';
 import { ToastrModule } from 'ngx-toastr';
 import { of } from 'rxjs';
 
-import {
-  configureTestBed,
-  FormHelper,
-  i18nProviders
-} from '../../../../../testing/unit-test-helper';
-import { RbdMirroringService } from '../../../../shared/api/rbd-mirroring.service';
-import { NotificationService } from '../../../../shared/services/notification.service';
-import { SharedModule } from '../../../../shared/shared.module';
+import { RbdMirroringService } from '~/app/shared/api/rbd-mirroring.service';
+import { NotificationService } from '~/app/shared/services/notification.service';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed, FormHelper } from '~/testing/unit-test-helper';
 import { BootstrapImportModalComponent } from './bootstrap-import-modal.component';
+import { CheckboxModule, InputModule, ModalModule, SelectModule } from 'carbon-components-angular';
 
 describe('BootstrapImportModalComponent', () => {
   let component: BootstrapImportModalComponent;
@@ -31,9 +27,12 @@ describe('BootstrapImportModalComponent', () => {
       ReactiveFormsModule,
       RouterTestingModule,
       SharedModule,
-      ToastrModule.forRoot()
-    ],
-    providers: [BsModalRef, BsModalService, i18nProviders]
+      ToastrModule.forRoot(),
+      ModalModule,
+      SelectModule,
+      InputModule,
+      CheckboxModule
+    ]
   });
 
   beforeEach(() => {
@@ -41,10 +40,10 @@ describe('BootstrapImportModalComponent', () => {
     component = fixture.componentInstance;
     component.siteName = 'site-A';
 
-    notificationService = TestBed.get(NotificationService);
+    notificationService = TestBed.inject(NotificationService);
     spyOn(notificationService, 'show').and.stub();
 
-    rbdMirroringService = TestBed.get(RbdMirroringService);
+    rbdMirroringService = TestBed.inject(RbdMirroringService);
 
     formHelper = new FormHelper(component.importBootstrapForm);
 
@@ -69,7 +68,7 @@ describe('BootstrapImportModalComponent', () => {
   describe('import token', () => {
     beforeEach(() => {
       spyOn(rbdMirroringService, 'refresh').and.stub();
-      spyOn(component.modalRef, 'hide').and.callThrough();
+      spyOn(component, 'closeModal').and.callThrough();
       fixture.detectChanges();
     });
 

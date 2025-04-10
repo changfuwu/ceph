@@ -1,24 +1,20 @@
-import { Component, OnInit } from '@angular/core';
-import { AbstractControl, FormControl, Validators } from '@angular/forms';
+import { Component, Inject, OnInit, Optional } from '@angular/core';
+import { AbstractControl, UntypedFormControl, Validators } from '@angular/forms';
 
-import { BsModalRef } from 'ngx-bootstrap/modal';
-
-import { RbdMirroringService } from '../../../../shared/api/rbd-mirroring.service';
-import { CdFormGroup } from '../../../../shared/forms/cd-form-group';
-import { FinishedTask } from '../../../../shared/models/finished-task';
-import { TaskWrapperService } from '../../../../shared/services/task-wrapper.service';
+import { RbdMirroringService } from '~/app/shared/api/rbd-mirroring.service';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { FinishedTask } from '~/app/shared/models/finished-task';
+import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 import { PoolEditPeerResponseModel } from './pool-edit-peer-response.model';
+import { BaseModal } from 'carbon-components-angular';
 
 @Component({
   selector: 'cd-pool-edit-peer-modal',
   templateUrl: './pool-edit-peer-modal.component.html',
   styleUrls: ['./pool-edit-peer-modal.component.scss']
 })
-export class PoolEditPeerModalComponent implements OnInit {
-  mode: string;
-  poolName: string;
-  peerUUID: string;
-
+export class PoolEditPeerModalComponent extends BaseModal implements OnInit {
   editPeerForm: CdFormGroup;
   bsConfig = {
     containerClass: 'theme-default'
@@ -28,25 +24,30 @@ export class PoolEditPeerModalComponent implements OnInit {
   response: PoolEditPeerResponseModel;
 
   constructor(
-    public modalRef: BsModalRef,
+    public actionLabels: ActionLabelsI18n,
     private rbdMirroringService: RbdMirroringService,
-    private taskWrapper: TaskWrapperService
+    private taskWrapper: TaskWrapperService,
+
+    @Inject('poolName') public poolName: string,
+    @Optional() @Inject('peerUUID') public peerUUID = '',
+    @Optional() @Inject('mode') public mode = ''
   ) {
+    super();
     this.createForm();
   }
 
   createForm() {
     this.editPeerForm = new CdFormGroup({
-      clusterName: new FormControl('', {
+      clusterName: new UntypedFormControl('', {
         validators: [Validators.required, this.validateClusterName]
       }),
-      clientID: new FormControl('', {
+      clientID: new UntypedFormControl('', {
         validators: [Validators.required, this.validateClientID]
       }),
-      monAddr: new FormControl('', {
+      monAddr: new UntypedFormControl('', {
         validators: [this.validateMonAddr]
       }),
-      key: new FormControl('', {
+      key: new UntypedFormControl('', {
         validators: [this.validateKey]
       })
     });
@@ -128,13 +129,12 @@ export class PoolEditPeerModalComponent implements OnInit {
       });
     }
 
-    action.subscribe(
-      undefined,
-      () => this.editPeerForm.setErrors({ cdSubmitButton: true }),
-      () => {
+    action.subscribe({
+      error: () => this.editPeerForm.setErrors({ cdSubmitButton: true }),
+      complete: () => {
         this.rbdMirroringService.refresh();
-        this.modalRef.hide();
+        this.closeModal();
       }
-    );
+    });
   }
 }

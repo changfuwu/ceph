@@ -12,6 +12,8 @@
 #include "librbd/mirror/snapshot/UnlinkPeerRequest.h"
 #include "librbd/mirror/snapshot/Utils.h"
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 
 #undef dout_prefix
@@ -27,10 +29,13 @@ using librbd::util::create_rados_callback;
 
 template <typename I>
 CreatePrimaryRequest<I>::CreatePrimaryRequest(
-    I *image_ctx, const std::string& global_image_id, uint32_t flags,
+    I *image_ctx, const std::string& global_image_id,
+    uint64_t clean_since_snap_id, uint64_t snap_create_flags, uint32_t flags,
     uint64_t *snap_id, Context *on_finish)
   : m_image_ctx(image_ctx), m_global_image_id(global_image_id),
-    m_flags(flags), m_snap_id(snap_id), m_on_finish(on_finish) {
+    m_clean_since_snap_id(clean_since_snap_id),
+    m_snap_create_flags(snap_create_flags), m_flags(flags), m_snap_id(snap_id),
+    m_on_finish(on_finish) {
   m_default_ns_ctx.dup(m_image_ctx->md_ctx);
   m_default_ns_ctx.set_namespace("");
 }
@@ -56,7 +61,7 @@ void CreatePrimaryRequest<I>::send() {
 template <typename I>
 void CreatePrimaryRequest<I>::get_mirror_peers() {
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << dendl;
+  ldout(cct, 15) << dendl;
 
   librados::ObjectReadOperation op;
   cls_client::mirror_peer_list_start(&op);
@@ -73,7 +78,7 @@ void CreatePrimaryRequest<I>::get_mirror_peers() {
 template <typename I>
 void CreatePrimaryRequest<I>::handle_get_mirror_peers(int r) {
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << "r=" << r << dendl;
+  ldout(cct, 15) << "r=" << r << dendl;
 
   std::vector<cls::rbd::MirrorPeer> peers;
   if (r == 0) {
@@ -111,21 +116,22 @@ void CreatePrimaryRequest<I>::create_snapshot() {
     ((m_flags & CREATE_PRIMARY_FLAG_DEMOTED) != 0 ?
       cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY_DEMOTED :
       cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY),
-    m_mirror_peer_uuids, "", CEPH_NOSNAP};
+    m_mirror_peer_uuids, "", m_clean_since_snap_id};
 
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << "name=" << m_snap_name << ", "
+  ldout(cct, 15) << "name=" << m_snap_name << ", "
                  << "ns=" << ns << dendl;
   auto ctx = create_context_callback<
     CreatePrimaryRequest<I>,
     &CreatePrimaryRequest<I>::handle_create_snapshot>(this);
-  m_image_ctx->operations->snap_create(ns, m_snap_name, ctx);
+  m_image_ctx->operations->snap_create(ns, m_snap_name, m_snap_create_flags,
+                                       m_prog_ctx, ctx);
 }
 
 template <typename I>
 void CreatePrimaryRequest<I>::handle_create_snapshot(int r) {
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << "r=" << r << dendl;
+  ldout(cct, 15) << "r=" << r << dendl;
 
   if (r < 0) {
     lderr(cct) << "failed to create mirror snapshot: " << cpp_strerror(r)
@@ -139,15 +145,10 @@ void CreatePrimaryRequest<I>::handle_create_snapshot(int r) {
 
 template <typename I>
 void CreatePrimaryRequest<I>::refresh_image() {
-  // if snapshot created via remote RPC, refresh is required to retrieve
-  // the snapshot id
-  if (m_snap_id == nullptr) {
-    unlink_peer();
-    return;
-  }
-
+  // refresh is required to retrieve the snapshot id (if snapshot
+  // created via remote RPC) and complete flag (regardless)
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << dendl;
+  ldout(cct, 15) << dendl;
 
   auto ctx = create_context_callback<
     CreatePrimaryRequest<I>,
@@ -158,7 +159,7 @@ void CreatePrimaryRequest<I>::refresh_image() {
 template <typename I>
 void CreatePrimaryRequest<I>::handle_refresh_image(int r) {
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << "r=" << r << dendl;
+  ldout(cct, 15) << "r=" << r << dendl;
 
   if (r < 0) {
     lderr(cct) << "failed to refresh image: " << cpp_strerror(r) << dendl;
@@ -166,11 +167,11 @@ void CreatePrimaryRequest<I>::handle_refresh_image(int r) {
     return;
   }
 
-  {
+  if (m_snap_id != nullptr) {
     std::shared_lock image_locker{m_image_ctx->image_lock};
     *m_snap_id = m_image_ctx->get_snap_id(
       cls::rbd::MirrorSnapshotNamespace{}, m_snap_name);
-    ldout(cct, 20) << "snap_id=" << *m_snap_id << dendl;
+    ldout(cct, 15) << "snap_id=" << *m_snap_id << dendl;
   }
 
   unlink_peer();
@@ -178,6 +179,7 @@ void CreatePrimaryRequest<I>::handle_refresh_image(int r) {
 
 template <typename I>
 void CreatePrimaryRequest<I>::unlink_peer() {
+  // TODO: Document semantics for unlink_peer
   uint64_t max_snapshots = m_image_ctx->config.template get_val<uint64_t>(
     "rbd_mirroring_max_mirroring_snapshots");
   ceph_assert(max_snapshots >= 3);
@@ -185,55 +187,76 @@ void CreatePrimaryRequest<I>::unlink_peer() {
   std::string peer_uuid;
   uint64_t snap_id = CEPH_NOSNAP;
 
-  for (auto &peer : m_mirror_peer_uuids) {
+  {
     std::shared_lock image_locker{m_image_ctx->image_lock};
-    size_t count = 0;
-    uint64_t prev_snap_id = 0;
-    for (auto &snap_it : m_image_ctx->snap_info) {
-      auto info = boost::get<cls::rbd::MirrorSnapshotNamespace>(
-        &snap_it.second.snap_namespace);
-      if (info == nullptr) {
-        continue;
-      }
-      if (info->state != cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY) {
-        // reset counters -- we count primary snapshots after the last promotion
-        count = 0;
-        prev_snap_id = 0;
-        continue;
-      }
-      count++;
-      if (count == max_snapshots - 1) {
-        prev_snap_id = snap_it.first;
-      } else if (count > max_snapshots) {
-        peer_uuid = peer;
-        snap_id = prev_snap_id;
-        break;
+    for (const auto& peer : m_mirror_peer_uuids) {
+      for (const auto& snap_info_pair : m_image_ctx->snap_info) {
+        auto info = std::get_if<cls::rbd::MirrorSnapshotNamespace>(
+          &snap_info_pair.second.snap_namespace);
+        if (info == nullptr) {
+          continue;
+        }
+        if (info->mirror_peer_uuids.empty() ||
+            (info->mirror_peer_uuids.count(peer) != 0 &&
+             info->is_primary() && !info->complete)) {
+          peer_uuid = peer;
+          snap_id = snap_info_pair.first;
+          goto do_unlink;
+        }
       }
     }
-    if (snap_id != CEPH_NOSNAP) {
-      break;
+    for (const auto& peer : m_mirror_peer_uuids) {
+      size_t count = 0;
+      uint64_t unlink_snap_id = 0;
+      for (const auto& snap_info_pair : m_image_ctx->snap_info) {
+        auto info = std::get_if<cls::rbd::MirrorSnapshotNamespace>(
+          &snap_info_pair.second.snap_namespace);
+        if (info == nullptr) {
+          continue;
+        }
+        if (info->state != cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY) {
+          // reset counters -- we count primary snapshots after the last
+          // promotion
+          count = 0;
+          unlink_snap_id = 0;
+          continue;
+        }
+        if (info->mirror_peer_uuids.count(peer) == 0) {
+          // snapshot is not linked with this peer
+          continue;
+        }
+        count++;
+        if (count == max_snapshots) {
+          unlink_snap_id = snap_info_pair.first;
+        }
+        if (count > max_snapshots) {
+          peer_uuid = peer;
+          snap_id = unlink_snap_id;
+          goto do_unlink;
+        }
+      }
     }
   }
 
-  if (snap_id == CEPH_NOSNAP) {
-    finish(0);
-    return;
-  }
+  finish(0);
+  return;
 
+do_unlink:
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << "peer=" << peer_uuid << ", snap_id=" << snap_id << dendl;
+  ldout(cct, 15) << "peer=" << peer_uuid << ", snap_id=" << snap_id << dendl;
 
   auto ctx = create_context_callback<
     CreatePrimaryRequest<I>,
     &CreatePrimaryRequest<I>::handle_unlink_peer>(this);
-  auto req = UnlinkPeerRequest<I>::create(m_image_ctx, snap_id, peer_uuid, ctx);
+  auto req = UnlinkPeerRequest<I>::create(m_image_ctx, snap_id, peer_uuid, true,
+                                          ctx);
   req->send();
 }
 
 template <typename I>
 void CreatePrimaryRequest<I>::handle_unlink_peer(int r) {
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << "r=" << r << dendl;
+  ldout(cct, 15) << "r=" << r << dendl;
 
   if (r < 0) {
     lderr(cct) << "failed to unlink peer: " << cpp_strerror(r) << dendl;
@@ -247,7 +270,7 @@ void CreatePrimaryRequest<I>::handle_unlink_peer(int r) {
 template <typename I>
 void CreatePrimaryRequest<I>::finish(int r) {
   CephContext *cct = m_image_ctx->cct;
-  ldout(cct, 20) << "r=" << r << dendl;
+  ldout(cct, 15) << "r=" << r << dendl;
 
   m_on_finish->complete(r);
   delete this;

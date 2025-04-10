@@ -3,20 +3,15 @@ import { FormsModule } from '@angular/forms';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { NgxDatatableModule } from '@swimlane/ngx-datatable';
-import { ChartsModule } from 'ng2-charts';
-import { AlertModule } from 'ngx-bootstrap/alert';
-import { BsDropdownModule } from 'ngx-bootstrap/dropdown';
-import { PopoverModule } from 'ngx-bootstrap/popover';
+import { NgbDropdownModule, NgbTooltipModule } from '@ng-bootstrap/ng-bootstrap';
+import { BaseChartDirective } from 'ng2-charts';
 
-import { configureTestBed, i18nProviders } from '../../../../testing/unit-test-helper';
-import { TableComponent } from '../../../shared/datatable/table/table.component';
-
-import { ComponentsModule } from '../../../shared/components/components.module';
-import { RbdConfigurationEntry } from '../../../shared/models/configuration';
-import { PipesModule } from '../../../shared/pipes/pipes.module';
-import { FormatterService } from '../../../shared/services/formatter.service';
-import { RbdConfigurationService } from '../../../shared/services/rbd-configuration.service';
+import { ComponentsModule } from '~/app/shared/components/components.module';
+import { RbdConfigurationEntry } from '~/app/shared/models/configuration';
+import { FormatterService } from '~/app/shared/services/formatter.service';
+import { RbdConfigurationService } from '~/app/shared/services/rbd-configuration.service';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { RbdConfigurationListComponent } from './rbd-configuration-list.component';
 
 describe('RbdConfigurationListComponent', () => {
@@ -27,17 +22,15 @@ describe('RbdConfigurationListComponent', () => {
     imports: [
       BrowserAnimationsModule,
       FormsModule,
-      NgxDatatableModule,
       RouterTestingModule,
       ComponentsModule,
-      AlertModule,
-      BsDropdownModule.forRoot(),
-      ChartsModule,
-      PipesModule,
-      PopoverModule
+      NgbDropdownModule,
+      BaseChartDirective,
+      SharedModule,
+      NgbTooltipModule
     ],
-    declarations: [RbdConfigurationListComponent, TableComponent],
-    providers: [FormatterService, RbdConfigurationService, i18nProviders]
+    declarations: [RbdConfigurationListComponent],
+    providers: [FormatterService, RbdConfigurationService]
   });
 
   beforeEach(() => {

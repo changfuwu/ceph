@@ -17,9 +17,8 @@
 
 #pragma once
 
-#include "rgw/rgw_service.h"
+#include "rgw_service.h"
 
-#include "svc_meta_be.h"
 #include "svc_bucket_sync.h"
 
 class RGWSI_Zone;
@@ -39,18 +38,18 @@ class RGWSI_Bucket_Sync_SObj : public RGWSI_Bucket_Sync
     std::shared_ptr<RGWBucketSyncPolicyHandler> handler;
   };
 
-  unique_ptr<RGWChainedCacheImpl<bucket_sync_policy_cache_entry> > sync_policy_cache;
+  std::unique_ptr<RGWChainedCacheImpl<bucket_sync_policy_cache_entry> > sync_policy_cache;
 
   std::unique_ptr<RGWSI_Bucket_Sync_SObj_HintIndexManager> hint_index_mgr;
 
-  int do_start() override;
+  int do_start(optional_yield, const DoutPrefixProvider *dpp) override;
 
   struct optional_zone_bucket {
-    optional<rgw_zone_id> zone;
-    optional<rgw_bucket> bucket;
+    std::optional<rgw_zone_id> zone;
+    std::optional<rgw_bucket> bucket;
 
-    optional_zone_bucket(const optional<rgw_zone_id>& _zone,
-                         const optional<rgw_bucket>& _bucket) : zone(_zone), bucket(_bucket) {}
+    optional_zone_bucket(const std::optional<rgw_zone_id>& _zone,
+                         const std::optional<rgw_bucket>& _bucket) : zone(_zone), bucket(_bucket) {}
 
     bool operator<(const optional_zone_bucket& ozb) const {
       if (zone < ozb.zone) {
@@ -63,23 +62,22 @@ class RGWSI_Bucket_Sync_SObj : public RGWSI_Bucket_Sync
     }
   };
 
-  void get_hint_entities(RGWSI_Bucket_X_Ctx& ctx,
-                         const std::set<rgw_zone_id>& zone_names,
+  void get_hint_entities(const std::set<rgw_zone_id>& zone_names,
                          const std::set<rgw_bucket>& buckets,
                          std::set<rgw_sync_bucket_entity> *hint_entities,
-                         optional_yield y);
-  int resolve_policy_hints(RGWSI_Bucket_X_Ctx& ctx,
-                           rgw_sync_bucket_entity& self_entity,
+                         optional_yield y, const DoutPrefixProvider *);
+  int resolve_policy_hints(rgw_sync_bucket_entity& self_entity,
                            RGWBucketSyncPolicyHandlerRef& handler,
                            RGWBucketSyncPolicyHandlerRef& zone_policy_handler,
                            std::map<optional_zone_bucket, RGWBucketSyncPolicyHandlerRef>& temp_map,
-                           optional_yield y);
-  int do_get_policy_handler(RGWSI_Bucket_X_Ctx& ctx,
-                            std::optional<rgw_zone_id> zone,
+                           optional_yield y,
+                           const DoutPrefixProvider *dpp);
+  int do_get_policy_handler(std::optional<rgw_zone_id> zone,
                             std::optional<rgw_bucket> _bucket,
                             std::map<optional_zone_bucket, RGWBucketSyncPolicyHandlerRef>& temp_map,
                             RGWBucketSyncPolicyHandlerRef *handler,
-                            optional_yield y);
+                            optional_yield y,
+                            const DoutPrefixProvider *dpp);
 public:
   struct Svc {
     RGWSI_Zone *zone{nullptr};
@@ -97,19 +95,22 @@ public:
             RGWSI_Bucket_SObj *_bucket_sobj_svc);
 
 
-  int get_policy_handler(RGWSI_Bucket_X_Ctx& ctx,
-                         std::optional<rgw_zone_id> zone,
+  int get_policy_handler(std::optional<rgw_zone_id> zone,
                          std::optional<rgw_bucket> bucket,
                          RGWBucketSyncPolicyHandlerRef *handler,
-                         optional_yield y);
+                         optional_yield y,
+                         const DoutPrefixProvider *dpp);
 
-  int handle_bi_update(RGWBucketInfo& bucket_info,
+  int handle_bi_update(const DoutPrefixProvider *dpp, 
+                       RGWBucketInfo& bucket_info,
                        RGWBucketInfo *orig_bucket_info,
                        optional_yield y) override;
-  int handle_bi_removal(const RGWBucketInfo& bucket_info,
+  int handle_bi_removal(const DoutPrefixProvider *dpp, 
+                        const RGWBucketInfo& bucket_info,
                         optional_yield y) override;
 
-  int get_bucket_sync_hints(const rgw_bucket& bucket,
+  int get_bucket_sync_hints(const DoutPrefixProvider *dpp,
+                            const rgw_bucket& bucket,
                             std::set<rgw_bucket> *sources,
                             std::set<rgw_bucket> *dests,
                             optional_yield y) override;

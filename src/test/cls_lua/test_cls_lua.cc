@@ -7,6 +7,8 @@
 #include "cls/lua/cls_lua_client.h"
 #include "cls/lua/cls_lua.h"
 
+using namespace std;
+
 /*
  * JSON script to test JSON I/O protocol with cls_lua
  */
@@ -678,7 +680,7 @@ TEST_F(ClsLua, Remove) {
 
 TEST_F(ClsLua, Stat) {
   /* build object and stat */
-  char buf[1024];
+  char buf[1024] = {};
   bufferlist bl;
   bl.append(buf, sizeof(buf));
   ASSERT_EQ(0, ioctx.write_full(oid, bl));
@@ -886,7 +888,7 @@ TEST_F(ClsLua, SetXattr) {
 
 TEST_F(ClsLua, WriteFull) {
   // write some data
-  char buf[1024];
+  char buf[1024] = {};
   bufferlist blin;
   blin.append(buf, sizeof(buf));
   ASSERT_EQ(0, ioctx.write(oid, blin, blin.length(), 0));
@@ -1098,7 +1100,10 @@ TEST_F(ClsLua, Json) {
 
   inbl.append(json_test_script);
 
-  int ret = ioctx.exec(oid, "lua", "eval_json", inbl, outbl);
+  librados::ObjectWriteOperation wop;
+  int rval;
+  wop.exec("lua", "eval_json", inbl, &outbl, &rval);
+  int ret = ioctx.operate(oid, &wop);
   ASSERT_EQ(ret, 0);
 
   std::string out(outbl.c_str(), outbl.length());

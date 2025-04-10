@@ -1,22 +1,22 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#include "include/compat.h"
 #include "CrushLocation.h"
 #include "CrushWrapper.h"
 #include "common/ceph_context.h"
 #include "common/config.h"
-#include "include/str_list.h"
 #include "common/debug.h"
 #include "common/errno.h"
+#include "common/SubProcess.h"
 #include "include/common_fwd.h"
 #include "include/compat.h"
+#include "include/str_list.h"
 
-#include "common/SubProcess.h"
+#include <boost/algorithm/string/trim.hpp>
 
 #include <vector>
 
-namespace TOPNSPC::crush {
+namespace ceph::crush {
 
 int CrushLocation::update_from_conf()
 {
@@ -93,7 +93,7 @@ int CrushLocation::update_from_hook()
 
   std::string out;
   bl.begin().copy(bl.length(), out);
-  out.erase(out.find_last_not_of(" \n\r\t")+1);
+  boost::algorithm::trim_right_if(out, boost::algorithm::is_any_of(" \n\r\t"));
   return _parse(out);
 }
 
@@ -122,7 +122,6 @@ int CrushLocation::init_on_startup()
   loc.clear();
   loc.insert(std::make_pair<std::string,std::string>("host", hostname));
   loc.insert(std::make_pair<std::string,std::string>("root", "default"));
-  lgeneric_dout(cct, 10) << "crush_location is (default) " << loc << dendl;
   return 0;
 }
 

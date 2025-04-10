@@ -15,8 +15,11 @@
 #include "common/ceph_argparse.h"
 
 #include "gtest/gtest.h"
+#include <iostream> // for std::cout
 #include <vector>
 #include "include/stringify.h"
+
+using namespace std;
 
 /* Holds a std::vector with C-strings.
  * Will free() them properly in the destructor.

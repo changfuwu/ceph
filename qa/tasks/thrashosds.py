@@ -63,6 +63,9 @@ def task(ctx, config):
        - kills that osd
        - revives all other osds
        - verifies that the osds fully recover
+    
+    test_min_size_duration: (1800) the number of seconds for
+        test_pool_min_size to last.
 
     timeout: (360) the number of seconds to wait for the cluster
        to become clean after each cluster change. If this doesn't
@@ -176,7 +179,7 @@ def task(ctx, config):
             for remote in ctx.cluster.remotes.keys():
                 log.debug('checking console status of %s' % remote.shortname)
                 if not remote.console.check_status():
-                    log.warn('Failed to get console status for %s',
+                    log.warning('Failed to get console status for %s',
                              remote.shortname)
 
             # check that all osd remotes have a valid console
@@ -211,7 +214,7 @@ def task(ctx, config):
         yield
     finally:
         log.info('joining thrashosds')
-        thrash_proc.do_join()
+        thrash_proc.stop_and_join()
         cluster_manager.wait_for_all_osds_up()
         cluster_manager.flush_all_pg_stats()
         cluster_manager.wait_for_recovery(config.get('timeout', 360))

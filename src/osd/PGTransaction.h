@@ -19,8 +19,11 @@
 #include <optional>
 
 #include "common/hobject.h"
-#include "osd/osd_types.h"
+#ifndef WITH_CRIMSON
 #include "osd/osd_internal_types.h"
+#else
+#include "crimson/osd/object_context.h"
+#endif
 #include "common/interval_map.h"
 #include "common/inline_variant.h"
 
@@ -359,12 +362,12 @@ public:
   /// Attr ops
   void setattrs(
     const hobject_t &hoid,         ///< [in] object to write
-    std::map<std::string, ceph::buffer::list> &attrs ///< [in] attrs, may be cleared
+    std::map<std::string, ceph::buffer::list, std::less<>> &attrs ///< [in] attrs, may be cleared
     ) {
     auto &op = get_object_op_for_modify(hoid);
-    for (auto &&i: attrs) {
-      auto& d = op.attr_updates[i.first];
-      d = i.second;
+    for (auto &[key, val]: attrs) {
+      auto& d = op.attr_updates[key];
+      d = val;
       d->rebuild();
     }
   }

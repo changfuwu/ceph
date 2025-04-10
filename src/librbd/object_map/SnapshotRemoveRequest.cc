@@ -9,6 +9,8 @@
 #include "librbd/object_map/InvalidateRequest.h"
 #include "cls/lock/cls_lock_client.h"
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::object_map::SnapshotRemoveRequest: " \
@@ -91,7 +93,7 @@ void SnapshotRemoveRequest::remove_snapshot() {
 
   librados::ObjectWriteOperation op;
   if (m_next_snap_id == CEPH_NOSNAP) {
-    rados::cls::lock::assert_locked(&op, RBD_LOCK_NAME, LOCK_EXCLUSIVE, "", "");
+    rados::cls::lock::assert_locked(&op, RBD_LOCK_NAME, ClsLockType::EXCLUSIVE, "", "");
   }
   cls_client::object_map_snap_remove(&op, m_snap_object_map);
 

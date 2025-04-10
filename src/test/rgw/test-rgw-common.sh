@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-rgw_flags="--debug-rgw=20 --debug-ms=1"
+rgw_flags="--debug-rgw-notification=20 --debug-rgw=20 --debug-ms=1"
 
 function _assert {
   src=$1; shift
@@ -76,9 +76,14 @@ function rgw_admin {
 }
 
 function rgw {
-  [ $# -ne 2 ] && echo "rgw() needs 2 params" && exit 1
+  [ $# -lt 2 ] && echo "rgw() needs at least 2 params" && exit 1
 
-  echo "$mrgw $1 $2 $rgw_flags"
+  name=$1
+  port=$2
+  ssl_port=0 #ssl port not used
+  shift 2
+
+  echo "$mrgw $name $port $ssl_port $rgw_flags $@"
 }
 
 function init_first_zone {
@@ -88,17 +93,17 @@ function init_first_zone {
   realm=$2
   zg=$3
   zone=$4
-  endpoints=$url:$5
+  endpoints=$5
 
   access_key=$6
   secret=$7
 
 # initialize realm
-  x $(rgw_admin $cid) realm create --rgw-realm=$realm
+  x $(rgw_admin $cid) realm create --rgw-realm=$realm --default
 
 # create zonegroup, zone
   x $(rgw_admin $cid) zonegroup create --rgw-zonegroup=$zg --master --default
-  x $(rgw_admin $cid) zone create --rgw-zonegroup=$zg --rgw-zone=$zone --access-key=${access_key} --secret=${secret} --endpoints=$endpoints --default
+  x $(rgw_admin $cid) zone create --rgw-zonegroup=$zg --rgw-zone=$zone --access-key=${access_key} --secret=${secret} --endpoints=$endpoints --master --default
   x $(rgw_admin $cid) user create --uid=zone.user --display-name=ZoneUser --access-key=${access_key} --secret=${secret} --system
 
   x $(rgw_admin $cid) period update --commit
@@ -112,7 +117,7 @@ function init_zone_in_existing_zg {
   zg=$3
   zone=$4
   master_zg_zone1_port=$5
-  endpoints=$url:$6
+  endpoints=$6
 
   access_key=$7
   secret=$8
@@ -123,7 +128,7 @@ function init_zone_in_existing_zg {
   x $(rgw_admin $cid) period update --commit
 }
 
-function init_first_zone_in_slave_zg {
+function init_first_zone_in_peer_zg {
   [ $# -ne 8 ] && echo "init_first_zone_in_slave_zg() needs 8 params" && exit 1
 
   cid=$1
@@ -131,7 +136,7 @@ function init_first_zone_in_slave_zg {
   zg=$3
   zone=$4
   master_zg_zone1_port=$5
-  endpoints=$url:$6
+  endpoints=$6
 
   access_key=$7
   secret=$8
@@ -155,3 +160,36 @@ function call_rgw_admin {
   shift 1
   x $(rgw_admin $cid) "$@"
 }
+
+function get_mstart_parameters {
+  [ $# -ne 1 ] && echo "get_mstart_parameters() needs 1 param" && exit 1
+  # bash arrays start from zero
+  index="$1"
+	index=$((index-1))
+  if [ -n "$DEV_LIST" ]; then
+    IFS=', ' read -r -a dev_list <<< "$DEV_LIST"
+    if [ ${#dev_list[@]} -gt "$index" ]; then
+      local dev_name=${dev_list["$index"]}
+      parameters="--bluestore-devs $dev_name"
+    fi
+  fi
+
+  if [ -n "$DB_DEV_LIST" ]; then
+    IFS=', ' read -r -a db_dev_list <<< "$DB_DEV_LIST"
+    if [ ${#db_dev_list[@]} -gt "$index" ]; then
+      local dev_name=${db_dev_list["$index"]}
+      parameters="$parameters"" -o bluestore_block_db_path=$dev_name"
+    fi
+  fi
+  
+  if [ -n "$WAL_DEV_LIST" ]; then
+    IFS=', ' read -r -a wal_dev_list <<< "$WAL_DEV_LIST"
+    if [ ${#wal_dev_list[@]} -gt "$index" ]; then
+      local dev_name=${wal_dev_list["$index"]}
+      parameters="$parameters"" -o bluestore_block_wal_path=$dev_name"
+    fi
+  fi
+
+  echo "$parameters $VSTART_PARAMETERS"
+}
+

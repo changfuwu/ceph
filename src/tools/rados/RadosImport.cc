@@ -12,14 +12,18 @@
  *
  */
 
-
-#include "common/errno.h"
-
-#include "osd/PGLog.h"
 #include "RadosImport.h"
+#include "osd/PGLog.h"
+#include "common/debug.h"
+#include "common/errno.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rados
+
+using std::cerr;
+using std::cout;
+using std::map;
+using std::string;
 
 int RadosImport::import(std::string pool, bool no_overwrite)
 {
@@ -194,6 +198,7 @@ int RadosImport::get_object_rados(librados::IoCtx &ioctx, bufferlist &bl, bool n
   }
 
   ioctx.set_namespace(ob.hoid.hobj.get_namespace());
+  ioctx.locator_set_key(ob.hoid.hobj.get_key());
 
   string msg("Write");
   skipping = false;

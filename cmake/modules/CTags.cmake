@@ -3,23 +3,24 @@ find_program(CTAGS_EXECUTABLE ctags)
 function(add_tags name)
   cmake_parse_arguments(TAGS "" "SRC_DIR;TAG_FILE" "EXCLUDE_OPTS;EXCLUDES" ${ARGN})
   set(excludes ${TAGS_EXCLUDES})
+  find_package(Git)
   if(TAGS_EXCLUDE_OPTS)
     # always respect EXCLUDES_OPTS
     list(APPEND excludes ${TAGS_EXCLUDE_OPTS})
-  else()
+  elseif(Git_FOUND)
     # exclude the submodules under SRC_DIR by default
     execute_process(
-      COMMAND git config --file .gitmodules --get-regexp path
+      COMMAND ${GIT_EXECUTABLE} config --file .gitmodules --get-regexp path
       COMMAND awk "/${TAGS_SRC_DIR}/ { print $2 }"
       WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
       RESULT_VARIABLE result_code
       OUTPUT_VARIABLE submodules
       OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(${result_code} EQUAL 0)
-      string(REPLACE "${TAGS_SRC_DIR}/" "" submodules ${submodules})
+      string(REPLACE "${TAGS_SRC_DIR}/" "" submodules "${submodules}")
       # cmake list uses ";" as the delimiter, so split the string manually
       # before iterating in it.
-      string(REPLACE "\n" ";" submodules ${submodules})
+      string(REPLACE "\n" ";" submodules "${submodules}")
       list(APPEND excludes ${submodules})
     endif()
   endif()
@@ -31,7 +32,7 @@ function(add_tags name)
     list(APPEND exclude_args --exclude=${exclude})
   endforeach()
   add_custom_target(${name}
-    COMMAND ${CTAGS_EXECUTABLE} -R --c++-kinds=+p --fields=+iaS --extra=+q ${exclude_args}
+    COMMAND ${CTAGS_EXECUTABLE} -R --python-kinds=-i --c++-kinds=+p --fields=+iaS --extra=+q ${exclude_args}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/${TAGS_SRC_DIR}
     COMMENT "Building ctags file ${TAGS_TAG_FILE}"
     VERBATIM)

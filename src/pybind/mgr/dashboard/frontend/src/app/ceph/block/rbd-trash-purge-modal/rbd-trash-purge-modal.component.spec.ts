@@ -7,14 +7,15 @@ import { ComponentFixture, fakeAsync, TestBed, tick } from '@angular/core/testin
 import { ReactiveFormsModule } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { BsModalRef } from 'ngx-bootstrap/modal';
+import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
 import { ToastrModule } from 'ngx-toastr';
 
-import { configureTestBed, i18nProviders } from '../../../../testing/unit-test-helper';
-import { Permission } from '../../../shared/models/permissions';
-import { NotificationService } from '../../../shared/services/notification.service';
-import { SharedModule } from '../../../shared/shared.module';
+import { Permission } from '~/app/shared/models/permissions';
+import { NotificationService } from '~/app/shared/services/notification.service';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { RbdTrashPurgeModalComponent } from './rbd-trash-purge-modal.component';
+import { ModalModule, SelectModule } from 'carbon-components-angular';
 
 describe('RbdTrashPurgeModalComponent', () => {
   let component: RbdTrashPurgeModalComponent;
@@ -27,15 +28,17 @@ describe('RbdTrashPurgeModalComponent', () => {
       ReactiveFormsModule,
       SharedModule,
       ToastrModule.forRoot(),
-      RouterTestingModule
+      RouterTestingModule,
+      ModalModule,
+      SelectModule
     ],
     declarations: [RbdTrashPurgeModalComponent],
-    providers: [BsModalRef, i18nProviders]
+    providers: [NgbActiveModal]
   });
 
   beforeEach(() => {
     fixture = TestBed.createComponent(RbdTrashPurgeModalComponent);
-    httpTesting = TestBed.get(HttpTestingController);
+    httpTesting = TestBed.inject(HttpTestingController);
     component = fixture.componentInstance;
   });
 
@@ -58,7 +61,7 @@ describe('RbdTrashPurgeModalComponent', () => {
         pool_name: 'baz'
       }
     ]);
-    tick();
+    tick(500);
     expect(component.pools).toEqual(['baz']);
     expect(component.purgeForm).toBeTruthy();
   }));
@@ -71,17 +74,15 @@ describe('RbdTrashPurgeModalComponent', () => {
 
   describe('should call purge', () => {
     let notificationService: NotificationService;
-    let modalRef: BsModalRef;
     let req: TestRequest;
 
     beforeEach(() => {
       fixture.detectChanges();
-      notificationService = TestBed.get(NotificationService);
-      modalRef = TestBed.get(BsModalRef);
+      notificationService = TestBed.inject(NotificationService);
 
       component.purgeForm.patchValue({ poolName: 'foo' });
 
-      spyOn(modalRef, 'hide').and.stub();
+      spyOn(component, 'closeModal').and.stub();
       spyOn(component.purgeForm, 'setErrors').and.stub();
       spyOn(notificationService, 'show').and.stub();
 
@@ -93,13 +94,13 @@ describe('RbdTrashPurgeModalComponent', () => {
     it('with success', () => {
       req.flush(null);
       expect(component.purgeForm.setErrors).toHaveBeenCalledTimes(0);
-      expect(component.modalRef.hide).toHaveBeenCalledTimes(1);
+      expect(component.closeModal).toHaveBeenCalledTimes(1);
     });
 
     it('with failure', () => {
       req.flush(null, { status: 500, statusText: 'failure' });
       expect(component.purgeForm.setErrors).toHaveBeenCalledTimes(1);
-      expect(component.modalRef.hide).toHaveBeenCalledTimes(0);
+      expect(component.closeModal).toHaveBeenCalledTimes(0);
     });
   });
 });

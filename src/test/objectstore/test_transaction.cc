@@ -18,6 +18,8 @@
 #include "include/utime.h"
 #include <boost/tuple/tuple.hpp>
 
+using namespace std;
+
 TEST(Transaction, MoveConstruct)
 {
   auto a = ObjectStore::Transaction{};
@@ -90,7 +92,6 @@ ObjectStore::Transaction generate_transaction()
 
   coll_t acid;
   object_t aobj("another_test_name");
-  snapid_t asnap(0);
   hobject_t ahoid(obj, "another_key", snap, 0, 0, "another_nspace");
   ghobject_t aoid(hoid);
   std::set<string> keys;
@@ -151,7 +152,6 @@ TEST(Transaction, GetNumBytes)
 
   coll_t acid;
   object_t aobj("another_test_name");
-  snapid_t asnap(0);
   hobject_t ahoid(obj, "another_key", snap, 0, 0, "another_nspace");
   ghobject_t aoid(hoid);
   std::set<string> keys;

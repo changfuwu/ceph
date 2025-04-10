@@ -30,7 +30,6 @@ namespace mirror {
 template <typename I>
 Throttler<I>::Throttler(CephContext *cct, const std::string &config_key)
   : m_cct(cct), m_config_key(config_key),
-    m_config_keys{m_config_key.c_str(), nullptr},
     m_lock(ceph::make_mutex(
       librbd::util::unique_lock_name("rbd::mirror::Throttler", this))),
     m_max_concurrent_ops(cct->_conf.get_val<uint64_t>(m_config_key)) {
@@ -222,13 +221,8 @@ void Throttler<I>::print_status(ceph::Formatter *f) {
 }
 
 template <typename I>
-const char** Throttler<I>::get_tracked_conf_keys() const {  
-  return m_config_keys;
-}
-
-template <typename I>
 void Throttler<I>::handle_conf_change(const ConfigProxy& conf,
-                                      const set<string> &changed) {
+                                      const std::set<std::string> &changed) {
   if (changed.count(m_config_key)) {
     set_max_concurrent_ops(conf.get_val<uint64_t>(m_config_key));
   }

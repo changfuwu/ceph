@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 #
 # rbd_mirror_helpers.sh - shared rbd-mirror daemon helper functions
 #
@@ -24,7 +24,7 @@
 # The cleanup can be done as a separate step, running the script with
 # `cleanup ${RBD_MIRROR_TEMDIR}' arguments.
 #
-# Note, as other workunits tests, rbd_mirror_journal.sh expects to find ceph binaries
+# Note, as other workunits tests, rbd_mirror_helpers.sh expects to find ceph binaries
 # in PATH.
 #
 # Thus a typical troubleshooting session:
@@ -35,7 +35,7 @@
 #   cd $CEPH_SRC_PATH
 #   PATH=$CEPH_SRC_PATH:$PATH
 #   RBD_MIRROR_NOCLEANUP=1 RBD_MIRROR_TEMDIR=/tmp/tmp.rbd_mirror \
-#     ../qa/workunits/rbd/rbd_mirror_journal.sh
+#     RBD_MIRROR_MODE=journal ../qa/workunits/rbd/rbd_mirror.sh
 #
 # After the test failure cd to TEMPDIR and check the current state:
 #
@@ -49,31 +49,28 @@
 #   ceph --admin-daemon rbd-mirror.cluster1_daemon.cluster1.$pid.asok help
 #   ...
 #
+# To setup the environment without actually running the tests:
+#
+#   cd $CEPH_SRC_PATH
+#   RBD_MIRROR_TEMDIR=/tmp/tmp.rbd_mirror \
+#     ../qa/workunits/rbd/rbd_mirror_helpers.sh setup
+#
 # Also you can execute commands (functions) from the script:
 #
 #   cd $CEPH_SRC_PATH
 #   export RBD_MIRROR_TEMDIR=/tmp/tmp.rbd_mirror
-#   ../qa/workunits/rbd/rbd_mirror_journal.sh status
-#   ../qa/workunits/rbd/rbd_mirror_journal.sh stop_mirror cluster1
-#   ../qa/workunits/rbd/rbd_mirror_journal.sh start_mirror cluster2
-#   ../qa/workunits/rbd/rbd_mirror_journal.sh flush cluster2
+#   ../qa/workunits/rbd/rbd_mirror_helpers.sh status
+#   ../qa/workunits/rbd/rbd_mirror_helpers.sh stop_mirror cluster1
+#   ../qa/workunits/rbd/rbd_mirror_helpers.sh start_mirror cluster2
+#   ../qa/workunits/rbd/rbd_mirror_helpers.sh flush cluster2
 #   ...
 #
 # Eventually, run the cleanup:
 #
 #   cd $CEPH_SRC_PATH
 #   RBD_MIRROR_TEMDIR=/tmp/tmp.rbd_mirror \
-#     ../qa/workunits/rbd/rbd_mirror_journal.sh cleanup
+#     ../qa/workunits/rbd/rbd_mirror_helpers.sh cleanup
 #
-
-if type xmlstarlet > /dev/null 2>&1; then
-    XMLSTARLET=xmlstarlet
-elif type xml > /dev/null 2>&1; then
-    XMLSTARLET=xml
-else
-    echo "Missing xmlstarlet binary!"
-    exit 1
-fi
 
 RBD_MIRROR_INSTANCES=${RBD_MIRROR_INSTANCES:-2}
 
@@ -88,8 +85,11 @@ TEMPDIR=
 CEPH_ID=${CEPH_ID:-mirror}
 RBD_IMAGE_FEATURES=${RBD_IMAGE_FEATURES:-layering,exclusive-lock,journaling}
 MIRROR_USER_ID_PREFIX=${MIRROR_USER_ID_PREFIX:-${CEPH_ID}.}
+RBD_MIRROR_MODE=${RBD_MIRROR_MODE:-journal}
 MIRROR_POOL_MODE=${MIRROR_POOL_MODE:-pool}
-MIRROR_IMAGE_MODE=${MIRROR_IMAGE_MODE:-journal}
+if [ "${RBD_MIRROR_MODE}" = "snapshot" ]; then
+  MIRROR_POOL_MODE=image
+fi
 
 export CEPH_ARGS="--id ${CEPH_ID}"
 
@@ -233,6 +233,47 @@ EOF
     done
 }
 
+peer_add()
+{
+    local cluster=$1 ; shift
+    local pool=$1 ; shift
+    local client_cluster=$1 ; shift
+    local remote_cluster="${client_cluster##*@}"
+
+    local uuid_var_name
+    if [ -n "$1" ]; then
+        uuid_var_name=$1 ; shift
+    fi
+
+    local error_code
+    local peer_uuid
+
+    for s in 1 2 4 8 16 32; do
+        set +e
+        peer_uuid=$(rbd --cluster ${cluster} mirror pool peer add \
+            ${pool} ${client_cluster} $@)
+        error_code=$?
+        set -e
+
+        if [ $error_code -eq 17 ]; then
+            # raced with a remote heartbeat ping -- remove and retry
+            sleep $s
+            peer_uuid=$(rbd mirror pool info --cluster ${cluster} --pool ${pool} --format xml | \
+                xmlstarlet sel -t -v "//peers/peer[site_name='${remote_cluster}']/uuid")
+
+            CEPH_ARGS='' rbd --cluster ${cluster} --pool ${pool} mirror pool peer remove ${peer_uuid}
+        else
+            test $error_code -eq 0
+            if [ -n "$uuid_var_name" ]; then
+                eval ${uuid_var_name}=${peer_uuid}
+            fi
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 setup_pools()
 {
     local cluster=$1
@@ -258,14 +299,16 @@ setup_pools()
 
     rbd --cluster ${cluster} namespace create ${POOL}/${NS1}
     rbd --cluster ${cluster} namespace create ${POOL}/${NS2}
+    rbd --cluster ${cluster} namespace create ${PARENT_POOL}/${NS1}
 
     rbd --cluster ${cluster} mirror pool enable ${POOL}/${NS1} ${MIRROR_POOL_MODE}
     rbd --cluster ${cluster} mirror pool enable ${POOL}/${NS2} image
+    rbd --cluster ${cluster} mirror pool enable ${PARENT_POOL}/${NS1} ${MIRROR_POOL_MODE}
 
     if [ -z ${RBD_MIRROR_MANUAL_PEERS} ]; then
       if [ -z ${RBD_MIRROR_CONFIG_KEY} ]; then
-        rbd --cluster ${cluster} mirror pool peer add ${POOL} ${remote_cluster}
-        rbd --cluster ${cluster} mirror pool peer add ${PARENT_POOL} ${remote_cluster}
+        peer_add ${cluster} ${POOL} ${remote_cluster}
+        peer_add ${cluster} ${PARENT_POOL} ${remote_cluster}
       else
         mon_map_file=${TEMPDIR}/${remote_cluster}.monmap
         CEPH_ARGS='' ceph --cluster ${remote_cluster} mon getmap > ${mon_map_file}
@@ -275,12 +318,11 @@ setup_pools()
         admin_key_file=${TEMPDIR}/${remote_cluster}.client.${CEPH_ID}.key
         CEPH_ARGS='' ceph --cluster ${remote_cluster} auth get-key client.${CEPH_ID} > ${admin_key_file}
 
-        CEPH_ARGS='' rbd --cluster ${cluster} mirror pool peer add ${POOL} \
-            client.${CEPH_ID}@${remote_cluster}${PEER_CLUSTER_SUFFIX} \
+        CEPH_ARGS='' peer_add ${cluster} ${POOL} \
+            client.${CEPH_ID}@${remote_cluster}${PEER_CLUSTER_SUFFIX} '' \
             --remote-mon-host "${mon_addr}" --remote-key-file ${admin_key_file}
 
-        uuid=$(rbd --cluster ${cluster} mirror pool peer add ${PARENT_POOL} \
-            client.${CEPH_ID}@${remote_cluster}${PEER_CLUSTER_SUFFIX})
+        peer_add ${cluster} ${PARENT_POOL} client.${CEPH_ID}@${remote_cluster}${PEER_CLUSTER_SUFFIX} uuid
         CEPH_ARGS='' rbd --cluster ${cluster} mirror pool peer set ${PARENT_POOL} ${uuid} mon-host ${mon_addr}
         CEPH_ARGS='' rbd --cluster ${cluster} mirror pool peer set ${PARENT_POOL} ${uuid} key-file ${admin_key_file}
       fi
@@ -486,11 +528,11 @@ status()
                 rbd --cluster ${cluster} -p ${image_pool} --namespace "${image_ns}" ls -l
                 echo
 
-                echo "${cluster} ${image_pool}${image_ns} mirror pool info"
+                echo "${cluster} ${image_pool} ${image_ns} mirror pool info"
                 rbd --cluster ${cluster} -p ${image_pool} --namespace "${image_ns}" mirror pool info
                 echo
 
-                echo "${cluster} ${image_pool}${image_ns} mirror pool status"
+                echo "${cluster} ${image_pool} ${image_ns} mirror pool status"
                 CEPH_ARGS='' rbd --cluster ${cluster} -p ${image_pool} --namespace "${image_ns}" mirror pool status --verbose
                 echo
 
@@ -502,10 +544,15 @@ status()
                     echo "image ${image} journal status"
                     rbd --cluster ${cluster} -p ${image_pool} --namespace "${image_ns}" journal status --image ${image}
                     echo
+                    echo "image ${image} snapshots"
+                    rbd --cluster ${cluster} -p ${image_pool} --namespace "${image_ns}" snap ls --all ${image}
+                    echo
                 done
 
                 echo "${cluster} ${image_pool} ${image_ns} rbd_mirroring omap vals"
                 rados --cluster ${cluster} -p ${image_pool} --namespace "${image_ns}" listomapvals rbd_mirroring
+                echo "${cluster} ${image_pool} ${image_ns} rbd_mirror_leader omap vals"
+                rados --cluster ${cluster} -p ${image_pool} --namespace "${image_ns}" listomapvals rbd_mirror_leader
                 echo
             done
         done
@@ -576,6 +623,39 @@ flush()
     fi
 
     admin_daemons "${cluster}" ${cmd}
+}
+
+get_pool_status_json()
+{
+    local cluster="$1"
+    local pool="$2"
+
+    CEPH_ARGS='' rbd --cluster "${cluster}" mirror pool status "${pool}" --verbose --format json
+}
+
+test_health_state()
+{
+    local cluster="$1"
+    local pool="$2"
+    local state="$3"
+
+    local status
+    status="$(get_pool_status_json "${cluster}" "${pool}")"
+    jq -e '.summary.health == "'"${state}"'"' <<< "${status}"
+}
+
+wait_for_health_state()
+{
+    local cluster="$1"
+    local pool="$2"
+    local state="$3"
+    local s
+
+    for s in 1 2 4 8 8 8 8 8 8 8 8 16 16; do
+        sleep "${s}"
+        test_health_state "${cluster}" "${pool}" "${state}" && return 0
+    done
+    return 1
 }
 
 test_image_replay_state()
@@ -665,17 +745,18 @@ wait_for_journal_replay_complete()
 {
     local local_cluster=$1
     local cluster=$2
-    local pool=$3
-    local image=$4
+    local local_pool=$3
+    local remote_pool=$4
+    local image=$5
     local s master_pos mirror_pos last_mirror_pos
     local master_tag master_entry mirror_tag mirror_entry
 
     while true; do
         for s in 0.2 0.4 0.8 1.6 2 2 4 4 8 8 16 16 32 32; do
             sleep ${s}
-            flush "${local_cluster}" "${pool}" "${image}"
-            master_pos=$(get_master_journal_position "${cluster}" "${pool}" "${image}")
-            mirror_pos=$(get_mirror_journal_position "${cluster}" "${pool}" "${image}")
+            flush "${local_cluster}" "${local_pool}" "${image}"
+            master_pos=$(get_master_journal_position "${cluster}" "${remote_pool}" "${image}")
+            mirror_pos=$(get_mirror_journal_position "${cluster}" "${remote_pool}" "${image}")
             test -n "${master_pos}" -a "${master_pos}" = "${mirror_pos}" && return 0
             test "${mirror_pos}" != "${last_mirror_pos}" && break
         done
@@ -718,21 +799,22 @@ wait_for_snapshot_sync_complete()
 {
     local local_cluster=$1
     local cluster=$2
-    local pool=$3
-    local image=$4
+    local local_pool=$3
+    local remote_pool=$4
+    local image=$5
 
-    local status_log=${TEMPDIR}/$(mkfname ${cluster}-${pool}-${image}.status)
-    local local_status_log=${TEMPDIR}/$(mkfname ${local_cluster}-${pool}-${image}.status)
+    local status_log=${TEMPDIR}/$(mkfname ${cluster}-${remote_pool}-${image}.status)
+    local local_status_log=${TEMPDIR}/$(mkfname ${local_cluster}-${local_pool}-${image}.status)
 
-    mirror_image_snapshot "${cluster}" "${pool}" "${image}"
-    get_newest_mirror_snapshot "${cluster}" "${pool}" "${image}" "${status_log}"
+    mirror_image_snapshot "${cluster}" "${remote_pool}" "${image}"
+    get_newest_mirror_snapshot "${cluster}" "${remote_pool}" "${image}" "${status_log}"
     local snapshot_id=$(xmlstarlet sel -t -v "//snapshot/id" < ${status_log})
 
     while true; do
         for s in 0.2 0.4 0.8 1.6 2 2 4 4 8 8 16 16 32 32; do
             sleep ${s}
 
-            get_newest_mirror_snapshot "${local_cluster}" "${pool}" "${image}" "${local_status_log}"
+            get_newest_mirror_snapshot "${local_cluster}" "${local_pool}" "${image}" "${local_status_log}"
             local primary_snapshot_id=$(xmlstarlet sel -t -v "//snapshot/namespace/primary_snap_id" < ${local_status_log})
 
             test "${snapshot_id}" = "${primary_snapshot_id}" && return 0
@@ -747,13 +829,14 @@ wait_for_replay_complete()
 {
     local local_cluster=$1
     local cluster=$2
-    local pool=$3
-    local image=$4
+    local local_pool=$3
+    local remote_pool=$4
+    local image=$5
 
-    if [ "${MIRROR_IMAGE_MODE}" = "journal" ]; then
-        wait_for_journal_replay_complete ${local_cluster} ${cluster} ${pool} ${image}
-    elif [ "${MIRROR_IMAGE_MODE}" = "snapshot" ]; then
-        wait_for_snapshot_sync_complete ${local_cluster} ${cluster} ${pool} ${image}
+    if [ "${RBD_MIRROR_MODE}" = "journal" ]; then
+        wait_for_journal_replay_complete ${local_cluster} ${cluster} ${local_pool} ${remote_pool} ${image}
+    elif [ "${RBD_MIRROR_MODE}" = "snapshot" ]; then
+        wait_for_snapshot_sync_complete ${local_cluster} ${cluster} ${local_pool} ${remote_pool} ${image}
     else
         return 1
     fi
@@ -769,23 +852,23 @@ test_status_in_pool_dir()
     local description_pattern="$5"
     local service_pattern="$6"
 
-    local status_log=${TEMPDIR}/$(mkfname ${cluster}-${pool}-${image}.mirror_status)
-    CEPH_ARGS='' rbd --cluster ${cluster} mirror image status ${pool}/${image} |
-        tee ${status_log} >&2
-    grep "^  state: .*${state_pattern}" ${status_log} || return 1
-    grep "^  description: .*${description_pattern}" ${status_log} || return 1
+    local status
+    status=$(CEPH_ARGS='' rbd --cluster ${cluster} mirror image status \
+                 ${pool}/${image})
+    grep "^  state: .*${state_pattern}" <<< "$status" || return 1
+    grep "^  description: .*${description_pattern}" <<< "$status" || return 1
 
     if [ -n "${service_pattern}" ]; then
-        grep "service: *${service_pattern}" ${status_log} || return 1
+        grep "service: *${service_pattern}" <<< "$status" || return 1
     elif echo ${state_pattern} | grep '^up+'; then
-        grep "service: *${MIRROR_USER_ID_PREFIX}.* on " ${status_log} || return 1
+        grep "service: *${MIRROR_USER_ID_PREFIX}.* on " <<< "$status" || return 1
     else
-        grep "service: " ${status_log} && return 1
+        grep "service: " <<< "$status" && return 1
     fi
 
     # recheck using `mirror pool status` command to stress test it.
-
-    local last_update="$(sed -nEe 's/^  last_update: *(.*) *$/\1/p' ${status_log})"
+    local last_update
+    last_update="$(sed -nEe 's/^  last_update: *(.*) *$/\1/p' <<< "$status")"
     test_mirror_pool_status_verbose \
         ${cluster} ${pool} ${image} "${state_pattern}" "${last_update}" &&
     return 0
@@ -802,16 +885,15 @@ test_mirror_pool_status_verbose()
     local state_pattern="$4"
     local prev_last_update="$5"
 
-    local status_log=${TEMPDIR}/$(mkfname ${cluster}-${pool}.mirror_status)
-
-    rbd --cluster ${cluster} mirror pool status ${pool} --verbose --format xml \
-        > ${status_log}
+    local status
+    status=$(CEPH_ARGS='' rbd --cluster ${cluster} mirror pool status ${pool} \
+                 --verbose --format xml)
 
     local last_update state
-    last_update=$($XMLSTARLET sel -t -v \
-        "//images/image[name='${image}']/last_update" < ${status_log})
-    state=$($XMLSTARLET sel -t -v \
-        "//images/image[name='${image}']/state" < ${status_log})
+    last_update=$(xmlstarlet sel -t -v \
+        "//images/image[name='${image}']/last_update" <<< "$status")
+    state=$(xmlstarlet sel -t -v \
+        "//images/image[name='${image}']/state" <<< "$status")
 
     echo "${state}" | grep "${state_pattern}" ||
     test "${last_update}" '>' "${prev_last_update}"
@@ -835,6 +917,20 @@ wait_for_status_in_pool_dir()
     return 1
 }
 
+wait_for_replaying_status_in_pool_dir()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    if [ "${RBD_MIRROR_MODE}" = "journal" ]; then
+        wait_for_status_in_pool_dir ${cluster} ${pool} ${image} 'up+replaying' \
+                                    'primary_position'
+    else
+        wait_for_status_in_pool_dir ${cluster} ${pool} ${image} 'up+replaying'
+    fi
+}
+
 create_image()
 {
     local cluster=$1 ; shift
@@ -851,18 +947,37 @@ create_image()
         --image-feature "${RBD_IMAGE_FEATURES}" $@ ${pool}/${image}
 }
 
+is_pool_mirror_mode_image()
+{
+    local pool=$1
+
+    if [ "${MIRROR_POOL_MODE}" = "image" ]; then
+        return 0
+    fi
+
+    case "${pool}" in
+        */${NS2} | ${PARENT_POOL})
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
 create_image_and_enable_mirror()
 {
     local cluster=$1 ; shift
     local pool=$1 ; shift
     local image=$1 ; shift
-    local mode=${1:-${MIRROR_IMAGE_MODE}}
+    local mode=${1:-${RBD_MIRROR_MODE}}
     if [ -n "$1" ]; then
         shift
     fi
 
     create_image ${cluster} ${pool} ${image} $@
-    enable_mirror ${cluster} ${pool} ${image} ${mode}
+    if is_pool_mirror_mode_image ${pool}; then
+        enable_mirror ${cluster} ${pool} ${image} ${mode}
+    fi
 }
 
 enable_journaling()
@@ -940,9 +1055,14 @@ trash_move() {
 trash_restore() {
     local cluster=$1
     local pool=$2
-    local image_id=$3
+    local image=$3
+    local image_id=$4
+    local mode=${5:-${RBD_MIRROR_MODE}}
 
     rbd --cluster=${cluster} trash restore ${pool}/${image_id}
+    if is_pool_mirror_mode_image ${pool}; then
+        enable_mirror ${cluster} ${pool} ${image} ${mode}
+    fi
 }
 
 clone_image()
@@ -971,13 +1091,15 @@ clone_image_and_enable_mirror()
     local clone_image=$6
     shift 6
 
-    local mode=${1:-${MIRROR_IMAGE_MODE}}
+    local mode=${1:-${RBD_MIRROR_MODE}}
     if [ -n "$1" ]; then
         shift
     fi
 
     clone_image ${cluster} ${parent_pool} ${parent_image} ${parent_snap} ${clone_pool} ${clone_image} $@
-    enable_mirror ${cluster} ${clone_pool} ${clone_image} ${mode}
+    if is_pool_mirror_mode_image ${clone_pool}; then
+      enable_mirror ${cluster} ${clone_pool} ${clone_image} ${mode}
+    fi
 }
 
 disconnect_image()
@@ -1051,6 +1173,20 @@ unprotect_snapshot()
     rbd --cluster ${cluster} snap unprotect ${pool}/${image}@${snap}
 }
 
+unprotect_snapshot_retry()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local snap=$4
+
+    for s in 0 1 2 4 8 16 32; do
+        sleep ${s}
+        unprotect_snapshot ${cluster} ${pool} ${image} ${snap} && return 0
+    done
+    return 1
+}
+
 wait_for_snap_present()
 {
     local cluster=$1
@@ -1075,7 +1211,7 @@ test_snap_moved_to_trash()
     local snap_name=$4
 
     rbd --cluster ${cluster} snap ls ${pool}/${image} --all |
-        grep -F " trash (${snap_name})"
+        grep -F " trash (user ${snap_name})"
 }
 
 wait_for_snap_moved_to_trash()
@@ -1108,6 +1244,25 @@ wait_for_snap_removed_from_trash()
     return 1
 }
 
+count_mirror_snaps()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster ${cluster} snap ls ${pool}/${image} --all |
+        grep -c -F " mirror ("
+}
+
+get_snaps_json()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster ${cluster} snap ls ${pool}/${image} --all --format json
+}
+
 write_image()
 {
     local cluster=$1
@@ -1130,10 +1285,18 @@ stress_write_image()
     local image=$3
     local duration=$(awk 'BEGIN {srand(); print int(10 * rand()) + 5}')
 
+    set +e
     timeout ${duration}s ceph_test_rbd_mirror_random_write \
         --cluster ${cluster} ${pool} ${image} \
         --debug-rbd=20 --debug-journaler=20 \
-        2> ${TEMPDIR}/rbd-mirror-random-write.log || true
+        2> ${TEMPDIR}/rbd-mirror-random-write.log
+    error_code=$?
+    set -e
+
+    if [ $error_code -eq 124 ]; then
+        return 0
+    fi
+    return 1
 }
 
 show_diff()
@@ -1149,16 +1312,19 @@ show_diff()
 
 compare_images()
 {
-    local pool=$1
-    local image=$2
     local ret=0
+    local local_cluster=$1
+    local cluster=$2
+    local local_pool=$3
+    local remote_pool=$4
+    local image=$5
 
-    local rmt_export=${TEMPDIR}/$(mkfname ${CLUSTER2}-${pool}-${image}.export)
-    local loc_export=${TEMPDIR}/$(mkfname ${CLUSTER1}-${pool}-${image}.export)
+    local rmt_export=${TEMPDIR}/$(mkfname ${cluster}-${remote_pool}-${image}.export)
+    local loc_export=${TEMPDIR}/$(mkfname ${local_cluster}-${local_pool}-${image}.export)
 
     rm -f ${rmt_export} ${loc_export}
-    rbd --cluster ${CLUSTER2} export ${pool}/${image} ${rmt_export}
-    rbd --cluster ${CLUSTER1} export ${pool}/${image} ${loc_export}
+    rbd --cluster ${cluster} export ${remote_pool}/${image} ${rmt_export}
+    rbd --cluster ${local_cluster} export ${local_pool}/${image} ${loc_export}
     if ! cmp ${rmt_export} ${loc_export}
     then
         show_diff ${rmt_export} ${loc_export}
@@ -1179,7 +1345,7 @@ compare_image_snapshots()
 
     for snap_name in $(rbd --cluster ${CLUSTER1} --format xml \
                            snap list ${pool}/${image} | \
-                           $XMLSTARLET sel -t -v "//snapshot/name" | \
+                           xmlstarlet sel -t -v "//snapshot/name" | \
                            grep -E -v "^\.rbd-mirror\."); do
         rm -f ${rmt_export} ${loc_export}
         rbd --cluster ${CLUSTER2} export ${pool}/${image}@${snap_name} ${rmt_export}
@@ -1236,9 +1402,11 @@ enable_mirror()
     local cluster=$1
     local pool=$2
     local image=$3
-    local mode=${4:-${MIRROR_IMAGE_MODE}}
+    local mode=${4:-${RBD_MIRROR_MODE}}
 
     rbd --cluster=${cluster} mirror image enable ${pool}/${image} ${mode}
+    # Display image info including the global image id for debugging purpose
+    rbd --cluster=${cluster} info ${pool}/${image}
 }
 
 test_image_present()
@@ -1334,6 +1502,58 @@ get_clone_format()
                if (!parent) exit 1
                print format
              }'
+}
+
+list_omap_keys()
+{
+    local cluster=$1
+    local pool=$2
+    local obj_name=$3
+
+    rados --cluster ${cluster} -p ${pool} listomapkeys ${obj_name}
+}
+
+count_omap_keys_with_filter()
+{
+    local cluster=$1
+    local pool=$2
+    local obj_name=$3
+    local filter=$4
+
+    list_omap_keys ${cluster} ${pool} ${obj_name} | grep -c ${filter}
+}
+
+wait_for_omap_keys()
+{
+    local cluster=$1
+    local pool=$2
+    local obj_name=$3
+    local filter=$4
+
+    for s in 0 1 2 2 4 4 8 8 8 16 16 32; do
+        sleep $s
+
+        set +e
+        test "$(count_omap_keys_with_filter ${cluster} ${pool} ${obj_name} ${filter})" = 0
+        error_code=$?
+        set -e
+
+        if [ $error_code -eq 0 ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+wait_for_image_in_omap()
+{
+    local cluster=$1
+    local pool=$2
+
+    wait_for_omap_keys ${cluster} ${pool} rbd_mirroring status_global
+    wait_for_omap_keys ${cluster} ${pool} rbd_mirroring image_
+    wait_for_omap_keys ${cluster} ${pool} rbd_mirror_leader image_map
 }
 
 #

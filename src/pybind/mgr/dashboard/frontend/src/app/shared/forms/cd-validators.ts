@@ -6,19 +6,22 @@ import {
   Validators
 } from '@angular/forms';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
-import * as _ from 'lodash';
+import _ from 'lodash';
 import { Observable, of as observableOf, timer as observableTimer } from 'rxjs';
 import { map, switchMapTo, take } from 'rxjs/operators';
 
-import { DimlessBinaryPipe } from '../pipes/dimless-binary.pipe';
-import { FormatterService } from '../services/formatter.service';
+import { RgwBucketService } from '~/app/shared/api/rgw-bucket.service';
+import { DimlessBinaryPipe } from '~/app/shared/pipes/dimless-binary.pipe';
+import { FormatterService } from '~/app/shared/services/formatter.service';
+import validator from 'validator';
 
 export function isEmptyInputValue(value: any): boolean {
   return value == null || value.length === 0;
 }
 
-export type existsServiceFn = (value: any) => Observable<boolean>;
+export type existsServiceFn = (value: any, ...args: any[]) => Observable<boolean>;
+
+export const DUE_TIMER = 500;
 
 export class CdValidators {
   /**
@@ -36,10 +39,10 @@ export class CdValidators {
   /**
    * Validator function in order to validate IP addresses.
    * @param {number} version determines the protocol version. It needs to be set to 4 for IPv4 and
-   * to 6 for IPv6 validation. For any other number (it's also the default case) it will return a
-   * function to validate the input string against IPv4 OR IPv6.
+   *   to 6 for IPv6 validation. For any other number (it's also the default case) it will return a
+   *   function to validate the input string against IPv4 OR IPv6.
    * @returns {ValidatorFn} A validator function that returns an error map containing `pattern`
-   * if the validation failed, otherwise `null`.
+   *   if the validation check fails, otherwise `null`.
    */
   static ip(version: number = 0): ValidatorFn {
     // prettier-ignore
@@ -59,7 +62,7 @@ export class CdValidators {
   /**
    * Validator function in order to validate numbers.
    * @returns {ValidatorFn} A validator function that returns an error map containing `pattern`
-   * if the validation failed, otherwise `null`.
+   *   if the validation check fails, otherwise `null`.
    */
   static number(allowsNegative: boolean = true): ValidatorFn {
     if (allowsNegative) {
@@ -72,7 +75,7 @@ export class CdValidators {
   /**
    * Validator function in order to validate decimal numbers.
    * @returns {ValidatorFn} A validator function that returns an error map containing `pattern`
-   * if the validation failed, otherwise `null`.
+   *   if the validation check fails, otherwise `null`.
    */
   static decimalNumber(allowsNegative: boolean = true): ValidatorFn {
     if (allowsNegative) {
@@ -83,16 +86,63 @@ export class CdValidators {
   }
 
   /**
+   * Validator that performs SSL certificate validation.
+   * @returns {ValidatorFn} A validator function that returns an error map containing `pattern`
+   *   if the validation check fails, otherwise `null`.
+   */
+  static sslCert(): ValidatorFn {
+    return Validators.pattern(
+      /^-----BEGIN CERTIFICATE-----(\n|\r|\f)((.+)?((\n|\r|\f).+)*)(\n|\r|\f)-----END CERTIFICATE-----[\n\r\f]*$/
+    );
+  }
+
+  /**
+   * Validator that performs SSL private key validation.
+   * @returns {ValidatorFn} A validator function that returns an error map containing `pattern`
+   *   if the validation check fails, otherwise `null`.
+   */
+  static sslPrivKey(): ValidatorFn {
+    return Validators.pattern(
+      /^-----BEGIN RSA PRIVATE KEY-----(\n|\r|\f)((.+)?((\n|\r|\f).+)*)(\n|\r|\f)-----END RSA PRIVATE KEY-----[\n\r\f]*$/
+    );
+  }
+
+  /**
+   * Validator that performs SSL certificate validation of pem format.
+   * @returns {ValidatorFn} A validator function that returns an error map containing `pattern`
+   *   if the validation check fails, otherwise `null`.
+   */
+  static pemCert(): ValidatorFn {
+    return Validators.pattern(/^-----BEGIN .+-----$.+^-----END .+-----$/ms);
+  }
+
+  /**
    * Validator that requires controls to fulfill the specified condition if
    * the specified prerequisites matches. If the prerequisites are fulfilled,
    * then the given function is executed and if it succeeds, the 'required'
    * validation error will be returned, otherwise null.
    * @param {Object} prerequisites An object containing the prerequisites.
+   *   To do additional checks rather than checking for equality you can
+   *   use the extended prerequisite syntax:
+   *     'field_name': { 'op': '<OPERATOR>', arg1: '<OPERATOR_ARGUMENT>' }
+   *   The following operators are supported:
+   *   * empty
+   *   * !empty
+   *   * equal
+   *   * !equal
+   *   * minLength
    *   ### Example
    *   ```typescript
    *   {
    *     'generate_key': true,
    *     'username': 'Max Mustermann'
+   *   }
+   *   ```
+   *   ### Example - Extended prerequisites
+   *   ```typescript
+   *   {
+   *     'generate_key': { 'op': 'equal', 'arg1': true },
+   *     'username': { 'op': 'minLength', 'arg1': 5 }
    *   }
    *   ```
    *   Only if all prerequisites are fulfilled, then the validation of the
@@ -120,7 +170,39 @@ export class CdValidators {
       // Check if all prerequisites met.
       if (
         !Object.keys(prerequisites).every((key) => {
-          return control.parent && control.parent.get(key).value === prerequisites[key];
+          if (!control.parent) {
+            return false;
+          }
+          const value = control.parent.get(key).value;
+          const prerequisite = prerequisites[key];
+          if (_.isObjectLike(prerequisite)) {
+            let result = false;
+            switch (prerequisite['op']) {
+              case 'empty':
+                result = _.isEmpty(value);
+                break;
+              case '!empty':
+                result = !_.isEmpty(value);
+                break;
+              case 'equal':
+                result = value === prerequisite['arg1'];
+                break;
+              case '!equal':
+                result = value !== prerequisite['arg1'];
+                break;
+              case 'minLength':
+                if (_.isString(value)) {
+                  result = value.length >= prerequisite['arg1'];
+                }
+                break;
+              case 'minValue':
+                if (_.isNumber(value)) {
+                  result = value >= prerequisite['arg1'];
+                }
+            }
+            return result;
+          }
+          return value === prerequisite;
         })
       ) {
         return null;
@@ -272,9 +354,12 @@ export class CdValidators {
    *   boolean 'true' if the given value exists, otherwise 'false'.
    * @param serviceFnThis {any} The object to be used as the 'this' object
    *   when calling the serviceFn function. Defaults to null.
-   * @param {number|Date} dueTime The delay time to wait before the
-   *   serviceFn call is executed. This is useful to prevent calls on
-   *   every keystroke. Defaults to 500.
+   * @param usernameFn {Function} Specifically used in rgw user form to
+   *   validate the tenant$username format
+   * @param uidField {boolean} Specifically used in rgw user form to
+   *   validate the tenant$username format
+   * @param extraArgs {...any} Any extra arguments that need to be passed
+   *   to the serviceFn function.
    * @return {AsyncValidatorFn} Returns an asynchronous validator function
    *   that returns an error map with the `notUnique` property if the
    *   validation check succeeds, otherwise `null`.
@@ -282,18 +367,28 @@ export class CdValidators {
   static unique(
     serviceFn: existsServiceFn,
     serviceFnThis: any = null,
-    dueTime = 500
+    usernameFn?: Function,
+    uidField = false,
+    ...extraArgs: any[]
   ): AsyncValidatorFn {
+    let uName: string;
     return (control: AbstractControl): Observable<ValidationErrors | null> => {
       // Exit immediately if user has not interacted with the control yet
       // or the control value is empty.
       if (control.pristine || isEmptyInputValue(control.value)) {
         return observableOf(null);
       }
-      // Forgot previous requests if a new one arrives within the specified
-      // delay time.
-      return observableTimer(dueTime).pipe(
-        switchMapTo(serviceFn.call(serviceFnThis, control.value)),
+      uName = control.value;
+      if (_.isFunction(usernameFn) && usernameFn() !== null && usernameFn() !== '') {
+        if (uidField) {
+          uName = `${control.value}$${usernameFn()}`;
+        } else {
+          uName = `${usernameFn()}$${control.value}`;
+        }
+      }
+
+      return observableTimer(DUE_TIMER).pipe(
+        switchMapTo(serviceFn.call(serviceFnThis, uName, ...extraArgs)),
         map((resp: boolean) => {
           if (!resp) {
             return null;
@@ -333,7 +428,7 @@ export class CdValidators {
    * be called in a static one.
    */
   static binaryMin(bytes: number): ValidatorFn {
-    return (control: AbstractControl): { [key: string]: (i18n: I18n) => string } | null => {
+    return (control: AbstractControl): { [key: string]: () => string } | null => {
       const formatterService = new FormatterService();
       const currentBytes = new FormatterService().toBytes(control.value);
       if (bytes <= currentBytes) {
@@ -341,7 +436,7 @@ export class CdValidators {
       }
       const value = new DimlessBinaryPipe(formatterService).transform(bytes);
       return {
-        binaryMin: (i18n: I18n) => i18n(`Size has to be at least {{value}} or more`, { value })
+        binaryMin: () => $localize`Size has to be at least ${value} or more`
       };
     };
   }
@@ -353,7 +448,7 @@ export class CdValidators {
    * be called in a static one.
    */
   static binaryMax(bytes: number): ValidatorFn {
-    return (control: AbstractControl): { [key: string]: (i18n: I18n) => string } | null => {
+    return (control: AbstractControl): { [key: string]: () => string } | null => {
       const formatterService = new FormatterService();
       const currentBytes = formatterService.toBytes(control.value);
       if (bytes >= currentBytes) {
@@ -361,7 +456,7 @@ export class CdValidators {
       }
       const value = new DimlessBinaryPipe(formatterService).transform(bytes);
       return {
-        binaryMax: (i18n: I18n) => i18n(`Size has to be at most {{value}} or less`, { value })
+        binaryMax: () => $localize`Size has to be at most ${value} or less`
       };
     };
   }
@@ -395,7 +490,7 @@ export class CdValidators {
       if (_.isFunction(usernameFn)) {
         username = usernameFn();
       }
-      return observableTimer(500).pipe(
+      return observableTimer(DUE_TIMER).pipe(
         switchMapTo(_.invoke(userServiceThis, 'validatePassword', control.value, username)),
         map((resp: { valid: boolean; credits: number; valuation: string }) => {
           if (_.isFunction(callback)) {
@@ -410,5 +505,208 @@ export class CdValidators {
         take(1)
       );
     };
+  }
+
+  /**
+   * Validate the bucket name. In general, bucket names should follow domain
+   * name constraints:
+   * - Bucket names must be unique.
+   * - Bucket names cannot be formatted as IP address.
+   * - Bucket names can be between 3 and 63 characters long.
+   * - Bucket names must not contain uppercase characters or underscores.
+   * - Bucket names must start with a lowercase letter or number.
+   * - Bucket names must be a series of one or more labels. Adjacent
+   *   labels are separated by a single period (.). Bucket names can
+   *   contain lowercase letters, numbers, and hyphens. Each label must
+   *   start and end with a lowercase letter or a number.
+   */
+  static bucketName(): AsyncValidatorFn {
+    return (control: AbstractControl): Observable<ValidationErrors | null> => {
+      if (control.pristine || !control.value) {
+        return observableOf({ required: true });
+      }
+      const constraints = [];
+      let errorName: string;
+      // - Bucket names cannot be formatted as IP address.
+      constraints.push(() => {
+        const ipv4Rgx = /^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/i;
+        const ipv6Rgx = /^(?:[a-f0-9]{1,4}:){7}[a-f0-9]{1,4}$/i;
+        const name = control.value;
+        let notIP = true;
+        if (ipv4Rgx.test(name) || ipv6Rgx.test(name)) {
+          errorName = 'ipAddress';
+          notIP = false;
+        }
+        return notIP;
+      });
+      // - Bucket names can be between 3 and 63 characters long.
+      constraints.push((name: string) => {
+        if (!_.inRange(name.length, 3, 64)) {
+          errorName = 'shouldBeInRange';
+          return false;
+        }
+        // Bucket names can only contain lowercase letters, numbers, periods and hyphens.
+        if (!/^[0-9a-z.-]+$/.test(control.value)) {
+          errorName = 'bucketNameInvalid';
+          return false;
+        }
+        return true;
+      });
+      // - Bucket names must not contain uppercase characters or underscores.
+      // - Bucket names must start with a lowercase letter or number.
+      // - Bucket names must be a series of one or more labels. Adjacent
+      //   labels are separated by a single period (.). Bucket names can
+      //   contain lowercase letters, numbers, and hyphens. Each label must
+      //   start and end with a lowercase letter or a number.
+      constraints.push((name: string) => {
+        const labels = _.split(name, '.');
+        return _.every(labels, (label) => {
+          // Bucket names must not contain uppercase characters or underscores.
+          if (label !== _.toLower(label) || label.includes('_')) {
+            errorName = 'containsUpperCase';
+            return false;
+          }
+          // Bucket labels can contain lowercase letters, numbers, and hyphens.
+          if (!/^[0-9a-z-]+$/.test(label)) {
+            errorName = 'onlyLowerCaseAndNumbers';
+            return false;
+          }
+          // Each label must start and end with a lowercase letter or a number.
+          return _.every([0, label.length - 1], (index) => {
+            errorName = 'lowerCaseOrNumber';
+            return /[a-z]/.test(label[index]) || _.isInteger(_.parseInt(label[index]));
+          });
+        });
+      });
+      if (!_.every(constraints, (func: Function) => func(control.value))) {
+        return observableOf(
+          (() => {
+            switch (errorName) {
+              case 'onlyLowerCaseAndNumbers':
+                return { onlyLowerCaseAndNumbers: true };
+              case 'shouldBeInRange':
+                return { shouldBeInRange: true };
+              case 'ipAddress':
+                return { ipAddress: true };
+              case 'containsUpperCase':
+                return { containsUpperCase: true };
+              case 'lowerCaseOrNumber':
+                return { lowerCaseOrNumber: true };
+              default:
+                return { bucketNameInvalid: true };
+            }
+          })()
+        );
+      }
+
+      return observableOf(null);
+    };
+  }
+
+  static bucketExistence(
+    requiredExistenceResult: boolean,
+    rgwBucketService: RgwBucketService
+  ): AsyncValidatorFn {
+    return (control: AbstractControl): Observable<ValidationErrors | null> => {
+      if (control.pristine || !control.value) {
+        return observableOf({ required: true });
+      }
+      return observableTimer(DUE_TIMER).pipe(
+        switchMapTo(rgwBucketService.exists(control.value)),
+        map((existenceResult: boolean) =>
+          existenceResult === requiredExistenceResult ? null : { bucketNameNotAllowed: true }
+        )
+      );
+    };
+  }
+
+  static json(): ValidatorFn {
+    return (control: AbstractControl): Record<string, any> | null => {
+      if (!control.value) return null;
+      try {
+        JSON.parse(control.value);
+        return null;
+      } catch (e) {
+        return { invalidJson: true };
+      }
+    };
+  }
+
+  static xml(): ValidatorFn {
+    return (control: AbstractControl): Record<string, boolean> | null => {
+      if (!control.value) return null;
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(control.value, 'application/xml');
+      const errorNode = xml.querySelector('parsererror');
+      if (errorNode) {
+        return { invalidXml: true };
+      }
+      return null;
+    };
+  }
+
+  static jsonOrXml(): ValidatorFn {
+    return (control: AbstractControl): Record<string, boolean> | null => {
+      if (!control.value) return null;
+
+      if (control.value.trim().startsWith('<')) {
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(control.value, 'application/xml');
+        const errorNode = xml.querySelector('parsererror');
+        if (errorNode) {
+          return { invalidXml: true };
+        }
+        return null;
+      } else {
+        try {
+          JSON.parse(control.value);
+          return null;
+        } catch (e) {
+          return { invalidJson: true };
+        }
+      }
+    };
+  }
+
+  static oauthAddressTest(): ValidatorFn {
+    const OAUTH2_HTTPS_ADDRESS_PATTERN = /^((\d{1,3}\.){3}\d{1,3}|([a-zA-Z0-9-_]+\.)*[a-zA-Z0-9-_]+)/;
+    return (control: AbstractControl): Record<string, boolean> | null => {
+      if (!control.value) {
+        return null;
+      }
+
+      if (!control.value.includes(':')) {
+        return { invalidAddress: true };
+      }
+      const [address, port] = control.value.split(':');
+      const addressTest = OAUTH2_HTTPS_ADDRESS_PATTERN.test(address);
+      const portTest = Number(port) >= 0 && Number(port) <= 65535;
+      return { invalidAddress: !(addressTest && portTest) };
+    };
+  }
+
+  /**
+   * Validator function to validate endpoints, allowing FQDN, IPv4, and IPv6 addresses with ports.
+   * Accepts multiple endpoints separated by commas.
+   */
+  static url(control: AbstractControl): ValidationErrors | null {
+    const value = control.value;
+
+    if (_.isEmpty(value)) {
+      return null;
+    }
+
+    const urls = value.includes(',') ? value.split(',') : [value];
+
+    const invalidUrls = urls.filter(
+      (url: string) =>
+        !validator.isURL(url, {
+          require_protocol: true,
+          allow_underscores: true,
+          require_tld: false
+        }) && !validator.isIP(url)
+    );
+
+    return invalidUrls.length > 0 ? { invalidURL: true } : null;
   }
 }

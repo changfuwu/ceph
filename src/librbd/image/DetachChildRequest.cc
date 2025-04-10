@@ -3,16 +3,19 @@
 
 #include "librbd/image/DetachChildRequest.h"
 #include "common/dout.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "librbd/Operations.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/journal/DisabledPolicy.h"
 #include "librbd/trash/RemoveRequest.h"
+
+#include <shared_mutex> // for std::shared_lock
 #include <string>
 
 #define dout_subsys ceph_subsys_rbd
@@ -73,6 +76,9 @@ void DetachChildRequest<I>::clone_v2_child_detach() {
                              m_parent_spec.pool_id,
                              m_parent_spec.pool_namespace, &m_parent_io_ctx);
   if (r < 0) {
+    if (r == -ENOENT) {
+      r = 0;
+    }
     finish(r);
     return;
   }
@@ -143,7 +149,7 @@ void DetachChildRequest<I>::handle_clone_v2_get_snapshot(int r) {
     }
   }
 
-  if (r < 0) {
+  if (r < 0 && r != -ENOENT) {
     ldout(cct, 5) << "failed to retrieve snapshot: " << cpp_strerror(r)
                   << dendl;
   }
@@ -181,7 +187,6 @@ void DetachChildRequest<I>::handle_clone_v2_open_parent(int r) {
   if (r < 0) {
     ldout(cct, 5) << "failed to open parent for read/write: "
                   << cpp_strerror(r) << dendl;
-    m_parent_image_ctx->destroy();
     m_parent_image_ctx = nullptr;
     finish(0);
     return;
@@ -336,7 +341,6 @@ void DetachChildRequest<I>::handle_clone_v2_close_parent(int r) {
                   << dendl;
   }
 
-  m_parent_image_ctx->destroy();
   m_parent_image_ctx = nullptr;
   finish(0);
 }

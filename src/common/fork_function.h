@@ -10,18 +10,23 @@
 #include <ostream>
 
 #include <signal.h>
+#ifndef _WIN32
 #include <sys/wait.h>
+#endif
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <sys/types.h>
 
 #include "include/ceph_assert.h"
 #include "common/errno.h"
 
+#ifndef _WIN32
 static void _fork_function_dummy_sighandler(int sig) {}
 
 // Run a function post-fork, with a timeout.  Function can return
 // int8_t only due to unix exit code limitations.  Returns -ETIMEDOUT
 // if timeout is reached.
-
 static inline int fork_function(
   int timeout,
   std::ostream& errstr,
@@ -51,17 +56,23 @@ static inline int fork_function(
   // we are forker (first child)
 
   // close all fds
-  int maxfd = sysconf(_SC_OPEN_MAX);
-  if (maxfd == -1)
-    maxfd = 16384;
-  for (int fd = 0; fd <= maxfd; fd++) {
-    if (fd == STDIN_FILENO)
-      continue;
-    if (fd == STDOUT_FILENO)
-      continue;
-    if (fd == STDERR_FILENO)
-      continue;
-    ::close(fd);
+#if defined(__linux__) && defined(SYS_close_range)
+  if (::syscall(SYS_close_range, STDERR_FILENO + 1, ~0U, 0))
+#endif
+  {
+    // fall back to manually closing
+    int maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd == -1)
+      maxfd = 16384;
+    for (int fd = 0; fd <= maxfd; fd++) {
+      if (fd == STDIN_FILENO)
+        continue;
+      if (fd == STDOUT_FILENO)
+        continue;
+      if (fd == STDERR_FILENO)
+        continue;
+      ::close(fd);
+    }
   }
 
   sigset_t mask, oldmask;
@@ -162,3 +173,13 @@ static inline int fork_function(
 fail_exit:
   _exit(EXIT_FAILURE);
 }
+#else
+static inline int fork_function(
+  int timeout,
+  std::ostream& errstr,
+  std::function<int8_t(void)> f)
+{
+  errstr << "Forking is not available on Windows.\n";
+  return -1;
+}
+#endif

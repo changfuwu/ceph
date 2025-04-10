@@ -169,10 +169,9 @@ function TEST_mon_features() {
     MONC=127.0.0.1:7129 # git grep '\<7129\>' ; there must be only one
     CEPH_ARGS_orig=$CEPH_ARGS
     CEPH_ARGS="--fsid=$fsid --auth-supported=none "
-    CEPH_ARGS+="--mon-initial-members=a,b,c "
     CEPH_ARGS+="--mon-host=$MONA,$MONB,$MONC "
     CEPH_ARGS+="--mon-debug-no-initial-persistent-features "
-    CEPH_ARGS+="--mon-debug-no-require-pacific "
+    CEPH_ARGS+="--mon-debug-no-require-tentacle"
 
     run_mon $dir a --public-addr $MONA || return 1
     run_mon $dir b --public-addr $MONB || return 1
@@ -183,7 +182,8 @@ function TEST_mon_features() {
     jq_success "$jqinput" '.monmap.mons | length == 3' || return 1
     # quorum contains two monitors
     jq_success "$jqinput" '.quorum | length == 2' || return 1
-    # quorum's monitor features contain kraken, luminous, mimic, nautilus, octopus
+    # quorum's monitor features contain kraken, luminous, mimic, nautilus,
+    # octopus, pacific, quincy, reef
     jqfilter='.features.quorum_mon[]|select(. == "kraken")'
     jq_success "$jqinput" "$jqfilter" "kraken" || return 1
     jqfilter='.features.quorum_mon[]|select(. == "luminous")'
@@ -194,6 +194,16 @@ function TEST_mon_features() {
     jq_success "$jqinput" "$jqfilter" "nautilus" || return 1
     jqfilter='.features.quorum_mon[]|select(. == "octopus")'
     jq_success "$jqinput" "$jqfilter" "octopus" || return 1
+    jqfilter='.features.quorum_mon[]|select(. == "pacific")'
+    jq_success "$jqinput" "$jqfilter" "pacific" || return 1
+    jqfilter='.features.quorum_mon[]|select(. == "quincy")'
+    jq_success "$jqinput" "$jqfilter" "quincy" || return 1
+    jqfilter='.features.quorum_mon[]|select(. == "reef")'
+    jq_success "$jqinput" "$jqfilter" "reef" || return 1
+    jqfilter='.features.quorum_mon[]|select(. == "squid")'
+    jq_success "$jqinput" "$jqfilter" "squid" || return 1
+    jqfilter='.features.quorum_mon[]|select(. == "tentacle")'
+    jq_success "$jqinput" "$jqfilter" "tentacle" || return 1
 
     # monmap must have no persistent features set, because we
     # don't currently have a quorum made out of all the monitors
@@ -208,7 +218,7 @@ function TEST_mon_features() {
     # validate 'mon feature ls'
 
     jqinput="$(ceph mon feature ls --format=json 2>/dev/null)"
-    # k l m n o are supported
+    # k l m n o p q r are supported
     jqfilter='.all.supported[] | select(. == "kraken")'
     jq_success "$jqinput" "$jqfilter" "kraken" || return 1
     jqfilter='.all.supported[] | select(. == "luminous")'
@@ -219,6 +229,16 @@ function TEST_mon_features() {
     jq_success "$jqinput" "$jqfilter" "nautilus" || return 1
     jqfilter='.all.supported[] | select(. == "octopus")'
     jq_success "$jqinput" "$jqfilter" "octopus" || return 1
+    jqfilter='.all.supported[] | select(. == "pacific")'
+    jq_success "$jqinput" "$jqfilter" "pacific" || return 1
+    jqfilter='.all.supported[] | select(. == "quincy")'
+    jq_success "$jqinput" "$jqfilter" "quincy" || return 1
+    jqfilter='.all.supported[] | select(. == "reef")'
+    jq_success "$jqinput" "$jqfilter" "reef" || return 1
+    jqfilter='.all.supported[] | select(. == "squid")'
+    jq_success "$jqinput" "$jqfilter" "squid" || return 1
+    jqfilter='.all.supported[] | select(. == "tentacle")'
+    jq_success "$jqinput" "$jqfilter" "tentacle" || return 1
 
     # start third monitor
     run_mon $dir c --public-addr $MONC || return 1
@@ -251,7 +271,17 @@ function TEST_mon_features() {
     jq_success "$jqinput" "$jqfilter" "octopus" || return 1
     jqfilter='.monmap.features.persistent[]|select(. == "pacific")'
     jq_success "$jqinput" "$jqfilter" "pacific" || return 1
-    jqfilter='.monmap.features.persistent | length == 7'
+    jqfilter='.monmap.features.persistent[]|select(. == "elector-pinging")'
+    jq_success "$jqinput" "$jqfilter" "elector-pinging" || return 1
+    jqfilter='.monmap.features.persistent[]|select(. == "quincy")'
+    jq_success "$jqinput" "$jqfilter" "quincy" || return 1
+    jqfilter='.monmap.features.persistent[]|select(. == "reef")'
+    jq_success "$jqinput" "$jqfilter" "reef" || return 1
+    jqfilter='.monmap.features.persistent[]|select(. == "squid")'
+    jq_success "$jqinput" "$jqfilter" "squid" || return 1
+    jqfilter='.monmap.features.persistent[]|select(. == "tentacle")'
+    jq_success "$jqinput" "$jqfilter" "tentacle" || return 1
+    jqfilter='.monmap.features.persistent | length == 12'
     jq_success "$jqinput" "$jqfilter" || return 1
 
     CEPH_ARGS=$CEPH_ARGS_orig

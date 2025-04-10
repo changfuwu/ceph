@@ -3,37 +3,71 @@ import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { RouterModule, Routes } from '@angular/router';
 
-import { NgBootstrapFormValidationModule } from 'ng-bootstrap-form-validation';
-import { ButtonsModule } from 'ngx-bootstrap/buttons';
-import { BsDatepickerModule } from 'ngx-bootstrap/datepicker';
-import { PopoverModule } from 'ngx-bootstrap/popover';
-import { TabsModule } from 'ngx-bootstrap/tabs';
+import { NgbModule, NgbNavModule, NgbPopoverModule } from '@ng-bootstrap/ng-bootstrap';
+import { PipesModule } from '~/app/shared/pipes/pipes.module';
 
-import { ActionLabels, URLVerbs } from '../../shared/constants/app.constants';
-import { SharedModule } from '../../shared/shared.module';
+import { ActionLabels, URLVerbs } from '~/app/shared/constants/app.constants';
+import { SharedModule } from '~/app/shared/shared.module';
 import { LoginPasswordFormComponent } from './login-password-form/login-password-form.component';
 import { LoginComponent } from './login/login.component';
 import { RoleDetailsComponent } from './role-details/role-details.component';
 import { RoleFormComponent } from './role-form/role-form.component';
 import { RoleListComponent } from './role-list/role-list.component';
-import { SsoNotFoundComponent } from './sso/sso-not-found/sso-not-found.component';
 import { UserFormComponent } from './user-form/user-form.component';
 import { UserListComponent } from './user-list/user-list.component';
 import { UserPasswordFormComponent } from './user-password-form/user-password-form.component';
 import { UserTabsComponent } from './user-tabs/user-tabs.component';
 
+import {
+  ButtonModule,
+  CheckboxModule,
+  DatePickerModule,
+  GridModule,
+  IconModule,
+  IconService,
+  InputModule,
+  ModalModule,
+  NumberModule,
+  RadioModule,
+  SelectModule,
+  UIShellModule,
+  TimePickerModule,
+  ComboBoxModule
+} from 'carbon-components-angular';
+// Icons
+import ChevronDown from '@carbon/icons/es/chevron--down/16';
+import Close from '@carbon/icons/es/close/32';
+import AddFilled from '@carbon/icons/es/add--filled/32';
+import SubtractFilled from '@carbon/icons/es/subtract--filled/32';
+import Reset from '@carbon/icons/es/reset/32';
+import EyeIcon from '@carbon/icons/es/view/16';
 @NgModule({
   imports: [
-    ButtonsModule.forRoot(),
     CommonModule,
     FormsModule,
-    PopoverModule.forRoot(),
     ReactiveFormsModule,
     SharedModule,
-    TabsModule.forRoot(),
+    UIShellModule,
+    InputModule,
+    GridModule,
+    ButtonModule,
+    IconModule,
+    CheckboxModule,
+    RadioModule,
+    SelectModule,
+    NumberModule,
+    ModalModule,
+    DatePickerModule,
+    TimePickerModule,
+    NgbNavModule,
+    NgbPopoverModule,
+    PipesModule,
     RouterModule,
-    NgBootstrapFormValidationModule,
-    BsDatepickerModule.forRoot()
+    NgbModule,
+    IconModule,
+    GridModule,
+    InputModule,
+    ComboBoxModule
   ],
   declarations: [
     LoginComponent,
@@ -41,14 +75,17 @@ import { UserTabsComponent } from './user-tabs/user-tabs.component';
     RoleDetailsComponent,
     RoleFormComponent,
     RoleListComponent,
-    SsoNotFoundComponent,
     UserTabsComponent,
     UserListComponent,
     UserFormComponent,
     UserPasswordFormComponent
   ]
 })
-export class AuthModule {}
+export class AuthModule {
+  constructor(private iconService: IconService) {
+    this.iconService.registerAll([ChevronDown, Close, AddFilled, SubtractFilled, Reset, EyeIcon]);
+  }
+}
 
 const routes: Routes = [
   { path: '', redirectTo: 'users', pathMatch: 'full' },

@@ -6,8 +6,8 @@
 #include "common/Timer.h"
 #include "common/debug.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 #include "ImageReplayer.h"
 #include "InstanceReplayer.h"
 #include "ServiceDaemon.h"
@@ -57,9 +57,9 @@ InstanceReplayer<I>::~InstanceReplayer() {
 }
 
 template <typename I>
-bool InstanceReplayer<I>::is_blacklisted() const {
+bool InstanceReplayer<I>::is_blocklisted() const {
   std::lock_guard locker{m_lock};
-  return m_blacklisted;
+  return m_blocklisted;
 }
 
 template <typename I>
@@ -175,7 +175,7 @@ void InstanceReplayer<I>::acquire_image(InstanceWatcher<I> *instance_watcher,
     // detect if the image has been deleted while the leader was offline
     auto& image_replayer = it->second;
     image_replayer->set_finished(false);
-    image_replayer->restart();
+    image_replayer->restart(new C_TrackedOp(m_async_op_tracker, nullptr));
   }
 
   m_threads->work_queue->queue(on_finish, 0);
@@ -224,7 +224,7 @@ void InstanceReplayer<I>::remove_peer_image(const std::string &global_image_id,
     // it will eventually detect that the peer image is missing and
     // determine if a delete propagation is required.
     auto image_replayer = it->second;
-    image_replayer->restart();
+    image_replayer->restart(new C_TrackedOp(m_async_op_tracker, nullptr));
   }
   m_threads->work_queue->queue(on_finish, 0);
 }
@@ -252,31 +252,36 @@ void InstanceReplayer<I>::start()
 
   m_manual_stop = false;
 
+  auto cct = static_cast<CephContext *>(m_local_io_ctx.cct());
+  auto gather_ctx = new C_Gather(
+    cct, new C_TrackedOp(m_async_op_tracker, nullptr));
   for (auto &kv : m_image_replayers) {
     auto &image_replayer = kv.second;
-    image_replayer->start(nullptr, true);
+    image_replayer->start(gather_ctx->new_sub(), true);
   }
+
+  gather_ctx->activate();
 }
 
 template <typename I>
 void InstanceReplayer<I>::stop()
 {
-  dout(10) << dendl;
-
-  std::lock_guard locker{m_lock};
-
-  m_manual_stop = true;
-
-  for (auto &kv : m_image_replayers) {
-    auto &image_replayer = kv.second;
-    image_replayer->stop(nullptr, true);
-  }
+  stop(nullptr);
 }
 
 template <typename I>
 void InstanceReplayer<I>::stop(Context *on_finish)
 {
   dout(10) << dendl;
+
+  if (on_finish == nullptr) {
+    on_finish = new C_TrackedOp(m_async_op_tracker, on_finish);
+  } else {
+    on_finish = new LambdaContext(
+      [this, on_finish] (int r) {
+        m_async_op_tracker.wait_for_ops(on_finish);
+      });
+  }
 
   auto cct = static_cast<CephContext *>(m_local_io_ctx.cct());
   auto gather_ctx = new C_Gather(cct, on_finish);
@@ -305,7 +310,7 @@ void InstanceReplayer<I>::restart()
 
   for (auto &kv : m_image_replayers) {
     auto &image_replayer = kv.second;
-    image_replayer->restart();
+    image_replayer->restart(new C_TrackedOp(m_async_op_tracker, nullptr));
   }
 }
 
@@ -329,11 +334,13 @@ void InstanceReplayer<I>::start_image_replayer(
 
   std::string global_image_id = image_replayer->get_global_image_id();
   if (!image_replayer->is_stopped()) {
+    dout(10) << "image replayer is not stopped for global_image_id="
+             << global_image_id << dendl;
     return;
-  } else if (image_replayer->is_blacklisted()) {
-    derr << "global_image_id=" << global_image_id << ": blacklisted detected "
+  } else if (image_replayer->is_blocklisted()) {
+    derr << "global_image_id=" << global_image_id << ": blocklisted detected "
          << "during image replay" << dendl;
-    m_blacklisted = true;
+    m_blocklisted = true;
     return;
   } else if (image_replayer->is_finished()) {
     // TODO temporary until policy integrated
@@ -343,11 +350,13 @@ void InstanceReplayer<I>::start_image_replayer(
     image_replayer->destroy();
     return;
   } else if (m_manual_stop) {
+    dout(10) << "image replayer manually stopped for global_image_id="
+             << global_image_id << dendl;
     return;
   }
 
   dout(10) << "global_image_id=" << global_image_id << dendl;
-  image_replayer->start(nullptr, false);
+  image_replayer->start(new C_TrackedOp(m_async_op_tracker, nullptr), false);
 }
 
 template <typename I>
@@ -366,6 +375,7 @@ void InstanceReplayer<I>::start_image_replayers(int r) {
 
   std::lock_guard locker{m_lock};
   if (m_on_shut_down != nullptr) {
+    m_async_op_tracker.finish_op();
     return;
   }
 

@@ -9,11 +9,6 @@ install(TARGETS ceph_erasure_code_benchmark
 add_executable(ceph_erasure_code_non_regression ceph_erasure_code_non_regression.cc)
 target_link_libraries(ceph_erasure_code_non_regression ceph-common Boost::program_options global ${CMAKE_DL_LIBS})
 
-add_executable(ceph_erasure_code ceph_erasure_code.cc)
-target_link_libraries(ceph_erasure_code ceph-common Boost::program_options global ${CMAKE_DL_LIBS})
-install(TARGETS ceph_erasure_code
-  DESTINATION bin)
-
 add_library(ec_example SHARED 
   ErasureCodePluginExample.cc
   $<TARGET_OBJECTS:erasure_code_objs>)
@@ -67,6 +62,25 @@ target_link_libraries(unittest_erasure_code
   ceph-common
   )
 
+if(WITH_EC_ISA_PLUGIN)
+# unittest_erasure_code_plugins
+add_executable(unittest_erasure_code_plugins
+  TestErasureCodePlugins.cc
+  $<TARGET_OBJECTS:unit-main>
+  )
+add_ceph_unittest(unittest_erasure_code_plugins)
+add_dependencies(unittest_erasure_code_plugins
+  ec_jerasure
+  ec_isa
+  ec_lrc
+  ec_shec
+  ec_clay)
+target_link_libraries(unittest_erasure_code_plugins
+  global
+  ${CMAKE_DL_LIBS}
+  ceph-common)
+endif(WITH_EC_ISA_PLUGIN)
+  
 # unittest_erasure_code_plugin_jerasure
 add_executable(unittest_erasure_code_plugin_jerasure
   TestErasureCodePluginJerasure.cc
@@ -79,7 +93,7 @@ target_link_libraries(unittest_erasure_code_plugin_jerasure
 add_dependencies(unittest_erasure_code_plugin_jerasure
   ec_jerasure)
 
-if(HAVE_BETTER_YASM_ELF64 OR HAVE_ARMV8_SIMD)
+if(WITH_EC_ISA_PLUGIN)
 
 #unittest_erasure_code_isa
 add_executable(unittest_erasure_code_isa
@@ -110,7 +124,7 @@ target_link_libraries(unittest_erasure_code_plugin_isa
   )
 add_dependencies(unittest_erasure_code_plugin_isa
   ec_isa)
-endif(HAVE_BETTER_YASM_ELF64 OR HAVE_ARMV8_SIMD)
+endif(WITH_EC_ISA_PLUGIN)
 
 # unittest_erasure_code_lrc
 add_executable(unittest_erasure_code_lrc
@@ -201,7 +215,7 @@ target_link_libraries(unittest_erasure_code_shec
 add_executable(unittest_erasure_code_shec_all
   TestErasureCodeShec_all.cc
   )
-add_ceph_unittest(unittest_erasure_code_shec_all parallel)
+add_ceph_unittest(unittest_erasure_code_shec_all PARALLEL)
 target_link_libraries(unittest_erasure_code_shec_all
   global
   ${CMAKE_DL_LIBS}

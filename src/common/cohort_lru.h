@@ -13,8 +13,26 @@
 #ifndef COHORT_LRU_H
 #define COHORT_LRU_H
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/slist.hpp>
+#include <cstdint>
+#include <atomic>
+#include <mutex>
+#include <algorithm>
+#include <functional>
+#include <vector>
+
+#ifdef __CEPH__
+# include "include/ceph_assert.h"
+#else
+# include <assert.h>
+#endif
 
 #include "common/likely.h"
 
@@ -41,6 +59,8 @@ namespace cohort {
     };
 
     typedef bi::link_mode<bi::safe_link> link_mode;
+
+    class ObjectFactory; // Forward declaration
 
     class Object
     {
@@ -70,7 +90,7 @@ namespace cohort {
 
       uint32_t get_refcnt() const { return lru_refcnt; }
 
-      virtual bool reclaim() = 0;
+      virtual bool reclaim(const ObjectFactory* newobj_fac) = 0;
 
       virtual ~Object() {}
 
@@ -132,20 +152,20 @@ namespace cohort {
 		(!(o->lru_flags & FLAG_EVICTING)));
       }
 
-      Object* evict_block() {
+      Object* evict_block(const ObjectFactory* newobj_fac) {
 	uint32_t lane_ix = next_evict_lane();
 	for (int ix = 0; ix < n_lanes; ++ix,
 	       lane_ix = next_evict_lane()) {
 	  Lane& lane = qlane[lane_ix];
-	  lane.lock.lock();
+	  std::unique_lock lane_lock{lane.lock};
 	  /* if object at LRU has refcnt==1, it may be reclaimable */
 	  Object* o = &(lane.q.back());
 	  if (can_reclaim(o)) {
 	    ++(o->lru_refcnt);
 	    o->lru_flags |= FLAG_EVICTING;
-	    lane.lock.unlock();
-	    if (o->reclaim()) {
-	      lane.lock.lock();
+	    lane_lock.unlock();
+	    if (o->reclaim(newobj_fac)) {
+	      lane_lock.lock();
 	      --(o->lru_refcnt);
 	      /* assertions that o state has not changed across
 	       * relock */
@@ -154,16 +174,13 @@ namespace cohort {
 	      Object::Queue::iterator it =
 		Object::Queue::s_iterator_to(*o);
 	      lane.q.erase(it);
-	      lane.lock.unlock();
 	      return o;
 	    } else {
-	      // XXX can't make unreachable (means what?)
 	      --(o->lru_refcnt);
 	      o->lru_flags &= ~FLAG_EVICTING;
 	      /* unlock in next block */
 	    }
 	  } /* can_reclaim(o) */
-	  lane.lock.unlock();
 	} /* each lane */
 	return nullptr;
       } /* evict_block */
@@ -236,7 +253,7 @@ namespace cohort {
       Object* insert(ObjectFactory* fac, Edge edge, uint32_t& flags) {
 	/* use supplied functor to re-use an evicted object, or
 	 * allocate a new one of the descendant type */
-	Object* o = evict_block();
+	Object* o = evict_block(fac);
 	if (o) {
 	  fac->recycle(o); /* recycle existing object */
 	  flags |= FLAG_RECYCLE;
@@ -425,7 +442,9 @@ namespace cohort {
 	  lat.lock->unlock();
 	return v;
       } /* find_latch */
-
+      bool is_same_partition(uint64_t lhs, uint64_t rhs) {
+        return ((lhs % n_part) == (rhs % n_part));
+      }
       void insert_latched(T* v, Latch& lat, uint32_t flags) {
 	(void) lat.p->tr.insert_unique_commit(*v, lat.commit_data);
 	if (flags & FLAG_UNLOCK)

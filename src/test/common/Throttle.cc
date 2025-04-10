@@ -23,6 +23,7 @@
 #include <signal.h>
 
 #include <chrono>
+#include <iostream> // for std::cout
 #include <list>
 #include <mutex>
 #include <random>
@@ -32,6 +33,8 @@
 #include "common/Thread.h"
 #include "common/Throttle.h"
 #include "common/ceph_argparse.h"
+
+using namespace std;
 
 class ThrottleTest : public ::testing::Test {
 protected:

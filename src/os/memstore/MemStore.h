@@ -16,13 +16,15 @@
 #ifndef CEPH_MEMSTORE_H
 #define CEPH_MEMSTORE_H
 
+#include <atomic>
 #include <mutex>
+#include <shared_mutex> // for std::shared_lock
+#include <unordered_map>
+
 #include <boost/intrusive_ptr.hpp>
 
-#include "include/unordered_map.h"
 #include "common/Finisher.h"
 #include "common/RefCountedObj.h"
-#include "common/RWLock.h"
 #include "os/ObjectStore.h"
 #include "PageSet.h"
 #include "include/ceph_assert.h"
@@ -31,8 +33,8 @@ class MemStore : public ObjectStore {
 public:
   struct Object : public RefCountedObject {
     ceph::mutex xattr_mutex{ceph::make_mutex("MemStore::Object::xattr_mutex")};
-    ceph::mutex omap_mutex{ceph::make_mutex("MemStore::Object::omap_mutex")};
-    std::map<std::string,ceph::buffer::ptr> xattr;
+    ceph::shared_mutex omap_mutex{ceph::make_shared_mutex("MemStore::Object::omap_mutex")};
+    std::map<std::string,ceph::buffer::ptr,std::less<>> xattr;
     ceph::buffer::list omap_header;
     std::map<std::string,ceph::buffer::list> omap;
 
@@ -93,7 +95,7 @@ public:
     int bits = 0;
     CephContext *cct;
     bool use_page_set;
-    ceph::unordered_map<ghobject_t, ObjectRef> object_hash;  ///< for lookup
+    std::unordered_map<ghobject_t, ObjectRef> object_hash;  ///< for lookup
     std::map<ghobject_t, ObjectRef> object_map;        ///< for iteration
     std::map<std::string,ceph::buffer::ptr> xattr;
     /// for object_{map,hash}
@@ -183,10 +185,7 @@ public:
   typedef Collection::Ref CollectionRef;
 
 private:
-  class OmapIteratorImpl;
-
-
-  ceph::unordered_map<coll_t, CollectionRef> coll_map;
+  std::unordered_map<coll_t, CollectionRef> coll_map;
   /// rwlock to protect coll_map
   ceph::shared_mutex coll_lock{
     ceph::make_shared_mutex("MemStore::coll_lock")};
@@ -196,7 +195,7 @@ private:
 
   Finisher finisher;
 
-  uint64_t used_bytes;
+  std::atomic<uint64_t> used_bytes;
 
   void _do_transaction(Transaction& t);
 
@@ -310,7 +309,7 @@ public:
   int getattr(CollectionHandle &c, const ghobject_t& oid, const char *name,
 	      ceph::buffer::ptr& value) override;
   int getattrs(CollectionHandle &c, const ghobject_t& oid,
-	       std::map<std::string,ceph::buffer::ptr>& aset) override;
+	       std::map<std::string,ceph::buffer::ptr,std::less<>>& aset) override;
 
   int list_collections(std::vector<coll_t>& ls) override;
 
@@ -373,11 +372,12 @@ public:
     std::set<std::string> *out         ///< [out] Subset of keys defined on oid
     ) override;
 
-  using ObjectStore::get_omap_iterator;
-  ObjectMap::ObjectMapIterator get_omap_iterator(
-    CollectionHandle& c,              ///< [in] collection
-    const ghobject_t &oid  ///< [in] object
-    ) override;
+  int omap_iterate(
+    CollectionHandle &c,   ///< [in] collection
+    const ghobject_t &oid, ///< [in] object
+    omap_iter_seek_t start_from, ///< [in] where the iterator should point to at the beginning
+    std::function<omap_iter_ret_t(std::string_view, std::string_view)> f
+  ) override;
 
   void set_fsid(uuid_d u) override;
   uuid_d get_fsid() override;
@@ -387,7 +387,8 @@ public:
   }
 
   objectstore_perf_stat_t get_cur_stats() override;
-
+  void refresh_perf_counters() override {
+  }
   const PerfCounters* get_perf_counters() const override {
     return nullptr;
   }

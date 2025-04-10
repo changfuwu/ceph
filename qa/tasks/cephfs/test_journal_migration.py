@@ -32,7 +32,7 @@ class TestJournalMigration(CephFSTestCase):
         self.assertTrue(self.fs.get_replay(status=status) is not None)
 
         # Do some client work so that the log is populated with something.
-        with self.mount_a.mounted():
+        with self.mount_a.mounted_wait():
             self.mount_a.create_files()
             self.mount_a.check_files()  # sanity, this should always pass
 
@@ -56,7 +56,7 @@ class TestJournalMigration(CephFSTestCase):
 
         # Check that files created in the initial client workload are still visible
         # in a client mount.
-        with self.mount_a.mounted():
+        with self.mount_a.mounted_wait():
             self.mount_a.check_files()
 
         # Verify that the journal really has been rewritten.
@@ -67,6 +67,7 @@ class TestJournalMigration(CephFSTestCase):
             ))
 
         # Verify that cephfs-journal-tool can now read the rewritten journal
+        self.fs.fail()
         inspect_out = self.fs.journal_tool(["journal", "inspect"], 0)
         if not inspect_out.endswith(": OK"):
             raise RuntimeError("Unexpected journal-tool result: '{0}'".format(
@@ -84,9 +85,11 @@ class TestJournalMigration(CephFSTestCase):
         if event_count < 1000:
             # Approximate value of "lots", expected from having run fsstress
             raise RuntimeError("Unexpectedly few journal events: {0}".format(event_count))
+        self.fs.set_joinable()
+        self.fs.wait_for_daemons()
 
         # Do some client work to check that writing the log is still working
-        with self.mount_a.mounted():
+        with self.mount_a.mounted_wait():
             workunit(self.ctx, {
                 'clients': {
                     "client.{0}".format(self.mount_a.client_id): ["fs/misc/trivial_sync.sh"],

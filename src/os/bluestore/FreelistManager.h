@@ -12,9 +12,10 @@
 #include "bluestore_types.h"
 
 class FreelistManager {
+  bool         null_manager = false;
 public:
   CephContext* cct;
-  FreelistManager(CephContext* cct) : cct(cct) {}
+  explicit FreelistManager(CephContext* cct) : cct(cct) {}
   virtual ~FreelistManager() {}
 
   static FreelistManager *create(
@@ -22,14 +23,13 @@ public:
     std::string type,
     std::string prefix);
 
-  static void setup_merge_operators(KeyValueDB *db);
+  static void setup_merge_operators(KeyValueDB *db, const std::string &type);
 
   virtual int create(uint64_t size, uint64_t granularity,
 		     KeyValueDB::Transaction txn) = 0;
 
-  virtual int init(const bluestore_bdev_label_t& l,
-    KeyValueDB *kvdb,
-    bool db_in_read_only) = 0;
+  virtual int init(KeyValueDB *kvdb, bool db_in_read_only,
+    std::function<int(const std::string&, std::string*)> cfg_reader) = 0;
   virtual void sync(KeyValueDB* kvdb) = 0;
   virtual void shutdown() = 0;
 
@@ -50,7 +50,16 @@ public:
   virtual uint64_t get_alloc_size() const = 0;
 
   virtual void get_meta(uint64_t target_size,
-    std::vector<std::pair<string, string>>*) const = 0;
+  std::vector<std::pair<std::string, std::string>>*) const = 0;
+
+  virtual bool validate(uint64_t min_alloc_size) const = 0;
+
+  void set_null_manager() {
+    null_manager = true;
+  }
+  bool is_null_manager() const {
+    return null_manager;
+  }
 };
 
 

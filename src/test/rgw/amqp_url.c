@@ -40,7 +40,11 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#include "amqp.h"
+#if __has_include(<rabbitmq-c/amqp.h>)
+#include <rabbitmq-c/amqp.h>
+#else
+#include <amqp.h>
+#endif
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -118,6 +122,8 @@ int amqp_parse_url(char *url, struct amqp_connection_info *parsed) {
 
   amqp_default_connection_info(parsed);
 
+  parsed->port = 5672;
+  parsed->ssl = 0;
   /* check the prefix */
   if (!strncmp(url, "amqp://", 7)) {
     /* do nothing */

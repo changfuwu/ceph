@@ -24,20 +24,20 @@
 
 
 #include <iosfwd>
+#include <list>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "buffer.h"
 #include "encoding.h"
-#include "include/types.h"
-#include "include/fs_types.h"
+#include "include/fs_types.h" // for inodeno_t
 
 #include "common/Formatter.h"
 
 
 class filepath {
-  inodeno_t ino;   // base inode.  ino=0 implies pure relative path.
+  inodeno_t ino = 0;   // base inode.  ino=0 implies pure relative path.
   std::string path;     // relative path.
 
   /** bits - path segments
@@ -46,7 +46,7 @@ class filepath {
    * NOTE: this value is LAZILY maintained... i.e. it's a cache
    */
   mutable std::vector<std::string> bits;
-  bool encoded;
+  bool encoded = false;
 
   void rebuild_path() {
     path.clear();
@@ -72,35 +72,33 @@ class filepath {
   }
 
  public:
-  filepath() : ino(0), encoded(false) { }
-  filepath(std::string_view s, inodeno_t i) : ino(i), path(s), encoded(false) { }
-  filepath(const std::string& s, inodeno_t i) : ino(i), path(s), encoded(false) { }
-  filepath(const char* s, inodeno_t i) : ino(i), path(s), encoded(false) { }
+  filepath() = default;
+  filepath(std::string_view p, inodeno_t i) : ino(i), path(p) {}
   filepath(const filepath& o) {
     ino = o.ino;
     path = o.path;
     bits = o.bits;
     encoded = o.encoded;
   }
-  filepath(inodeno_t i) : ino(i), encoded(false) { }
+  filepath(inodeno_t i) : ino(i) {}
+  filepath& operator=(const char* path) {
+    set_path(path);
+    return *this;
+  }
 
   /*
    * if we are fed a relative path as a string, either set ino=0 (strictly
    * relative) or 1 (absolute).  throw out any leading '/'.
    */
-  filepath(std::string_view s) : encoded(false) {
-    set_path(s);
-  }
-  filepath(const char *s) : encoded(false) {
-    set_path(std::string_view(s));
-  }
+  filepath(std::string_view s) { set_path(s); }
+  filepath(const char* s) { set_path(s); }
 
   void set_path(std::string_view s, inodeno_t b) {
     path = s;
     ino = b;
   }
   void set_path(std::string_view s) {
-    if (s[0] == '/') {
+    if (!s.empty() && s[0] == '/') {
       path = s.substr(1);
       ino = 1;
     } else {
@@ -130,6 +128,24 @@ class filepath {
   const std::string& operator[](int i) const {
     if (bits.empty() && path.length() > 0) parse_bits();
     return bits[i];
+  }
+
+  auto begin() const {
+    if (bits.empty() && path.length() > 0) parse_bits();
+    return std::as_const(bits).begin();
+  }
+  auto rbegin() const {
+    if (bits.empty() && path.length() > 0) parse_bits();
+    return std::as_const(bits).rbegin();
+  }
+
+  auto end() const {
+    if (bits.empty() && path.length() > 0) parse_bits();
+    return std::as_const(bits).end();
+  }
+  auto rend() const {
+    if (bits.empty() && path.length() > 0) parse_bits();
+    return std::as_const(bits).rend();
   }
 
   const std::string& last_dentry() const {

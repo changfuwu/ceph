@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "include/types.h"
@@ -17,6 +17,8 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+
+using namespace std;
 
 class TestClsQueue : public ::testing::Test {
 protected:
@@ -83,7 +85,7 @@ TEST_F(TestClsQueue, Enqueue)
   ASSERT_EQ(0, ioctx.operate(queue_name, &op));
 
   // test multiple enqueues
-  // 10 iterations, 100 elelemts each
+  // 10 iterations, 100 elements each
   // expect 0 (OK)
   test_enqueue(queue_name, 10, 100, 0);
 }
@@ -97,10 +99,10 @@ TEST_F(TestClsQueue, QueueFull)
   cls_queue_init(op, queue_name, queue_size);
   ASSERT_EQ(0, ioctx.operate(queue_name, &op));
 
-  // 8 iterations, 5 elelemts each
+  // 8 iterations, 5 elements each
   // expect 0 (OK)
   test_enqueue(queue_name, 8, 5, 0);
-  // 2 iterations, 5 elelemts each
+  // 2 iterations, 5 elements each
   // expect -28 (Q FULL)
   test_enqueue(queue_name, 2, 5, -28);
 }
@@ -135,6 +137,51 @@ TEST_F(TestClsQueue, List)
   ASSERT_EQ(total_elements, number_of_ops*number_of_elements);
 }
 
+TEST_F(TestClsQueue, ListByEndMarker)
+{
+  const std::string queue_name = "my-queue";
+  const uint64_t queue_size = 1024*1024;
+  librados::ObjectWriteOperation op;
+  op.create(true);
+  cls_queue_init(op, queue_name, queue_size);
+  ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+  const auto number_of_ops = 10;
+  const auto number_of_elements = 100;
+
+  // test multiple enqueues
+  test_enqueue(queue_name, number_of_ops, number_of_elements, 0);
+
+  const auto max_elements = 42;
+  std::string marker, end_marker;
+  bool truncated = false;
+  std::string max_op_next_marker;
+  auto total_elements = 0;
+  do {
+    std::vector<cls_queue_entry> entries;
+    auto ret = cls_queue_list_entries(ioctx, queue_name, marker, max_elements, entries, &truncated, max_op_next_marker);
+    ASSERT_EQ(0, ret);
+    end_marker = max_op_next_marker;
+
+    std::vector<cls_queue_entry> end_marker_entries;
+    std::string end_marker_next_marker;
+    bool end_marker_truncated = false;
+    ret = cls_queue_list_entries(ioctx, queue_name, marker, end_marker, end_marker_entries,
+                                 &end_marker_truncated, end_marker_next_marker);
+    ASSERT_EQ(0, ret);
+
+    ASSERT_EQ(end_marker_next_marker, end_marker);
+    ASSERT_EQ(end_marker_entries.size(), entries.size());
+    for (auto i = 0U; i < end_marker_entries.size() && i < entries.size(); ++i) {
+      ASSERT_EQ(end_marker_entries[i].marker, entries[i].marker);
+    }
+
+    marker = max_op_next_marker;
+    total_elements += entries.size();
+  } while (truncated);
+
+  ASSERT_EQ(total_elements, number_of_ops*number_of_elements);
+}
+
 TEST_F(TestClsQueue, Dequeue)
 {
   const std::string queue_name = "my-queue";
@@ -159,6 +206,50 @@ TEST_F(TestClsQueue, Dequeue)
   // remove up to end marker
   cls_queue_remove_entries(op, end_marker); 
   ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+}
+
+TEST_F(TestClsQueue, DequeueMarker)
+{
+  const std::string queue_name = "my-queue";
+  const uint64_t queue_size = 1024*1024;
+  librados::ObjectWriteOperation op;
+  op.create(true);
+  cls_queue_init(op, queue_name, queue_size);
+  ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+
+  // test multiple enqueues
+  test_enqueue(queue_name, 10, 1000, 0);
+
+  const auto remove_elements = 1024;
+  const std::string marker;
+  bool truncated;
+  std::string end_marker;
+  std::vector<cls_queue_entry> entries;
+  auto ret = cls_queue_list_entries(ioctx, queue_name, marker, remove_elements, entries, &truncated, end_marker);
+  ASSERT_EQ(0, ret);
+  ASSERT_EQ(truncated, true);
+  cls_queue_marker after_deleted_marker;
+  // remove specific markers
+  for (const auto& entry : entries) {
+    cls_queue_marker marker;
+    marker.from_str(entry.marker.c_str());
+    ASSERT_EQ(marker.from_str(entry.marker.c_str()), 0);
+    if (marker.offset > 0 && marker.offset % 2 == 0) {
+      after_deleted_marker = marker;
+      cls_queue_remove_entries(op, marker.to_str());
+    }
+  }
+  ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+  entries.clear();
+  ret = cls_queue_list_entries(ioctx, queue_name, marker, remove_elements, entries, &truncated, end_marker);
+  ASSERT_EQ(0, ret);
+  for (const auto& entry : entries) {
+    cls_queue_marker marker;
+    marker.from_str(entry.marker.c_str());
+    ASSERT_EQ(marker.from_str(entry.marker.c_str()), 0);
+    ASSERT_GE(marker.gen, after_deleted_marker.gen);    
+    ASSERT_GE(marker.offset, after_deleted_marker.offset);    
+  }
 }
 
 TEST_F(TestClsQueue, ListEmpty)
@@ -197,7 +288,7 @@ TEST_F(TestClsQueue, DequeueEmpty)
   std::vector<cls_queue_entry> entries;
   const auto ret = cls_queue_list_entries(ioctx, queue_name, marker, max_elements, entries, &truncated, end_marker);
   ASSERT_EQ(0, ret);
-  cls_queue_remove_entries(op, end_marker); 
+  cls_queue_remove_entries(op, end_marker);
   ASSERT_EQ(0, ioctx.operate(queue_name, &op));
 }
 
@@ -243,7 +334,7 @@ TEST_F(TestClsQueue, DeleteAll)
   std::vector<cls_queue_entry> entries;
   auto ret = cls_queue_list_entries(ioctx, queue_name, marker, total_elements, entries, &truncated, end_marker);
   ASSERT_EQ(0, ret);
-  cls_queue_remove_entries(op, end_marker); 
+  cls_queue_remove_entries(op, end_marker);
   ASSERT_EQ(0, ioctx.operate(queue_name, &op));
   // list again to make sure that queue is empty
   ret = cls_queue_list_entries(ioctx, queue_name, marker, 10, entries, &truncated, end_marker);
@@ -282,7 +373,7 @@ TEST_F(TestClsQueue, EnqueueDequeue)
             const auto ret = cls_queue_list_entries(ioctx, queue_name, marker, max_elements, entries, &truncated, end_marker);
             ASSERT_EQ(0, ret);
             consume_count += entries.size();
-            cls_queue_remove_entries(op, end_marker); 
+            cls_queue_remove_entries(op, end_marker);
             ASSERT_EQ(0, ioctx.operate(queue_name, &op));
           }
        });
@@ -341,7 +432,7 @@ TEST_F(TestClsQueue, QueueFullDequeue)
             auto ret = cls_queue_list_entries(ioctx, queue_name, marker, max_elements, entries, &truncated, end_marker);
             ASSERT_EQ(0, ret);
             consume_count += entries.size();
-            cls_queue_remove_entries(op, end_marker); 
+            cls_queue_remove_entries(op, end_marker);
             ASSERT_EQ(0, ioctx.operate(queue_name, &op));
           }
        });
@@ -367,10 +458,10 @@ TEST_F(TestClsQueue, MultiProducer)
 
   std::vector<std::thread> producers(max_producer_count);
   for (auto& p : producers) {
-    p = std::move(std::thread([this, &queue_name, &producer_count] {
-                test_enqueue(queue_name, number_of_ops, number_of_elements, 0);
-                --producer_count;
-    }));
+    p = std::thread([this, &queue_name, &producer_count] {
+		      test_enqueue(queue_name, number_of_ops, number_of_elements, 0);
+		      --producer_count;
+		    });
   }
 
   auto consume_count = 0U;
@@ -385,7 +476,7 @@ TEST_F(TestClsQueue, MultiProducer)
             const auto ret = cls_queue_list_entries(ioctx, queue_name, marker, max_elements, entries, &truncated, end_marker);
             ASSERT_EQ(0, ret);
             consume_count += entries.size();
-            cls_queue_remove_entries(op, end_marker); 
+            cls_queue_remove_entries(op, end_marker);
             ASSERT_EQ(0, ioctx.operate(queue_name, &op));
           }
        });
@@ -432,7 +523,7 @@ TEST_F(TestClsQueue, MultiConsumer)
             const auto ret = cls_queue_list_entries(ioctx, queue_name, marker, max_elements, entries, &truncated, end_marker);
             ASSERT_EQ(0, ret);
             consume_count += entries.size();
-            cls_queue_remove_entries(op, end_marker); 
+            cls_queue_remove_entries(op, end_marker);
             ASSERT_EQ(0, ioctx.operate(queue_name, &op));
           }
     });
@@ -475,7 +566,7 @@ TEST_F(TestClsQueue, NoLockMultiConsumer)
           while (!done || truncated) {
             const auto ret = cls_queue_list_entries(ioctx, queue_name, marker, max_elements, entries, &truncated, end_marker);
             ASSERT_EQ(0, ret);
-            cls_queue_remove_entries(op, end_marker); 
+            cls_queue_remove_entries(op, end_marker);
             ASSERT_EQ(0, ioctx.operate(queue_name, &op));
           }
     });
@@ -496,5 +587,66 @@ TEST_F(TestClsQueue, NoLockMultiConsumer)
   ASSERT_EQ(0, ret);
   ASSERT_EQ(entries.size(), 0);
   ASSERT_EQ(truncated, false);
+}
+
+TEST_F(TestClsQueue, WrapAround)
+{
+  const std::string queue_name = "my-queue";
+  const auto number_of_entries = 10U;
+  const auto max_entry_size = 2000;
+  const auto min_entry_size = 1000;
+  const uint64_t queue_size = number_of_entries*max_entry_size;
+  const auto entry_overhead = 10;
+  librados::ObjectWriteOperation op;
+  op.create(true);
+  cls_queue_init(op, queue_name, queue_size);
+  ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+
+  std::list<bufferlist> total_bl;
+
+  // fill up the queue
+  for (auto i = 0U; i < number_of_entries; ++i) {
+    const auto entry_size = rand()%(max_entry_size - min_entry_size + 1) + min_entry_size;
+    std::string entry_str(entry_size-entry_overhead, 0);
+    std::generate_n(entry_str.begin(), entry_str.size(), [](){return (char)(rand());});
+    bufferlist entry_bl;
+    entry_bl.append(entry_str);
+    std::vector<bufferlist> data{{entry_bl}};
+    // enqueue vector
+    cls_queue_enqueue(op, 0, data);
+    ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+    total_bl.push_back(entry_bl);
+  }
+
+  std::string marker;
+  for (auto j = 0; j < 10; ++j) {
+    // empty half+1 of the queue
+    const auto max_elements = number_of_entries/2 + 1;
+    bool truncated;
+    std::string end_marker;
+    std::vector<cls_queue_entry> entries;
+    const auto ret = cls_queue_list_entries(ioctx, queue_name, marker, max_elements, entries, &truncated, end_marker);
+    ASSERT_EQ(0, ret);
+    for (auto& entry : entries) {
+      ASSERT_EQ(entry.data, total_bl.front());
+      total_bl.pop_front();
+    }
+    marker = end_marker;
+    cls_queue_remove_entries(op, end_marker);
+    ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+   
+    // fill half+1 of the queue
+    for (auto i = 0U; i < number_of_entries/2 + 1; ++i) {
+      const auto entry_size = rand()%(max_entry_size - min_entry_size + 1) + min_entry_size;
+      std::string entry_str(entry_size-entry_overhead, 0);
+      std::generate_n(entry_str.begin(), entry_str.size(), [](){return (char)(rand());});
+      bufferlist entry_bl;
+      entry_bl.append(entry_str);
+      std::vector<bufferlist> data{{entry_bl}};
+      cls_queue_enqueue(op, 0, data);
+      ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+      total_bl.push_back(entry_bl);
+    }
+  }
 }
 

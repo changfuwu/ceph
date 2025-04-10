@@ -15,24 +15,30 @@
 #include "mds/Anchor.h"
 
 #include "common/Formatter.h"
+#include "include/denc.h"
 
 void Anchor::encode(bufferlist &bl) const
 {
-  ENCODE_START(1, 1, bl);
-  encode(ino, bl);
-  encode(dirino, bl);
+  ENCODE_START(2, 1, bl);
+  encode(std::tuple{
+    ino,
+    dirino,
+  }, bl, 0);
   encode(d_name, bl);
   encode(d_type, bl);
+  encode(frags, bl);
   ENCODE_FINISH(bl);
 }
 
 void Anchor::decode(bufferlist::const_iterator &bl)
 {
-  DECODE_START(1, bl);
+  DECODE_START(2, bl);
   decode(ino, bl);
   decode(dirino, bl);
   decode(d_name, bl);
   decode(d_type, bl);
+  if (struct_v >= 2)
+    decode(frags, bl);
   DECODE_FINISH(bl);
 }
 
@@ -54,7 +60,7 @@ void Anchor::generate_test_instances(std::list<Anchor*>& ls)
   ls.back()->d_type = DT_DIR;
 }
 
-ostream& operator<<(ostream& out, const Anchor &a)
+std::ostream& operator<<(std::ostream& out, const Anchor &a)
 {
   return out << "a(" << a.ino << " " << a.dirino << "/'" << a.d_name << "' " << a.d_type << ")";
 }

@@ -3,6 +3,7 @@ ceph manager -- Thrasher and CephManager objects
 """
 from functools import wraps
 import contextlib
+import errno
 import random
 import signal
 import time
@@ -13,25 +14,22 @@ import logging
 import threading
 import traceback
 import os
-import six
+import shlex
 
-from io import BytesIO
-from six import StringIO
+from io import BytesIO, StringIO
+from subprocess import DEVNULL
 from teuthology import misc as teuthology
 from tasks.scrub import Scrubber
-from tasks.util.rados import cmd_erasure_code_profile
+from tasks.util.rados import cmd_erasure_code_profile, cmd_ec_crush_profile
 from tasks.util import get_remote
+
 from teuthology.contextutil import safe_while
 from teuthology.orchestra.remote import Remote
 from teuthology.orchestra import run
+from teuthology.parallel import parallel
 from teuthology.exceptions import CommandFailedError
 from tasks.thrasher import Thrasher
-from six import StringIO
 
-try:
-    from subprocess import DEVNULL # py3k
-except ImportError:
-    DEVNULL = open(os.devnull, 'r+')  # type: ignore
 
 DEFAULT_CONF_PATH = '/etc/ceph/ceph.conf'
 
@@ -39,7 +37,6 @@ log = logging.getLogger(__name__)
 
 # this is for cephadm clusters
 def shell(ctx, cluster_name, remote, args, name=None, **kwargs):
-    testdir = teuthology.get_testdir(ctx)
     extra_args = []
     if name:
         extra_args = ['-n', name]
@@ -55,6 +52,20 @@ def shell(ctx, cluster_name, remote, args, name=None, **kwargs):
         ] + args,
         **kwargs
     )
+
+# this is for rook clusters
+def toolbox(ctx, cluster_name, args, **kwargs):
+    return ctx.rook[cluster_name].remote.run(
+        args=[
+            'kubectl',
+            '-n', 'rook-ceph',
+            'exec',
+            ctx.rook[cluster_name].toolbox,
+            '--',
+        ] + args,
+        **kwargs
+    )
+
 
 def write_conf(ctx, conf_path=DEFAULT_CONF_PATH, cluster='ceph'):
     conf_fp = BytesIO()
@@ -73,6 +84,65 @@ def write_conf(ctx, conf_path=DEFAULT_CONF_PATH, cluster='ceph'):
         wait=False)
     teuthology.feed_many_stdins_and_close(conf_fp, writes)
     run.wait(writes)
+
+def get_valgrind_args(testdir, name, preamble, v, exit_on_first_error=True, cd=True):
+    """
+    Build a command line for running valgrind.
+
+    testdir - test results directory
+    name - name of daemon (for naming hte log file)
+    preamble - stuff we should run before valgrind
+    v - valgrind arguments
+    """
+    if v is None:
+        return preamble
+    if not isinstance(v, list):
+        v = [v]
+
+    # https://tracker.ceph.com/issues/44362
+    preamble.extend([
+        'env', 'OPENSSL_ia32cap=~0x1000000000000000',
+    ])
+
+    val_path = '/var/log/ceph/valgrind'
+    if '--tool=memcheck' in v or '--tool=helgrind' in v:
+        extra_args = [
+            'valgrind',
+            '--trace-children=no',
+            '--child-silent-after-fork=yes',
+            '--soname-synonyms=somalloc=*tcmalloc*',
+            '--num-callers=50',
+            '--suppressions={tdir}/valgrind.supp'.format(tdir=testdir),
+            '--gen-suppressions=all',
+            '--xml=yes',
+            '--xml-file={vdir}/{n}.log'.format(vdir=val_path, n=name),
+            '--time-stamp=yes',
+            '--vgdb=yes',
+        ]
+    else:
+        extra_args = [
+            'valgrind',
+            '--trace-children=no',
+            '--child-silent-after-fork=yes',
+            '--soname-synonyms=somalloc=*tcmalloc*',
+            '--suppressions={tdir}/valgrind.supp'.format(tdir=testdir),
+            '--gen-suppressions=all',
+            '--log-file={vdir}/{n}.log'.format(vdir=val_path, n=name),
+            '--time-stamp=yes',
+            '--vgdb=yes',
+        ]
+    if exit_on_first_error:
+        extra_args.extend([
+            # at least Valgrind 3.14 is required
+            '--exit-on-first-error=yes',
+            '--error-exitcode=42',
+        ])
+    args = []
+    if cd:
+        args += ['cd', testdir, run.Raw('&&')]
+    args += preamble + extra_args + v
+    log.debug('running %s under valgrind with args %s', name, args)
+    return args
 
 
 def mount_osd_data(ctx, remote, cluster, osd):
@@ -166,6 +236,8 @@ class OSDThrasher(Thrasher):
         self.chance_thrash_pg_upmap_items = self.config.get('chance_thrash_pg_upmap', 1.0)
         self.random_eio = self.config.get('random_eio')
         self.chance_force_recovery = self.config.get('chance_force_recovery', 0.3)
+        self.chance_reset_purged_snaps_last = self.config.get('chance_reset_purged_snaps_last', 0.3)
+        self.chance_trim_stale_osdmaps = self.config.get('chance_trim_stale_osdmaps', 0.3)
 
         num_osds = self.in_osds + self.out_osds
         self.max_pgs = self.config.get("max_pgs_per_pool_osd", 1200) * len(num_osds)
@@ -216,7 +288,7 @@ class OSDThrasher(Thrasher):
         self.logger.info(msg, *args, **kwargs)
 
     def cmd_exists_on_osds(self, cmd):
-        if self.ceph_manager.cephadm:
+        if self.ceph_manager.cephadm or self.ceph_manager.rook:
             return True
         allremotes = self.ceph_manager.ctx.cluster.only(\
             teuthology.is_type('osd', self.cluster)).remotes.keys()
@@ -233,14 +305,34 @@ class OSDThrasher(Thrasher):
         if self.ceph_manager.cephadm:
             return shell(
                 self.ceph_manager.ctx, self.ceph_manager.cluster, remote,
-                args=['ceph-objectstore-tool'] + cmd,
+                args=['ceph-objectstore-tool', '--err-to-stderr'] + cmd,
                 name=osd,
                 wait=True, check_status=False,
                 stdout=StringIO(),
                 stderr=StringIO())
+        elif self.ceph_manager.rook:
+            assert False, 'not implemented'
         else:
             return remote.run(
-                args=['sudo', 'adjust-ulimits', 'ceph-objectstore-tool'] + cmd,
+                args=['sudo', 'adjust-ulimits', 'ceph-objectstore-tool', '--err-to-stderr'] + cmd,
+                wait=True, check_status=False,
+                stdout=StringIO(),
+                stderr=StringIO())
+
+    def run_ceph_bluestore_tool(self, remote, osd, cmd):
+        if self.ceph_manager.cephadm:
+            return shell(
+                self.ceph_manager.ctx, self.ceph_manager.cluster, remote,
+                args=['ceph-bluestore-tool', '--err-to-stderr'] + cmd,
+                name=osd,
+                wait=True, check_status=False,
+                stdout=StringIO(),
+                stderr=StringIO())
+        elif self.ceph_manager.rook:
+            assert False, 'not implemented'
+        else:
+            return remote.run(
+                args=['sudo', 'ceph-bluestore-tool', '--err-to-stderr'] + cmd,
                 wait=True, check_status=False,
                 stdout=StringIO(),
                 stderr=StringIO())
@@ -281,6 +373,9 @@ class OSDThrasher(Thrasher):
                 '--log-file=/var/log/ceph/objectstore_tool.$pid.log',
             ]
 
+            if self.ceph_manager.rook:
+                assert False, 'not implemented'
+
             if not self.ceph_manager.cephadm:
                 # ceph-objectstore-tool might be temporarily absent during an
                 # upgrade - see http://tracker.ceph.com/issues/18014
@@ -314,7 +409,7 @@ class OSDThrasher(Thrasher):
                                         "exp list-pgs failure with status {ret}".
                                         format(ret=proc.exitstatus))
 
-            pgs = six.ensure_str(proc.stdout.getvalue()).split('\n')[:-1]
+            pgs = proc.stdout.getvalue().split('\n')[:-1]
             if len(pgs) == 0:
                 self.log("No PGs found for osd.{osd}".format(osd=exp_osd))
                 return
@@ -379,7 +474,7 @@ class OSDThrasher(Thrasher):
                     raise Exception("ceph-objectstore-tool: "
                                     "imp list-pgs failure with status {ret}".
                                     format(ret=proc.exitstatus))
-                pgs = six.ensure_str(proc.stdout.getvalue()).split('\n')[:-1]
+                pgs = proc.stdout.getvalue().split('\n')[:-1]
                 if pg not in pgs:
                     self.log("Moving pg {pg} from osd.{fosd} to osd.{tosd}".
                              format(pg=pg, fosd=exp_osd, tosd=imp_osd))
@@ -443,27 +538,6 @@ class OSDThrasher(Thrasher):
             if imp_remote != exp_remote:
                 imp_remote.run(args=cmd)
 
-            # apply low split settings to each pool
-            if not self.ceph_manager.cephadm:
-                for pool in self.ceph_manager.list_pools():
-                    cmd = ("CEPH_ARGS='--filestore-merge-threshold 1 "
-                           "--filestore-split-multiple 1' sudo -E "
-                           + 'ceph-objectstore-tool '
-                           + ' '.join(prefix + [
-                               '--data-path', FSPATH.format(id=imp_osd),
-                               '--journal-path', JPATH.format(id=imp_osd),
-                           ])
-                           + " --op apply-layout-settings --pool " + pool).format(id=osd)
-                    proc = imp_remote.run(args=cmd,
-                                          wait=True, check_status=False,
-                                          stderr=StringIO())
-                    if 'Couldn\'t find pool' in proc.stderr.getvalue():
-                        continue
-                    if proc.exitstatus:
-                        raise Exception("ceph-objectstore-tool apply-layout-settings"
-                                        " failed with {status}".format(status=proc.exitstatus))
-
-
     def blackhole_kill_osd(self, osd=None):
         """
         If all else fails, kill the osd.
@@ -493,10 +567,49 @@ class OSDThrasher(Thrasher):
         self.live_osds.append(osd)
         if self.random_eio > 0 and osd == self.rerrosd:
             self.ceph_manager.set_config(self.rerrosd,
-                                         filestore_debug_random_read_err = self.random_eio)
-            self.ceph_manager.set_config(self.rerrosd,
                                          bluestore_debug_random_read_err = self.random_eio)
 
+    def out_host(self, host=None):
+        """
+        Make all OSDs on a host out if the host has more than min_in OSDs.
+        :param host: Host to be marked.
+        """
+        # Check that all OSD remotes have a valid console
+        osds = self.ceph_manager.ctx.cluster.only(teuthology.is_type('osd', self.ceph_manager.cluster))
+        all_hosts = list(osds.remotes.keys())
+        min_in = self.minin
+        
+        if host is not None:
+            all_hosts = [host] if host in all_hosts else []
+
+        random.shuffle(all_hosts)  # Shuffle the list to pick hosts randomly
+        
+        for host in all_hosts:
+            self.log("Checking the number of in OSDs in host %s" % (host,))
+
+            # Count the number of in OSDs in the host
+            in_host_osd_count = 0
+            for role in osds.remotes[host]:
+                if role.startswith("osd."):
+                    osdid = int(role.split('.')[1])
+                    if osdid in self.in_osds:
+                        in_host_osd_count += 1
+
+            # Check taking out that host will cause the number 
+            # of in OSDs to be less than min_in
+            if len(self.in_osds) - in_host_osd_count >= min_in:
+                self.log("Removing all OSDs in host %s" % (host,))
+                # Proceed to take out OSDs
+                for role in osds.remotes[host]:
+                    if role.startswith("osd."):
+                        osdid = int(role.split('.')[1])
+                        if osdid in self.in_osds:
+                            self.out_osd(osdid)
+                return
+            else:
+                self.log("Host %s can't be trashed as it will left %d OSDs in" % (host, len(self.in_osds) - in_host_osd_count))
+
+        self.log("No suitable host found to thrash")
 
     def out_osd(self, osd=None):
         """
@@ -556,6 +669,7 @@ class OSDThrasher(Thrasher):
                     options['max_change'])
 
     def primary_affinity(self, osd=None):
+        self.log("primary_affinity")
         if osd is None:
             osd = random.choice(self.in_osds)
         if random.random() >= .5:
@@ -582,6 +696,7 @@ class OSDThrasher(Thrasher):
         """
         Install or remove random pg_upmap entries in OSDMap
         """
+        self.log("thrash_pg_upmap")
         from random import shuffle
         out = self.ceph_manager.raw_cluster_cmd('osd', 'dump', '-f', 'json-pretty')
         j = json.loads(out)
@@ -590,12 +705,14 @@ class OSDThrasher(Thrasher):
             if random.random() >= .3:
                 pgs = self.ceph_manager.get_pg_stats()
                 if not pgs:
+                    self.log('No pgs; doing nothing')
                     return
                 pg = random.choice(pgs)
                 pgid = str(pg['pgid'])
                 poolid = int(pgid.split('.')[0])
                 sizes = [x['size'] for x in j['pools'] if x['pool'] == poolid]
                 if len(sizes) == 0:
+                    self.log('No pools; doing nothing')
                     return
                 n = sizes[0]
                 osds = self.in_osds + self.out_osds
@@ -624,6 +741,7 @@ class OSDThrasher(Thrasher):
         """
         Install or remove random pg_upmap_items entries in OSDMap
         """
+        self.log("thrash_pg_upmap_items")
         from random import shuffle
         out = self.ceph_manager.raw_cluster_cmd('osd', 'dump', '-f', 'json-pretty')
         j = json.loads(out)
@@ -632,12 +750,14 @@ class OSDThrasher(Thrasher):
             if random.random() >= .3:
                 pgs = self.ceph_manager.get_pg_stats()
                 if not pgs:
+                    self.log('No pgs; doing nothing')
                     return
                 pg = random.choice(pgs)
                 pgid = str(pg['pgid'])
                 poolid = int(pgid.split('.')[0])
                 sizes = [x['size'] for x in j['pools'] if x['pool'] == poolid]
                 if len(sizes) == 0:
+                    self.log('No pools; doing nothing')
                     return
                 n = sizes[0]
                 osds = self.in_osds + self.out_osds
@@ -702,6 +822,32 @@ class OSDThrasher(Thrasher):
         else:
            self.cancel_force_recovery()
 
+    def reset_purged_snaps_last(self):
+        """
+        Run reset_purged_snaps_last
+        """
+        self.log('reset_purged_snaps_last')
+        for osd in self.in_osds:
+            try:
+               self.ceph_manager.raw_cluster_cmd(
+               'tell', "osd.%s" % (str(osd)),
+               'reset_purged_snaps_last')
+            except CommandFailedError:
+                self.log('Failed to reset_purged_snaps_last, ignoring')
+
+    def trim_stale_osdmaps(self):
+       """
+       Trim stale osdmaps
+       """
+       self.log('trim_stale_osdmaps')
+       for osd in self.in_osds:
+           try:
+               self.ceph_manager.raw_cluster_cmd(
+               'tell', "osd.%s" % (str(osd)),
+               'trim stale osdmaps')
+           except CommandFailedError:
+               self.log('Failed to trim stale osdmaps, ignoring')
+
     def all_up(self):
         """
         Make sure all osds are up and not out.
@@ -724,11 +870,16 @@ class OSDThrasher(Thrasher):
             self.ceph_manager.raw_cluster_cmd('osd', 'primary-affinity',
                                               str(osd), str(1))
 
-    def do_join(self):
+    def stop(self):
+        """
+        Stop the thrasher
+        """
+        self.stopping = True
+
+    def join(self):
         """
         Break out of this Ceph loop
         """
-        self.stopping = True
         self.thread.get()
         if self.sighup_delay:
             self.log("joining the do_sighup greenlet")
@@ -742,6 +893,13 @@ class OSDThrasher(Thrasher):
         if self.noscrub_toggle_delay:
             self.log("joining the do_noscrub_toggle greenlet")
             self.noscrub_toggle_thread.join()
+
+    def stop_and_join(self):
+        """
+        Stop and join the thrasher
+        """
+        self.stop()
+        return self.join()
 
     def grow_pool(self):
         """
@@ -786,122 +944,130 @@ class OSDThrasher(Thrasher):
         if self.ceph_manager.set_pool_pgpnum(pool, force):
             self.pools_to_fix_pgp_num.discard(pool)
 
+    def get_rand_pg_acting_set(self, pool_id=None):
+        """
+        Return an acting set of a random PG, you
+        have the option to specify which pool you
+        want the PG from.
+        """
+        pgs = self.ceph_manager.get_pg_stats()
+        if not pgs:
+            self.log('No pgs; doing nothing')
+            return
+        if pool_id:
+           pgs_in_pool = [pg for pg in pgs if int(pg['pgid'].split('.')[0]) == pool_id]
+           pg = random.choice(pgs_in_pool)
+        else:
+            pg = random.choice(pgs)
+        self.log('Choosing PG {id} with acting set {act}'.format(id=pg['pgid'],act=pg['acting']))
+        return pg['acting']
+
+    def get_k_m_ec_pool(self, pool, pool_json):
+        """
+        Returns k and m
+        """
+        k = 0
+        m = 99
+        try:
+            ec_profile = self.ceph_manager.get_pool_property(pool, 'erasure_code_profile')
+            ec_profile = pool_json['erasure_code_profile']
+            ec_profile_json = self.ceph_manager.raw_cluster_cmd(
+                'osd',
+                'erasure-code-profile',
+                'get',
+                ec_profile,
+                '--format=json')
+            ec_json = json.loads(ec_profile_json)
+            local_k = int(ec_json['k'])
+            local_m = int(ec_json['m'])
+            self.log("pool {pool} local_k={k} local_m={m}".format(pool=pool,
+                                                                  k=local_k, m=local_m))
+            if local_k > k:
+                self.log("setting k={local_k} from previous {k}".format(local_k=local_k, k=k))
+                k = local_k
+            if local_m < m:
+                self.log("setting m={local_m} from previous {m}".format(local_m=local_m, m=m))
+                m = local_m
+        except CommandFailedError:
+            self.log("failed to read erasure_code_profile. %s was likely removed", pool)
+            return None, None
+
+        return k, m
+
     def test_pool_min_size(self):
         """
-        Loop to selectively push PGs below their min_size and test that recovery
-        still occurs.
+        Loop to selectively push PGs to their min_size and test that recovery
+        still occurs. We achieve this by randomly picking a PG and fail the OSDs
+        according to the PG's acting set.
         """
         self.log("test_pool_min_size")
         self.all_up()
+        time.sleep(60) # buffer time for recovery to start.
         self.ceph_manager.wait_for_recovery(
             timeout=self.config.get('timeout')
             )
-
-        minout = int(self.config.get("min_out", 1))
-        minlive = int(self.config.get("min_live", 2))
-        mindead = int(self.config.get("min_dead", 1))
         self.log("doing min_size thrashing")
-        self.ceph_manager.wait_for_clean(timeout=60)
+        self.ceph_manager.wait_for_clean(timeout=180)
         assert self.ceph_manager.is_clean(), \
             'not clean before minsize thrashing starts'
-        while not self.stopping:
+        start = time.time()
+        while time.time() - start < self.config.get("test_min_size_duration", 1800):
             # look up k and m from all the pools on each loop, in case it
             # changes as the cluster runs
-            k = 0
-            m = 99
-            has_pools = False
             pools_json = self.ceph_manager.get_osd_dump_json()['pools']
-
-            for pool_json in pools_json:
-                pool = pool_json['pool_name']
-                has_pools = True
-                pool_type = pool_json['type']  # 1 for rep, 3 for ec
-                min_size = pool_json['min_size']
-                self.log("pool {pool} min_size is {min_size}".format(pool=pool,min_size=min_size))
-                try:
-                    ec_profile = self.ceph_manager.get_pool_property(pool, 'erasure_code_profile')
-                    if pool_type != PoolType.ERASURE_CODED:
-                        continue
-                    ec_profile = pool_json['erasure_code_profile']
-                    ec_profile_json = self.ceph_manager.raw_cluster_cmd(
-                        'osd',
-                        'erasure-code-profile',
-                        'get',
-                        ec_profile,
-                        '--format=json')
-                    ec_json = json.loads(ec_profile_json)
-                    local_k = int(ec_json['k'])
-                    local_m = int(ec_json['m'])
-                    self.log("pool {pool} local_k={k} local_m={m}".format(pool=pool,
-                                                                          k=local_k, m=local_m))
-                    if local_k > k:
-                        self.log("setting k={local_k} from previous {k}".format(local_k=local_k, k=k))
-                        k = local_k
-                    if local_m < m:
-                        self.log("setting m={local_m} from previous {m}".format(local_m=local_m, m=m))
-                        m = local_m
-                except CommandFailedError:
-                    self.log("failed to read erasure_code_profile. %s was likely removed", pool)
-                    continue
-
-            if has_pools :
-                self.log("using k={k}, m={m}".format(k=k,m=m))
-            else:
+            if len(pools_json) == 0:
                 self.log("No pools yet, waiting")
                 time.sleep(5)
                 continue
-                
-            if minout > len(self.out_osds): # kill OSDs and mark out
-                self.log("forced to out an osd")
-                self.kill_osd(mark_out=True)
-                continue
-            elif mindead > len(self.dead_osds): # kill OSDs but force timeout
-                self.log("forced to kill an osd")
-                self.kill_osd()
-                continue
-            else: # make mostly-random choice to kill or revive OSDs
-                minup = max(minlive, k)
-                rand_val = random.uniform(0, 1)
-                self.log("choosing based on number of live OSDs and rand val {rand}".\
-                         format(rand=rand_val))
-                if len(self.live_osds) > minup+1 and rand_val < 0.5:
-                    # chose to knock out as many OSDs as we can w/out downing PGs
-                    
-                    most_killable = min(len(self.live_osds) - minup, m)
-                    self.log("chose to kill {n} OSDs".format(n=most_killable))
-                    for i in range(1, most_killable):
-                        self.kill_osd(mark_out=True)
-                    time.sleep(10)
-                    # try a few times since there might be a concurrent pool
-                    # creation or deletion
-                    with safe_while(
-                            sleep=5, tries=5,
-                            action='check for active or peered') as proceed:
-                        while proceed():
-                            if self.ceph_manager.all_active_or_peered():
-                                break
-                            self.log('not all PGs are active or peered')
-                else: # chose to revive OSDs, bring up a random fraction of the dead ones
-                    self.log("chose to revive osds")
-                    for i in range(1, int(rand_val * len(self.dead_osds))):
-                        self.revive_osd(i)
+            for pool_json in pools_json:
+                pool = pool_json['pool_name']
+                pool_id = pool_json['pool']
+                pool_type = pool_json['type']  # 1 for rep, 3 for ec
+                min_size = pool_json['min_size']
+                self.log("pool {pool} min_size is {min_size}".format(pool=pool,min_size=min_size))
+                if pool_type != PoolType.ERASURE_CODED:
+                    continue
+                else:
+                    k, m = self.get_k_m_ec_pool(pool, pool_json)
+                    if k == None and m == None:
+                        continue
+                    self.log("using k={k}, m={m}".format(k=k,m=m))
 
-            # let PGs repair themselves or our next knockout might kill one
-            self.ceph_manager.wait_for_clean(timeout=self.config.get('timeout'))
- 
-        # / while not self.stopping
-        self.all_up_in()
- 
-        self.ceph_manager.wait_for_recovery(
-            timeout=self.config.get('timeout')
-            )
+                self.log("dead_osds={d}, live_osds={ld}".format(d=self.dead_osds, ld=self.live_osds))
+                minup = max(min_size, k)
+                # Choose a random PG and kill OSDs until only min_size remain
+                most_killable = min(len(self.live_osds) - minup, m)
+                self.log("chose to kill {n} OSDs".format(n=most_killable))
+                acting_set = self.get_rand_pg_acting_set(pool_id)
+                assert most_killable < len(acting_set)
+                for i in range(0, most_killable):
+                    self.kill_osd(osd=acting_set[i], mark_out=True)
+                self.log("dead_osds={d}, live_osds={ld}".format(d=self.dead_osds, ld=self.live_osds))
+                with safe_while(
+                    sleep=25, tries=5,
+                    action='check for active or peered') as proceed:
+                    while proceed():
+                        if self.ceph_manager.all_active_or_peered():
+                            break
+                        self.log('not all PGs are active or peered')
+                self.all_up_in() # revive all OSDs
+                # let PGs repair themselves or our next knockout might kill one
+                # wait_for_recovery since some workloads won't be able to go clean
+                self.ceph_manager.wait_for_recovery(
+                    timeout=self.config.get('timeout')
+                )
+        # while not self.stopping
+        self.all_up_in() # revive all OSDs
+
+        # Wait until all PGs are active+clean after we have revived all the OSDs
+        self.ceph_manager.wait_for_clean(timeout=self.config.get('timeout'))
 
     def inject_pause(self, conf_key, duration, check_after, should_be_down):
         """
         Pause injection testing. Check for osd being down when finished.
         """
         the_one = random.choice(self.live_osds)
-        self.log("inject_pause on {osd}".format(osd=the_one))
+        self.log("inject_pause on osd.{osd}".format(osd=the_one))
         self.log(
             "Testing {key} pause injection for duration {duration}".format(
                 key=conf_key,
@@ -959,6 +1125,113 @@ class OSDThrasher(Thrasher):
             self.ceph_manager.osd_admin_socket(i, command=['injectfull', 'none'],
                                      check_status=True, timeout=30, stdout=DEVNULL)
 
+
+    def generate_random_sharding(self):
+        prefixes = [
+            'm','O','P','L'
+        ]
+        new_sharding = ''
+        for prefix in prefixes:
+            choose = random.choice([False, True])
+            if not choose:
+                continue
+            if new_sharding != '':
+                new_sharding = new_sharding + ' '
+            columns = random.randint(1, 5)
+            do_hash = random.choice([False, True])
+            if do_hash:
+                low_hash = random.choice([0, 5, 8])
+                do_high_hash = random.choice([False, True])
+                if do_high_hash:
+                    high_hash = random.choice([8, 16, 30]) + low_hash
+                    new_sharding = new_sharding + prefix + '(' + str(columns) + ',' + str(low_hash) + '-' + str(high_hash) + ')'
+                else:
+                    new_sharding = new_sharding + prefix + '(' + str(columns) + ',' + str(low_hash) + '-)'
+            else:
+                if columns == 1:
+                    new_sharding = new_sharding + prefix
+                else:
+                    new_sharding = new_sharding + prefix + '(' + str(columns) + ')'
+        return new_sharding
+
+    def test_bluestore_reshard_action(self):
+        """
+        Test if resharding of bluestore works properly.
+        If bluestore is not used, or bluestore is in version that
+        does not support sharding, skip.
+        """
+
+        osd = random.choice(self.dead_osds)
+        remote = self.ceph_manager.find_remote('osd', osd)
+        FSPATH = self.ceph_manager.get_filepath()
+
+        prefix = [
+                '--no-mon-config',
+                '--log-file=/var/log/ceph/bluestore_tool.$pid.log',
+                '--log-level=10',
+                '--path', FSPATH.format(id=osd)
+            ]
+
+        # sanity check if bluestore-tool accessible
+        self.log('checking if target objectstore is bluestore on osd.%s' % osd)
+        cmd = prefix + [
+            'show-label'
+            ]
+        proc = self.run_ceph_bluestore_tool(remote, 'osd.%s' % osd, cmd)
+        if proc.exitstatus != 0:
+            raise Exception("ceph-bluestore-tool access failed.")
+
+        # check if sharding is possible
+        self.log('checking if target bluestore supports sharding on osd.%s' % osd)
+        cmd = prefix + [
+            'show-sharding'
+            ]
+        proc = self.run_ceph_bluestore_tool(remote, 'osd.%s' % osd, cmd)
+        if proc.exitstatus != 0:
+            self.log("Unable to test resharding, "
+                     "ceph-bluestore-tool does not support it.")
+            return
+
+        # now go for reshard to something else
+        self.log('applying new sharding to bluestore on osd.%s' % osd)
+        new_sharding = self.config.get('bluestore_new_sharding','random')
+
+        if new_sharding == 'random':
+            self.log('generate random sharding')
+            new_sharding = self.generate_random_sharding()
+
+        self.log("applying new sharding: " + new_sharding)
+        cmd = prefix + [
+            '--sharding', new_sharding,
+            'reshard'
+            ]
+        proc = self.run_ceph_bluestore_tool(remote, 'osd.%s' % osd, cmd)
+        if proc.exitstatus != 0:
+            raise Exception("ceph-bluestore-tool resharding failed.")
+
+        # now do fsck to
+        self.log('running fsck to verify new sharding on osd.%s' % osd)
+        cmd = prefix + [
+            'fsck'
+            ]
+        proc = self.run_ceph_bluestore_tool(remote, 'osd.%s' % osd, cmd)
+        if proc.exitstatus != 0:
+            raise Exception("ceph-bluestore-tool fsck failed.")
+        self.log('resharding successfully completed')
+
+    def test_bluestore_reshard(self):
+        """
+        1) kills an osd
+        2) reshards bluestore on killed osd
+        3) revives the osd
+        """
+        self.log('test_bluestore_reshard started')
+        self.kill_osd(mark_down=True, mark_out=True)
+        self.test_bluestore_reshard_action()
+        self.revive_osd()
+        self.log('test_bluestore_reshard completed')
+
+
     def test_map_discontinuity(self):
         """
         1) Allows the osds to recover
@@ -969,6 +1242,7 @@ class OSDThrasher(Thrasher):
         This sequence should cause the revived osd to have to handle
         a map gap since the mons would have trimmed
         """
+        self.log("test_map_discontinuity")
         while len(self.in_osds) < (self.minin + 1):
             self.in_osd()
         self.log("Waiting for recovery")
@@ -1008,12 +1282,18 @@ class OSDThrasher(Thrasher):
         minout = int(self.config.get("min_out", 0))
         minlive = int(self.config.get("min_live", 2))
         mindead = int(self.config.get("min_dead", 0))
+        thrash_hosts = self.config.get("thrash_hosts", False)
 
         self.log('choose_action: min_in %d min_out '
-                 '%d min_live %d min_dead %d' %
-                 (minin, minout, minlive, mindead))
+                 '%d min_live %d min_dead %d '
+                 'chance_down %.2f' %
+                 (minin, minout, minlive, mindead, chance_down))
         actions = []
-        if len(self.in_osds) > minin:
+        if thrash_hosts:
+            if len(self.in_osds) > minin:
+                self.log("check thrash_hosts: in_osds > minin")
+                actions.append((self.out_host, 1.0,))
+        elif len(self.in_osds) > minin:
             actions.append((self.out_osd, 1.0,))
         if len(self.live_osds) > minlive and chance_down > 0:
             actions.append((self.kill_osd, chance_down,))
@@ -1043,6 +1323,10 @@ class OSDThrasher(Thrasher):
             actions.append((self.thrash_pg_upmap_items, self.chance_thrash_pg_upmap_items,))
         if self.chance_force_recovery > 0:
             actions.append((self.force_cancel_recovery, self.chance_force_recovery))
+        if self.chance_reset_purged_snaps_last > 0:
+            actions.append((self.reset_purged_snaps_last, self.chance_reset_purged_snaps_last))
+        if self.chance_trim_stale_osdmaps > 0:
+            actions.append((self.trim_stale_osdmaps, self.chance_trim_stale_osdmaps))
 
         for key in ['heartbeat_inject_failure', 'filestore_inject_stall']:
             for scenario in [
@@ -1059,6 +1343,13 @@ class OSDThrasher(Thrasher):
                                    True),
                  self.config.get('chance_inject_pause_long', 0),)]:
                 actions.append(scenario)
+
+        # only consider resharding if objectstore is bluestore
+        cluster_name = self.ceph_manager.cluster
+        cluster = self.ceph_manager.ctx.ceph[cluster_name]
+        if cluster.conf.get('osd', {}).get('osd objectstore', 'bluestore') == 'bluestore':
+            actions.append((self.test_bluestore_reshard,
+                            self.config.get('chance_bluestore_reshard', 0),))
 
         total = sum([y for (x, y) in actions])
         val = random.uniform(0, total)
@@ -1174,9 +1465,6 @@ class OSDThrasher(Thrasher):
         self.rerrosd = self.live_osds[0]
         if self.random_eio > 0:
             self.ceph_manager.inject_args('osd', self.rerrosd,
-                                          'filestore_debug_random_read_err',
-                                          self.random_eio)
-            self.ceph_manager.inject_args('osd', self.rerrosd,
                                           'bluestore_debug_random_read_err',
                                           self.random_eio)
         self.log("starting do_thrash")
@@ -1210,8 +1498,6 @@ class OSDThrasher(Thrasher):
         self.all_up()
         if self.random_eio > 0:
             self.ceph_manager.inject_args('osd', self.rerrosd,
-                                          'filestore_debug_random_read_err', '0.0')
-            self.ceph_manager.inject_args('osd', self.rerrosd,
                                           'bluestore_debug_random_read_err', '0.0')
         for pool in list(self.pools_to_fix_pgp_num):
             if self.ceph_manager.get_pool_pg_num(pool) > 0:
@@ -1235,7 +1521,7 @@ class ObjectStoreTool:
             if self.osd == "primary":
                 self.osd = self.manager.get_object_primary(self.pool,
                                                            self.object_name)
-        assert self.osd
+        assert self.osd is not None
         if self.object_name:
             self.pgid = self.manager.get_object_pg_with_shard(self.pool,
                                                               self.object_name,
@@ -1268,22 +1554,20 @@ class ObjectStoreTool:
         lines.append(cmd)
         return "\n".join(lines)
 
-    def run(self, options, args, stdin=None, stdout=None):
-        if stdout is None:
-            stdout = BytesIO()
+    def run(self, options, args):
         self.manager.kill_osd(self.osd)
-        cmd = self.build_cmd(options, args, stdin)
+        cmd = self.build_cmd(options, args, None)
         self.manager.log(cmd)
         try:
             proc = self.remote.run(args=['bash', '-e', '-x', '-c', cmd],
                                    check_status=False,
-                                   stdout=stdout,
+                                   stdout=BytesIO(),
                                    stderr=BytesIO())
             proc.wait()
             if proc.exitstatus != 0:
                 self.manager.log("failed with " + str(proc.exitstatus))
-                error = six.ensure_str(proc.stdout.getvalue())  + " " + \
-                        six.ensure_str(proc.stderr.getvalue())
+                error = proc.stdout.getvalue().decode()  + " " + \
+                        proc.stderr.getvalue().decode()
                 raise Exception(error)
         finally:
             if self.do_revive:
@@ -1307,14 +1591,14 @@ class CephManager:
     """
 
     def __init__(self, controller, ctx=None, config=None, logger=None,
-                 cluster='ceph', cephadm=False):
+                 cluster='ceph', cephadm=False, rook=False) -> None:
         self.lock = threading.RLock()
         self.ctx = ctx
         self.config = config
         self.controller = controller
         self.next_pool_id = 0
         self.cluster = cluster
-        self.cephadm = cephadm
+
         if (logger):
             self.log = lambda x: logger.info(x)
         else:
@@ -1324,8 +1608,19 @@ class CephManager:
                 """
                 print(x)
             self.log = tmp
+
         if self.config is None:
             self.config = dict()
+
+        # NOTE: These variables are meant to be overriden by vstart_runner.py.
+        self.rook = rook
+        self.cephadm = cephadm
+        self.testdir = teuthology.get_testdir(self.ctx)
+        # prefix args for ceph cmds to be executed
+        self.pre = ['adjust-ulimits', 'ceph-coverage',
+                    f'{self.testdir}/archive/coverage']
+        self.RADOS_CMD = self.pre + ['rados', '--cluster', self.cluster]
+
         pools = self.list_pools()
         self.pools = {}
         for pool in pools:
@@ -1335,61 +1630,95 @@ class CephManager:
             except CommandFailedError:
                 self.log('Failed to get pg_num from pool %s, ignoring' % pool)
 
-    def raw_cluster_cmd(self, *args):
+    def get_ceph_cmd(self, **kwargs):
+        timeout = kwargs.pop('timeout', 120)
+        return ['sudo'] + self.pre + ['timeout', f'{timeout}', 'ceph',
+                                      '--cluster', self.cluster]
+    def save_conf_epoch(self):
+        p = self.ceph("config log 1 --format=json")
+        J = json.loads(p.stdout.getvalue())
+        self.ctx.conf_epoch = J[0]["version"]
+        log.info("config epoch is %d", self.ctx.conf_epoch)
+
+    def ceph(self, cmd, **kwargs):
+        """
+        Simple Ceph admin command wrapper around run_cluster_cmd.
+        """
+
+        kwargs.pop('args', None)
+        args = shlex.split(cmd)
+        stdout = kwargs.pop('stdout', StringIO())
+        stderr = kwargs.pop('stderr', StringIO())
+        return self.run_cluster_cmd(args=args, stdout=stdout, stderr=stderr, **kwargs)
+
+    def run_cluster_cmd(self, **kwargs):
+        """
+        Run a Ceph command and return the object representing the process
+        for the command.
+
+        Accepts arguments same as that of teuthology.orchestra.run.run()
+        """
+        if isinstance(kwargs['args'], str):
+            kwargs['args'] = shlex.split(kwargs['args'])
+        elif isinstance(kwargs['args'], tuple):
+            kwargs['args'] = list(kwargs['args'])
+
+        prefixcmd = []
+        timeoutcmd = kwargs.pop('timeoutcmd', None)
+        if timeoutcmd is not None:
+            prefixcmd += ['timeout', str(timeoutcmd)]
+
+        if self.cephadm:
+            prefixcmd += ['ceph']
+            cmd = prefixcmd + list(kwargs['args'])
+            return shell(self.ctx, self.cluster, self.controller,
+                         args=cmd,
+                         stdout=StringIO(),
+                         check_status=kwargs.get('check_status', True))
+        elif self.rook:
+            prefixcmd += ['ceph']
+            cmd = prefixcmd + list(kwargs['args'])
+            return toolbox(self.ctx, self.cluster,
+                           args=cmd,
+                           stdout=StringIO(),
+                           check_status=kwargs.get('check_status', True))
+        else:
+            kwargs['args'] = prefixcmd + self.get_ceph_cmd(**kwargs) + kwargs['args']
+            return self.controller.run(**kwargs)
+
+    def raw_cluster_cmd(self, *args, **kwargs) -> str:
         """
         Start ceph on a raw cluster.  Return count
         """
-        if self.cephadm:
-            proc = shell(self.ctx, self.cluster, self.controller,
-                         args=['ceph'] + list(args),
-                         stdout=BytesIO())
-        else:
-            testdir = teuthology.get_testdir(self.ctx)
-            ceph_args = [
-                'sudo',
-                'adjust-ulimits',
-                'ceph-coverage',
-                '{tdir}/archive/coverage'.format(tdir=testdir),
-                'timeout',
-                '120',
-                'ceph',
-                '--cluster',
-                self.cluster,
-                '--log-early',
-            ]
-            ceph_args.extend(args)
-            proc = self.controller.run(
-                args=ceph_args,
-                stdout=BytesIO(),
-            )
-        return six.ensure_str(proc.stdout.getvalue())
+        if kwargs.get('args') is None and args:
+            kwargs['args'] = args
+        kwargs['stdout'] = kwargs.pop('stdout', StringIO())
+        return self.run_cluster_cmd(**kwargs).stdout.getvalue()
 
     def raw_cluster_cmd_result(self, *args, **kwargs):
         """
         Start ceph on a cluster.  Return success or failure information.
         """
-        if self.cephadm:
-            proc = shell(self.ctx, self.cluster, self.controller,
-                         args=['ceph'] + list(args),
-                         check_status=False)
-        else:
-            testdir = teuthology.get_testdir(self.ctx)
-            ceph_args = [
-                'sudo',
-                'adjust-ulimits',
-                'ceph-coverage',
-                '{tdir}/archive/coverage'.format(tdir=testdir),
-                'timeout',
-                '120',
-                'ceph',
-                '--cluster',
-                self.cluster,
-            ]
-            ceph_args.extend(args)
-            kwargs['args'] = ceph_args
-            kwargs['check_status'] = False
-            proc = self.controller.run(**kwargs)
-        return proc.exitstatus
+        if kwargs.get('args') is None and args:
+           kwargs['args'] = args
+        kwargs['check_status'] = False
+        return self.run_cluster_cmd(**kwargs).exitstatus
+
+    def get_keyring(self, client_id):
+        """
+        Return keyring for the given client.
+
+        :param client_id: str
+        :return keyring: str
+        """
+        if client_id.find('client.') != -1:
+            client_id = client_id.replace('client.', '')
+
+        keyring = self.run_cluster_cmd(args=f'auth get client.{client_id}',
+                                       stdout=StringIO()).stdout.getvalue()
+
+        assert isinstance(keyring, str) and keyring != ''
+        return keyring
 
     def run_ceph_w(self, watch_channel=None):
         """
@@ -1400,13 +1729,7 @@ class CephManager:
                               'cluster', 'audit', ...
         :type watch_channel: str
         """
-        args = ["sudo",
-                "daemon-helper",
-                "kill",
-                "ceph",
-                '--cluster',
-                self.cluster,
-                "-w"]
+        args = ['sudo', 'daemon-helper', 'kill', 'ceph', '--cluster', self.cluster, '-w']
         if watch_channel is not None:
             args.append("--watch-channel")
             args.append(watch_channel)
@@ -1469,19 +1792,19 @@ class CephManager:
                         wait for all specified osds, but some of them could be
                         moved out of osdmap, so we cannot get their updated
                         stat seq from monitor anymore. in that case, you need
-                        to pass a blacklist.
+                        to pass a blocklist.
         :param wait_for_mon: wait for mon to be synced with mgr. 0 to disable
                              it. (5 min by default)
         """
-        seq = {osd: int(self.raw_cluster_cmd('tell', 'osd.%d' % osd, 'flush_pg_stats'))
-               for osd in osds}
-        if not wait_for_mon:
-            return
         if no_wait is None:
             no_wait = []
-        for osd, need in seq.items():
+
+        def flush_one_osd(osd: int, wait_for_mon: int):
+            need = int(self.raw_cluster_cmd('tell', 'osd.%d' % osd, 'flush_pg_stats'))
+            if not wait_for_mon:
+                return
             if osd in no_wait:
-                continue
+                return
             got = 0
             while wait_for_mon > 0:
                 got = int(self.raw_cluster_cmd('osd', 'last-stat-seq', 'osd.%d' % osd))
@@ -1497,27 +1820,30 @@ class CephManager:
                                 'osd.{osd}: {got} < {need}'.
                                 format(osd=osd, got=got, need=need))
 
+        with parallel() as p:
+            for osd in osds:
+                p.spawn(flush_one_osd, osd, wait_for_mon)
+
     def flush_all_pg_stats(self):
         self.flush_pg_stats(range(len(self.get_osd_dump())))
 
-    def do_rados(self, remote, cmd, check_status=True):
+    def do_rados(self, cmd, pool=None, namespace=None, remote=None, **kwargs):
         """
         Execute a remote rados command.
         """
-        testdir = teuthology.get_testdir(self.ctx)
-        pre = [
-            'adjust-ulimits',
-            'ceph-coverage',
-            '{tdir}/archive/coverage'.format(tdir=testdir),
-            'rados',
-            '--cluster',
-            self.cluster,
-            ]
+        if remote is None:
+            remote = self.controller
+
+        pre = self.RADOS_CMD + [] # deep-copying!
+        if pool is not None:
+            pre += ['--pool', pool]
+        if namespace is not None:
+            pre += ['--namespace', namespace]
         pre.extend(cmd)
         proc = remote.run(
             args=pre,
             wait=True,
-            check_status=check_status
+            **kwargs
             )
         return proc
 
@@ -1528,7 +1854,6 @@ class CephManager:
         Threads not used yet.
         """
         args = [
-            '-p', pool,
             '--num-objects', num_objects,
             '-b', size,
             'bench', timelimit,
@@ -1536,59 +1861,42 @@ class CephManager:
             ]
         if not cleanup:
             args.append('--no-cleanup')
-        return self.do_rados(self.controller, map(str, args))
+        return self.do_rados(map(str, args), pool=pool)
 
     def do_put(self, pool, obj, fname, namespace=None):
         """
         Implement rados put operation
         """
-        args = ['-p', pool]
-        if namespace is not None:
-            args += ['-N', namespace]
-        args += [
-            'put',
-            obj,
-            fname
-        ]
+        args = ['put', obj, fname]
         return self.do_rados(
-            self.controller,
             args,
-            check_status=False
+            check_status=False,
+            pool=pool,
+            namespace=namespace
         ).exitstatus
 
     def do_get(self, pool, obj, fname='/dev/null', namespace=None):
         """
         Implement rados get operation
         """
-        args = ['-p', pool]
-        if namespace is not None:
-            args += ['-N', namespace]
-        args += [
-            'get',
-            obj,
-            fname
-        ]
+        args = ['get', obj, fname]
         return self.do_rados(
-            self.controller,
             args,
-            check_status=False
+            check_status=False,
+            pool=pool,
+            namespace=namespace,
         ).exitstatus
 
     def do_rm(self, pool, obj, namespace=None):
         """
         Implement rados rm operation
         """
-        args = ['-p', pool]
-        if namespace is not None:
-            args += ['-N', namespace]
-        args += [
-            'rm',
-            obj
-        ]
+        args = ['rm', obj]
         return self.do_rados(
-            self.controller,
             args,
-            check_status=False
+            check_status=False,
+            pool=pool,
+            namespace=namespace
         ).exitstatus
 
     def osd_admin_socket(self, osd_id, command, check_status=True, timeout=0, stdout=None):
@@ -1631,13 +1939,14 @@ class CephManager:
                 wait=True,
                 check_status=check_status,
             )
+        if self.rook:
+            assert False, 'not implemented'
 
-        testdir = teuthology.get_testdir(self.ctx)
         args = [
             'sudo',
             'adjust-ulimits',
             'ceph-coverage',
-            '{tdir}/archive/coverage'.format(tdir=testdir),
+           f'{self.testdir}/archive/coverage',
             'timeout',
             str(timeout),
             'ceph',
@@ -1860,11 +2169,25 @@ class CephManager:
         when creating an erasure coded pool.
         """
         with self.lock:
+            # msr rules require at least squid
+            if 'crush-osds-per-failure-domain' in profile:
+                self.raw_cluster_cmd(
+                    'osd', 'set-require-min-compat-client', 'squid')
             args = cmd_erasure_code_profile(profile_name, profile)
+            self.raw_cluster_cmd(*args)
+
+    def create_erasure_code_crush_rule(self, rule_name, profile):
+        """
+        Create an erasure code crush rule that can be used as a parameter
+        when creating an erasure coded pool.
+        """
+        with self.lock:
+            args = cmd_ec_crush_profile(rule_name, profile)
             self.raw_cluster_cmd(*args)
 
     def create_pool_with_unique_name(self, pg_num=16,
                                      erasure_code_profile_name=None,
+                                     erasure_code_crush_rule_name=None,
                                      min_size=None,
                                      erasure_code_use_overwrites=False):
         """
@@ -1878,6 +2201,7 @@ class CephManager:
                 name,
                 pg_num,
                 erasure_code_profile_name=erasure_code_profile_name,
+                erasure_code_crush_rule_name=erasure_code_crush_rule_name,
                 min_size=min_size,
                 erasure_code_use_overwrites=erasure_code_use_overwrites)
         return name
@@ -1890,6 +2214,7 @@ class CephManager:
 
     def create_pool(self, pool_name, pg_num=16,
                     erasure_code_profile_name=None,
+                    erasure_code_crush_rule_name=None,
                     min_size=None,
                     erasure_code_use_overwrites=False):
         """
@@ -1898,17 +2223,24 @@ class CephManager:
         :param pg_num: initial number of pgs.
         :param erasure_code_profile_name: if set and !None create an
                                           erasure coded pool using the profile
+        :param erasure_code_crush_rule_name: if set and !None create an
+                                             erasure coded pool using the crush rule
         :param erasure_code_use_overwrites: if true, allow overwrites
         """
         with self.lock:
-            assert isinstance(pool_name, six.string_types)
+            assert isinstance(pool_name, str)
             assert isinstance(pg_num, int)
             assert pool_name not in self.pools
             self.log("creating pool_name %s" % (pool_name,))
             if erasure_code_profile_name:
-                self.raw_cluster_cmd('osd', 'pool', 'create',
-                                     pool_name, str(pg_num), str(pg_num),
-                                     'erasure', erasure_code_profile_name)
+                cmd_args = ['osd', 'pool', 'create', 
+                            pool_name, str(pg_num), 
+                            str(pg_num), 'erasure', 
+                            erasure_code_profile_name]
+
+                if erasure_code_crush_rule_name:
+                    cmd_args.extend([erasure_code_crush_rule_name])
+                self.raw_cluster_cmd(*cmd_args)
             else:
                 self.raw_cluster_cmd('osd', 'pool', 'create',
                                      pool_name, str(pg_num))
@@ -1953,7 +2285,7 @@ class CephManager:
         :param pool_name: Pool to be removed
         """
         with self.lock:
-            assert isinstance(pool_name, six.string_types)
+            assert isinstance(pool_name, str)
             assert pool_name in self.pools
             self.log("removing pool_name %s" % (pool_name,))
             del self.pools[pool_name]
@@ -1973,7 +2305,7 @@ class CephManager:
         Return the number of pgs in the pool specified.
         """
         with self.lock:
-            assert isinstance(pool_name, six.string_types)
+            assert isinstance(pool_name, str)
             if pool_name in self.pools:
                 return self.pools[pool_name]
             return 0
@@ -1985,8 +2317,8 @@ class CephManager:
         :returns: property as string
         """
         with self.lock:
-            assert isinstance(pool_name, six.string_types)
-            assert isinstance(prop, six.string_types)
+            assert isinstance(pool_name, str)
+            assert isinstance(prop, str)
             output = self.raw_cluster_cmd(
                 'osd',
                 'pool',
@@ -2007,8 +2339,8 @@ class CephManager:
         This routine retries if set operation fails.
         """
         with self.lock:
-            assert isinstance(pool_name, six.string_types)
-            assert isinstance(prop, six.string_types)
+            assert isinstance(pool_name, str)
+            assert isinstance(prop, str)
             assert isinstance(val, int)
             tries = 0
             while True:
@@ -2035,7 +2367,7 @@ class CephManager:
         Increase the number of pgs in a pool
         """
         with self.lock:
-            assert isinstance(pool_name, six.string_types)
+            assert isinstance(pool_name, str)
             assert isinstance(by, int)
             assert pool_name in self.pools
             if self.get_num_creating() > 0:
@@ -2055,7 +2387,7 @@ class CephManager:
         with self.lock:
             self.log('contract_pool %s by %s min %s' % (
                      pool_name, str(by), str(min_pgs)))
-            assert isinstance(pool_name, six.string_types)
+            assert isinstance(pool_name, str)
             assert isinstance(by, int)
             assert pool_name in self.pools
             if self.get_num_creating() > 0:
@@ -2095,7 +2427,7 @@ class CephManager:
         Set pgpnum property of pool_name pool.
         """
         with self.lock:
-            assert isinstance(pool_name, six.string_types)
+            assert isinstance(pool_name, str)
             assert pool_name in self.pools
             if not force and self.get_num_creating() > 0:
                 return False
@@ -2135,6 +2467,24 @@ class CephManager:
             return j['pg_map']['pg_stats']
         except KeyError:
             return j['pg_stats']
+
+    def get_osd_df(self, osdid):
+        """
+        Get the osd df stats
+        """
+        out = self.raw_cluster_cmd('osd', 'df', 'name', 'osd.{}'.format(osdid),
+                                   '--format=json')
+        j = json.loads('\n'.join(out.split('\n')[1:]))
+        return j['nodes'][0]
+
+    def get_pool_df(self, name):
+        """
+        Get the pool df stats
+        """
+        out = self.raw_cluster_cmd('df', 'detail', '--format=json')
+        j = json.loads('\n'.join(out.split('\n')[1:]))
+        return next((p['stats'] for p in j['pools'] if p['name'] == name),
+                    None)
 
     def get_pgids_to_force(self, backfill):
         """
@@ -2446,12 +2796,69 @@ class CephManager:
                  num += 1
         return num
 
+    def _print_not_active_clean_pg(self, pgs):
+        """
+        Print the PGs that are not active+clean.
+        """
+        for pg in pgs:
+            if not (pg['state'].count('active') and
+                    pg['state'].count('clean') and
+                    not pg['state'].count('stale')):
+                log.debug(
+                    "PG %s is not active+clean, but %s",
+                    pg['pgid'], pg['state']
+                )
+
+    def pg_all_active_clean(self):
+        """
+        Check if all pgs are active+clean
+        return: True if all pgs are active+clean else False
+        """
+        pgs = self.get_pg_stats()
+        result = self._get_num_active_clean(pgs) == len(pgs)
+        if result:
+            log.debug("All PGs are active+clean")
+        else:
+            log.debug("Not all PGs are active+clean")
+            self._print_not_active_clean_pg(pgs)
+        return result
+
+    def _print_not_active_pg(self, pgs):
+        """
+        Print the PGs that are not active.
+        """
+        for pg in pgs:
+            if not (pg['state'].count('active')
+                    and not pg['state'].count('stale')):
+                log.debug(
+                    "PG %s is not active, but %s",
+                    pg['pgid'], pg['state']
+                )
+
+    def pg_all_active(self):
+        """
+        Check if all pgs are active
+        return: True if all pgs are active else False
+        """
+        pgs = self.get_pg_stats()
+        result = self._get_num_active(pgs) == len(pgs)
+        if result:
+            log.debug("All PGs are active")
+        else:
+            log.debug("Not all PGs are active")
+            self._print_not_active_pg(pgs)
+        return result
+
     def is_clean(self):
         """
         True if all pgs are clean
         """
         pgs = self.get_pg_stats()
-        return self._get_num_active_clean(pgs) == len(pgs)
+        if self._get_num_active_clean(pgs) == len(pgs):
+            return True
+        else:
+            self.dump_pgs_not_active_clean()
+            return False
 
     def is_recovered(self):
         """
@@ -2466,6 +2873,42 @@ class CephManager:
         """
         pgs = self.get_pg_stats()
         return self._get_num_active_down(pgs) == len(pgs)
+
+    def dump_pgs_not_active_clean(self):
+        """
+        Dumps all pgs that are not active+clean
+        """
+        pgs = self.get_pg_stats()
+        for pg in pgs:
+           if pg['state'] != 'active+clean':
+             self.log('PG %s is not active+clean' % pg['pgid'])
+             self.log(pg)
+
+    def dump_pgs_not_active_down(self):
+        """
+        Dumps all pgs that are not active or down
+        """
+        pgs = self.get_pg_stats()
+        for pg in pgs:
+           if 'active' not in pg['state'] and 'down' not in pg['state']:
+             self.log('PG %s is not active or down' % pg['pgid'])
+             self.log(pg)
+
+    def dump_pgs_not_active(self):
+        """
+        Dumps all pgs that are not active
+        """
+        pgs = self.get_pg_stats()
+        for pg in pgs:
+           if 'active' not in pg['state']:
+             self.log('PG %s is not active' % pg['pgid'])
+             self.log(pg)
+
+    def dump_pgs_not_active_peered(self, pgs):
+        for pg in pgs:
+            if (not pg['state'].count('active')) and (not pg['state'].count('peered')):
+                self.log('PG %s is not active or peered' % pg['pgid'])
+                self.log(pg)
 
     def wait_for_clean(self, timeout=1200):
         """
@@ -2482,11 +2925,10 @@ class CephManager:
                 else:
                     self.log("no progress seen, keeping timeout for now")
                     if time.time() - start >= timeout:
-                        self.log('dumping pgs')
-                        out = self.raw_cluster_cmd('pg', 'dump')
-                        self.log(out)
+                        self.log('dumping pgs not clean')
+                        self.dump_pgs_not_active_clean()
                         assert time.time() - start < timeout, \
-                            'failed to become clean before timeout expired'
+                            'wait_for_clean: failed before timeout expired'
             cur_active_clean = self.get_num_active_clean()
             if cur_active_clean != num_active_clean:
                 start = time.time()
@@ -2568,11 +3010,10 @@ class CephManager:
                     if now - start >= timeout:
                         if self.is_recovered():
                             break
-                        self.log('dumping pgs')
-                        out = self.raw_cluster_cmd('pg', 'dump')
-                        self.log(out)
+                        self.log('dumping pgs not recovered yet')
+                        self.dump_pgs_not_active_clean()
                         assert now - start < timeout, \
-                            'failed to recover before timeout expired'
+                            'wait_for_recovery: failed before timeout expired'
             cur_active_recovered = self.get_num_active_recovered()
             if cur_active_recovered != num_active_recovered:
                 start = time.time()
@@ -2590,11 +3031,10 @@ class CephManager:
         while not self.is_active():
             if timeout is not None:
                 if time.time() - start >= timeout:
-                    self.log('dumping pgs')
-                    out = self.raw_cluster_cmd('pg', 'dump')
-                    self.log(out)
+                    self.log('dumping pgs not active')
+                    self.dump_pgs_not_active()
                     assert time.time() - start < timeout, \
-                        'failed to recover before timeout expired'
+                        'wait_for_active: failed before timeout expired'
             cur_active = self.get_num_active()
             if cur_active != num_active:
                 start = time.time()
@@ -2613,11 +3053,10 @@ class CephManager:
         while not self.is_active_or_down():
             if timeout is not None:
                 if time.time() - start >= timeout:
-                    self.log('dumping pgs')
-                    out = self.raw_cluster_cmd('pg', 'dump')
-                    self.log(out)
+                    self.log('dumping pgs not active or down')
+                    self.dump_pgs_not_active_down()
                     assert time.time() - start < timeout, \
-                        'failed to recover before timeout expired'
+                        'wait_for_active_or_down: failed before timeout expired'
             cur_active_down = self.get_num_active_down()
             if cur_active_down != num_active_down:
                 start = time.time()
@@ -2655,8 +3094,14 @@ class CephManager:
         """
         Wrapper to check if all PGs are active or peered
         """
+        self.log("checking for active or peered")
         pgs = self.get_pg_stats()
-        return self._get_num_active(pgs) + self._get_num_peered(pgs) == len(pgs)
+        if self._get_num_active(pgs) + self._get_num_peered(pgs) == len(pgs):
+            self.log("all pgs are active or peered!")
+            return True
+        else:
+            self.dump_pgs_not_active_peered(pgs)
+            return False
 
     def wait_till_active(self, timeout=None):
         """
@@ -2667,11 +3112,10 @@ class CephManager:
         while not self.is_active():
             if timeout is not None:
                 if time.time() - start >= timeout:
-                    self.log('dumping pgs')
-                    out = self.raw_cluster_cmd('pg', 'dump')
-                    self.log(out)
+                    self.log('dumping pgs not active')
+                    self.dump_pgs_not_active()
                     assert time.time() - start < timeout, \
-                        'failed to become active before timeout expired'
+                        'wait_till_active: failed before timeout expired'
             time.sleep(3)
         self.log("active!")
 
@@ -2846,6 +3290,26 @@ class CephManager:
             self.make_admin_daemon_dir(remote)
         self.ctx.daemons.get_daemon('mgr', mgr, self.cluster).restart()
 
+    def get_crush_rule_id(self, crush_rule_name):
+        """
+        Get crush rule id by name
+        :returns: int -- crush rule id
+        """
+        out = self.raw_cluster_cmd('osd', 'crush', 'rule', 'dump', '--format=json')
+        j = json.loads('\n'.join(out.split('\n')[1:]))
+        for rule in j:
+            if rule['rule_name'] == crush_rule_name:
+                return rule['rule_id']
+        assert False, 'rule %s not found' % crush_rule_name
+
+    def get_mon_dump_json(self):
+        """
+        mon dump --format=json converted to a python object
+        :returns: the python object
+        """
+        out = self.raw_cluster_cmd('mon', 'dump', '--format=json')
+        return json.loads('\n'.join(out.split('\n')[1:]))
+
     def get_mon_status(self, mon):
         """
         Extract all the monitor status information from the cluster
@@ -2859,28 +3323,47 @@ class CephManager:
         """
         out = self.raw_cluster_cmd('quorum_status')
         j = json.loads(out)
-        self.log('quorum_status is %s' % out)
         return j['quorum']
+
+    def get_mon_quorum_names(self):
+        """
+        Extract monitor quorum names from the cluster
+        """
+        out = self.raw_cluster_cmd('quorum_status')
+        j = json.loads(out)
+        return j['quorum_names']
 
     def wait_for_mon_quorum_size(self, size, timeout=300):
         """
         Loop until quorum size is reached.
         """
         self.log('waiting for quorum size %d' % size)
-        start = time.time()
-        while not len(self.get_mon_quorum()) == size:
-            if timeout is not None:
-                assert time.time() - start < timeout, \
-                    ('failed to reach quorum size %d '
-                     'before timeout expired' % size)
-            time.sleep(3)
+        sleep = 3
+        with safe_while(sleep=sleep,
+                        tries=timeout // sleep,
+                        action=f'wait for quorum size {size}') as proceed:
+            while proceed():
+                try:
+                    if len(self.get_mon_quorum()) == size:
+                        break
+                except CommandFailedError as e:
+                    # could fail instea4d of blocked if the rotating key of the
+                    # connected monitor is not updated yet after they form the
+                    # quorum
+                    if e.exitstatus == errno.EACCES:
+                        pass
+                    else:
+                        raise
         self.log("quorum is size %d" % size)
 
-    def get_mon_health(self, debug=False):
+    def get_mon_health(self, debug=False, detail=False):
         """
         Extract all the monitor health information.
         """
-        out = self.raw_cluster_cmd('health', '--format=json')
+        if detail:
+            out = self.raw_cluster_cmd('health', 'detail', '--format=json')
+        else:
+            out = self.raw_cluster_cmd('health', '--format=json')
         if debug:
             self.log('health:\n{h}'.format(h=out))
         return json.loads(out)
@@ -2929,6 +3412,23 @@ class CephManager:
             return {}
         self.log(task_status)
         return task_status
+
+    # Stretch mode related functions
+    def is_degraded_stretch_mode(self):
+        """
+        Return whether the cluster is in degraded stretch mode
+        """
+        try:
+            osdmap = self.get_osd_dump_json()
+            stretch_mode = osdmap.get('stretch_mode', {})
+            degraded_stretch_mode = stretch_mode.get('degraded_stretch_mode', 0)
+            self.log("is_degraded_stretch_mode: {0}".format(degraded_stretch_mode))
+            return degraded_stretch_mode == 1
+        except (TypeError, AttributeError) as e:
+            # Log the error or handle it as needed
+            self.log("Error accessing degraded_stretch_mode: {0}".format(e))
+            return False
+
 
 def utility_task(name):
     """

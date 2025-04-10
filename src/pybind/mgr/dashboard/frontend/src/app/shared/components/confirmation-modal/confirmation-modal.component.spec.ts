@@ -3,44 +3,34 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { ReactiveFormsModule } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 
-import { BsModalRef, BsModalService, ModalModule } from 'ngx-bootstrap/modal';
-
-import { By } from '@angular/platform-browser';
-import {
-  configureTestBed,
-  FixtureHelper,
-  i18nProviders,
-  modalServiceShow
-} from '../../../../testing/unit-test-helper';
+import { configureTestBed, FixtureHelper } from '~/testing/unit-test-helper';
 import { BackButtonComponent } from '../back-button/back-button.component';
+import { FormButtonPanelComponent } from '../form-button-panel/form-button-panel.component';
 import { ModalComponent } from '../modal/modal.component';
 import { SubmitButtonComponent } from '../submit-button/submit-button.component';
 import { ConfirmationModalComponent } from './confirmation-modal.component';
+import { ModalCdsService } from '../../services/modal-cds.service';
+import { ModalService, PlaceholderService } from 'carbon-components-angular';
 
-@NgModule({
-  entryComponents: [ConfirmationModalComponent]
-})
+@NgModule({})
 export class MockModule {}
 
 @Component({
-  template: `
-    <ng-template #fillTpl>
-      Template based description.
-    </ng-template>
-  `
+  template: `<ng-template #fillTpl>Template based description.</ng-template>`
 })
 class MockComponent {
   @ViewChild('fillTpl', { static: true })
   fillTpl: TemplateRef<any>;
-  modalRef: BsModalRef;
+  modalRef: any;
   returnValue: any;
 
   // Normally private, but public is needed by tests
-  constructor(public modalService: BsModalService) {}
+  constructor(public modalService: ModalCdsService) {}
 
   private openModal(extendBaseState = {}) {
-    this.modalRef = this.modalService.show(ConfirmationModalComponent, {
-      initialState: Object.assign(
+    this.modalRef = this.modalService.show(
+      ConfirmationModalComponent,
+      Object.assign(
         {
           titleText: 'Title is a must have',
           buttonText: 'Action label',
@@ -48,12 +38,11 @@ class MockComponent {
           description: 'String based description.',
           onSubmit: () => {
             this.returnValue = 'The submit action has to hide manually.';
-            this.modalRef.hide();
           }
         },
         extendBaseState
       )
-    });
+    );
   }
 
   basicModal() {
@@ -72,16 +61,8 @@ describe('ConfirmationModalComponent', () => {
   let fixture: ComponentFixture<ConfirmationModalComponent>;
   let mockComponent: MockComponent;
   let mockFixture: ComponentFixture<MockComponent>;
-  let modalService: BsModalService;
   let fh: FixtureHelper;
-
-  /**
-   * The hide method of `BsModalService` doesn't emit events during tests that's why it's mocked.
-   *
-   * The only events of hide are `null`, `'backdrop-click'` and `'esc'` as described here:
-   * https://ngx-universal.herokuapp.com/#/modals#service-events
-   */
-  const hide = (x: string) => modalService.onHide.emit(null || x);
+  let modalService: ModalCdsService;
 
   const expectReturnValue = (v: string) => expect(mockComponent.returnValue).toBe(v);
 
@@ -91,11 +72,29 @@ describe('ConfirmationModalComponent', () => {
       BackButtonComponent,
       MockComponent,
       ModalComponent,
-      SubmitButtonComponent
+      SubmitButtonComponent,
+      FormButtonPanelComponent
     ],
     schemas: [NO_ERRORS_SCHEMA],
-    imports: [ModalModule.forRoot(), ReactiveFormsModule, MockModule, RouterTestingModule],
-    providers: [BsModalRef, i18nProviders, SubmitButtonComponent]
+    imports: [ReactiveFormsModule, MockModule, RouterTestingModule],
+    providers: [
+      SubmitButtonComponent,
+      FormButtonPanelComponent,
+      ModalService,
+      PlaceholderService,
+      {
+        provide: 'titleText',
+        useValue: 'test-title'
+      },
+      {
+        provide: 'buttonText',
+        useValue: 'test-button'
+      },
+      {
+        provide: 'onSubmit',
+        useValue: () => {}
+      }
+    ]
   });
 
   beforeEach(() => {
@@ -103,14 +102,14 @@ describe('ConfirmationModalComponent', () => {
     mockFixture = TestBed.createComponent(MockComponent);
     mockComponent = mockFixture.componentInstance;
     mockFixture.detectChanges();
-    modalService = TestBed.get(BsModalService);
-    spyOn(modalService, 'show').and.callFake((_modalComp, config) => {
-      const data = modalServiceShow(ConfirmationModalComponent, config);
-      fixture = data.fixture;
-      component = data.component;
-      spyOn(component.modalRef, 'hide').and.callFake(hide);
+    modalService = TestBed.inject(ModalCdsService);
+
+    spyOn(TestBed.inject(ModalCdsService), 'show').and.callFake((_modalComp, config) => {
+      fixture = TestBed.createComponent(ConfirmationModalComponent);
+      component = fixture.componentInstance;
+      component = Object.assign(component, config);
+      spyOn(modalService, 'dismissAll').and.callThrough();
       fh.updateFixture(fixture);
-      return data.ref;
     });
   });
 
@@ -167,11 +166,11 @@ describe('ConfirmationModalComponent', () => {
   describe('basics', () => {
     beforeEach(() => {
       mockComponent.basicModal();
-      spyOn(mockComponent.modalRef, 'hide').and.callFake(hide);
+      spyOn(component, 'onSubmit').and.callThrough();
     });
 
     it('should show the correct title', () => {
-      expect(fh.getText('.modal-title')).toBe('Title is a must have');
+      expect(fh.getText('cds-modal-header h3')).toBe('Title is a must have');
     });
 
     it('should show the correct action name', () => {
@@ -180,61 +179,22 @@ describe('ConfirmationModalComponent', () => {
 
     it('should use the correct submit action', () => {
       // In order to ignore the `ElementRef` usage of `SubmitButtonComponent`
-      spyOn(
-        fixture.debugElement.query(By.directive(SubmitButtonComponent)).componentInstance,
-        'focusButton'
-      );
+      spyOn(fh.getElementByCss('.tc_submitButton').componentInstance, 'focusButton');
       fh.clickElement('.tc_submitButton');
-      expect(mockComponent.modalRef.hide).toHaveBeenCalledTimes(1);
-      expect(component.modalRef.hide).toHaveBeenCalledTimes(0);
+      expect(component.onSubmit).toHaveBeenCalledTimes(1);
+      expect(modalService.dismissAll).toHaveBeenCalledTimes(0);
       expectReturnValue('The submit action has to hide manually.');
     });
 
     it('should use the default cancel action', () => {
       fh.clickElement('.tc_backButton');
-      expect(mockComponent.modalRef.hide).toHaveBeenCalledTimes(0);
-      expect(component.modalRef.hide).toHaveBeenCalledTimes(1);
+      expect(component.onSubmit).toHaveBeenCalledTimes(0);
+      expect(modalService.dismissAll).toHaveBeenCalledTimes(1);
       expectReturnValue(undefined);
     });
 
     it('should show the description', () => {
-      expect(fh.getText('.modal-body')).toBe(
-        'Template based description.  String based description.'
-      );
-    });
-  });
-
-  describe('custom cancel action', () => {
-    const expectCancelValue = () =>
-      expectReturnValue('If you have todo something besides hiding the modal.');
-
-    beforeEach(() => {
-      mockComponent.customCancelModal();
-    });
-
-    it('should use custom cancel action', () => {
-      fh.clickElement('.tc_backButton');
-      expectCancelValue();
-    });
-
-    it('should use custom cancel action if escape was pressed', () => {
-      hide('esc');
-      expectCancelValue();
-    });
-
-    it('should use custom cancel action if clicked outside the modal', () => {
-      hide('backdrop-click');
-      expectCancelValue();
-    });
-
-    it('should unsubscribe on destroy', () => {
-      hide('backdrop-click');
-      expectCancelValue();
-      const s = 'This value will not be changed.';
-      mockComponent.returnValue = s;
-      component.ngOnDestroy();
-      hide('backdrop-click');
-      expectReturnValue(s);
+      expect(fh.getText('section')).toBe('Template based description. String based description.');
     });
   });
 });

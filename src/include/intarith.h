@@ -15,6 +15,9 @@
 #ifndef CEPH_INTARITH_H
 #define CEPH_INTARITH_H
 
+#include <bit>
+#include <climits>
+#include <concepts>
 #include <type_traits>
 
 template<typename T, typename U>
@@ -22,6 +25,10 @@ constexpr inline std::make_unsigned_t<std::common_type_t<T, U>> div_round_up(T n
   return (n + d - 1) / d;
 }
 
+template<typename T, typename U>
+constexpr inline std::make_unsigned_t<std::common_type_t<T, U>> round_down_to(T n, U d) {
+  return n - n % d;
+}
 
 template<typename T, typename U>
 constexpr inline std::make_unsigned_t<std::common_type_t<T, U>> round_up_to(T n, U d) {
@@ -31,14 +38,6 @@ constexpr inline std::make_unsigned_t<std::common_type_t<T, U>> round_up_to(T n,
 template<typename T, typename U>
 constexpr inline std::make_unsigned_t<std::common_type_t<T, U>> shift_round_up(T x, U y) {
   return (x + (1 << y) - 1) >> y;
-}
-
-/*
- * Wrapper to determine if value is a power of 2
- */
-template<typename T>
-constexpr inline bool isp2(T x) {
-  return (x & (x - 1)) == 0;
 }
 
 /*
@@ -56,6 +55,18 @@ constexpr inline bool isp2(T x) {
 template<typename T>
 constexpr inline T p2align(T x, T align) {
   return x & -align;
+}
+
+/*
+ * return whether x is aligned with (align)
+ * eg, p2aligned(1200, 1024) ==> false
+ * eg, p2aligned(1024, 1024) ==> true
+ * eg, p2aligned(0x1234, 0x100) ==> false
+ * eg, p2aligned(0x5600, 0x100) ==> true
+ */
+template<typename T>
+constexpr inline bool p2aligned(T x, T align) {
+  return p2align(x, align) == x;
 }
 
 /*
@@ -80,6 +91,17 @@ constexpr inline T p2nphase(T x, T align) {
 }
 
 /*
+ * return how much space is left in this block,
+ * when perfectly aligned, return whole block
+ * eg, p2remain(0x1234, 0x100) == 0xcc
+ * eg, p2remain(0x5600, 0x100) == 0x100
+ */
+template<typename T>
+constexpr inline T p2remain(T x, T align) {
+  return align - p2phase(x, align);
+}
+
+/*
  * return x rounded up to an align boundary
  * eg, p2roundup(0x1234, 0x100) == 0x1300 (0x13*align)
  * eg, p2roundup(0x5600, 0x100) == 0x5600 (0x56*align)
@@ -89,105 +111,10 @@ constexpr inline T p2roundup(T x, T align) {
   return -(-x & -align);
 }
 
-// count trailing zeros.
-// NOTE: the builtin is nondeterministic on 0 input
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) <= sizeof(unsigned)),
-  unsigned>::type ctz(T v) {
-  if (v == 0)
-    return sizeof(v) * 8;
-  return __builtin_ctz(v);
-}
-
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) > sizeof(unsigned int) &&
-   sizeof(T) <= sizeof(unsigned long)),
-  unsigned>::type ctz(T v) {
-  if (v == 0)
-    return sizeof(v) * 8;
-  return __builtin_ctzl(v);
-}
-
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) > sizeof(unsigned long) &&
-   sizeof(T) <= sizeof(unsigned long long)),
-  unsigned>::type ctz(T v) {
-  if (v == 0)
-    return sizeof(v) * 8;
-  return __builtin_ctzll(v);
-}
-
-// count leading zeros
-// NOTE: the builtin is nondeterministic on 0 input
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) <= sizeof(unsigned)),
-  unsigned>::type clz(T v) {
-  if (v == 0)
-    return sizeof(v) * 8;
-  return __builtin_clz(v);
-}
-
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) > sizeof(unsigned int) &&
-   sizeof(T) <= sizeof(unsigned long)),
-  unsigned>::type clz(T v) {
-  if (v == 0)
-    return sizeof(v) * 8;
-  return __builtin_clzl(v);
-}
-
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) > sizeof(unsigned long) &&
-   sizeof(T) <= sizeof(unsigned long long)),
-  unsigned>::type clz(T v) {
-  if (v == 0)
-    return sizeof(v) * 8;
-  return __builtin_clzll(v);
-}
-
 // count bits (set + any 0's that follow)
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) <= sizeof(unsigned)),
-  unsigned>::type cbits(T v) {
-  if (v == 0)
-    return 0;
-  return (sizeof(v) * 8) - __builtin_clz(v);
-}
-
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) > sizeof(unsigned int) &&
-   sizeof(T) <= sizeof(unsigned long)),
-  unsigned>::type cbits(T v) {
-  if (v == 0)
-    return 0;
-  return (sizeof(v) * 8) - __builtin_clzl(v);
-}
-
-template<class T>
-  inline typename std::enable_if<
-  (std::is_integral<T>::value &&
-   sizeof(T) > sizeof(unsigned long) &&
-   sizeof(T) <= sizeof(unsigned long long)),
-  unsigned>::type cbits(T v) {
-  if (v == 0)
-    return 0;
-  return (sizeof(v) * 8) - __builtin_clzll(v);
+template<std::integral T>
+unsigned cbits(T v) {
+  return (sizeof(v) * CHAR_BIT) - std::countl_zero(std::make_unsigned_t<T>(v));
 }
 
 #endif

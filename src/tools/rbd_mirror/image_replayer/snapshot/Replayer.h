@@ -94,6 +94,11 @@ public:
     return m_error_description;
   }
 
+  std::string get_image_spec() const {
+    std::unique_lock locker(m_lock);
+    return m_image_spec;
+  }
+
 private:
   /**
    * @verbatim
@@ -115,42 +120,48 @@ private:
    *    v (skip if not needed)                          |
    * REFRESH_REMOTE_IMAGE                               |
    *    |                                               |
+   *    | (unused non-primary snapshot)                 |
+   *    |\--------------> PRUNE_NON_PRIMARY_SNAPSHOT---/|
+   *    |                                               |
    *    | (interrupted sync)                            |
    *    |\--------------> GET_LOCAL_IMAGE_STATE ------\ |
    *    |                                             | |
    *    | (new snapshot)                              | |
    *    |\--------------> COPY_SNAPSHOTS              | |
-   *    |                     |                       | |
-   *    |                     v                       | |
+   *    |                       |                     | |
+   *    |                       v                     | |
    *    |                 GET_REMOTE_IMAGE_STATE      | |
-   *    |                     |                       | |
-   *    |                     v                       | |
+   *    |                       |                     | |
+   *    |                       v                     | |
    *    |                 CREATE_NON_PRIMARY_SNAPSHOT | |
-   *    |                     |                       | |
-   *    |                     |/----------------------/ |
-   *    |                     |                         |
-   *    |                     v                         |
+   *    |                       |                     | |
+   *    |                       v (skip if not needed)| |
+   *    |                 UPDATE_MIRROR_IMAGE_STATE   | |
+   *    |                       |                     | |
+   *    |                       |/--------------------/ |
+   *    |                       |                       |
+   *    |                       v                       |
    *    |                 REQUEST_SYNC                  |
-   *    |                     |                         |
-   *    |                     v                         |
+   *    |                       |                       |
+   *    |                       v                       |
    *    |                 COPY_IMAGE                    |
-   *    |                     |                         |
-   *    |                     v                         |
+   *    |                       |                       |
+   *    |                       v                       |
    *    |                 APPLY_IMAGE_STATE             |
-   *    |                     |                         |
-   *    |                     v                         |
+   *    |                       |                       |
+   *    |                       v                       |
    *    |                 UPDATE_NON_PRIMARY_SNAPSHOT   |
-   *    |                     |                         |
-   *    |                     v                         |
+   *    |                       |                       |
+   *    |                       v                       |
    *    |                 NOTIFY_IMAGE_UPDATE           |
-   *    |                     |                         |
-   *    |                     v                         |
-   *    |                 UNLINK_PEER                   |
-   *    |                     |                         |
-   *    |                     v                         |
+   *    |                       |                       |
+   *    | (interrupted unlink)  v                       |
+   *    |\--------------> UNLINK_PEER                   |
+   *    |                       |                       |
+   *    |                       v                       |
    *    |                 NOTIFY_LISTENER               |
-   *    |                     |                         |
-   *    |                     \------------------------/|
+   *    |                       |                       |
+   *    |                       \----------------------/|
    *    |                                               |
    *    | (remote demoted)                              |
    *    \---------------> NOTIFY_LISTENER               |
@@ -186,7 +197,6 @@ private:
   };
 
   struct C_UpdateWatchCtx;
-  struct C_TrackedOp;
   struct DeepCopyHandler;
 
   Threads<ImageCtxT>* m_threads;
@@ -200,13 +210,14 @@ private:
 
   State m_state = STATE_INIT;
 
+  std::string m_image_spec;
   Context* m_on_init_shutdown = nullptr;
 
   bool m_resync_requested = false;
   int m_error_code = 0;
   std::string m_error_description;
 
-  C_UpdateWatchCtx* m_update_watch_ctx;
+  C_UpdateWatchCtx* m_update_watch_ctx = nullptr;
   uint64_t m_local_update_watcher_handle = 0;
   uint64_t m_remote_update_watcher_handle = 0;
   bool m_image_updated = false;
@@ -227,18 +238,24 @@ private:
   DeepCopyHandler* m_deep_copy_handler = nullptr;
 
   TimeRollingMean m_bytes_per_second;
+  uint64_t m_last_snapshot_sync_seconds = 0;
 
   uint64_t m_snapshot_bytes = 0;
+  uint64_t m_last_snapshot_bytes = 0;
+
   boost::accumulators::accumulator_set<
     uint64_t, boost::accumulators::stats<
       boost::accumulators::tag::rolling_mean>> m_bytes_per_snapshot{
     boost::accumulators::tag::rolling_window::window_size = 2};
+  utime_t m_snapshot_replay_start;
 
   uint32_t m_pending_snapshots = 0;
 
   bool m_remote_image_updated = false;
   bool m_updating_sync_point = false;
   bool m_sync_in_progress = false;
+
+  PerfCounters *m_perf_counters = nullptr;
 
   void load_local_image_meta();
   void handle_load_local_image_meta(int r);
@@ -252,6 +269,9 @@ private:
   void scan_local_mirror_snapshots(std::unique_lock<ceph::mutex>* locker);
   void scan_remote_mirror_snapshots(std::unique_lock<ceph::mutex>* locker);
 
+  void prune_non_primary_snapshot(uint64_t snap_id);
+  void handle_prune_non_primary_snapshot(int r);
+
   void copy_snapshots();
   void handle_copy_snapshots(int r);
 
@@ -263,6 +283,9 @@ private:
 
   void create_non_primary_snapshot();
   void handle_create_non_primary_snapshot(int r);
+
+  void update_mirror_image_state();
+  void handle_update_mirror_image_state(int r);
 
   void request_sync();
   void handle_request_sync(int r);
@@ -282,7 +305,7 @@ private:
   void notify_image_update();
   void handle_notify_image_update(int r);
 
-  void unlink_peer();
+  void unlink_peer(uint64_t remote_snap_id);
   void handle_unlink_peer(int r);
 
   void finish_sync();
@@ -312,6 +335,8 @@ private:
   bool is_replay_interrupted();
   bool is_replay_interrupted(std::unique_lock<ceph::mutex>* lock);
 
+  void register_perf_counters();
+  void unregister_perf_counters();
 };
 
 } // namespace snapshot

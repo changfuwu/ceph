@@ -74,6 +74,7 @@ public:
  * until wait() returns.
  */
 class C_SaferCond : public Context {
+protected:
   ceph::mutex lock;  ///< Mutex to take
   ceph::condition_variable cond;     ///< Cond to signal
   bool done = false; ///< true after finish() has been called
@@ -103,11 +104,15 @@ public:
 
   /// Wait until the \c secs expires or \c complete() is called
   int wait_for(double secs) {
+    return wait_for(ceph::make_timespan(secs));
+  }
+
+  int wait_for(ceph::timespan secs) {
     std::unique_lock l{lock};
     if (done) {
       return rval;
     }
-    if (cond.wait_for(l, ceph::make_timespan(secs), [this] { return done; })) {
+    if (cond.wait_for(l, secs, [this] { return done; })) {
       return rval;
     } else {
       return ETIMEDOUT;

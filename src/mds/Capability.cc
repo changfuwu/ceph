@@ -13,10 +13,17 @@
  */
 
 #include "Capability.h"
+#include "BatchOp.h"
 #include "CInode.h"
 #include "SessionMap.h"
 
+#include "common/debug.h"
 #include "common/Formatter.h"
+
+#define dout_context g_ceph_context
+#define dout_subsys ceph_subsys_mds
+#undef dout_prefix
+#define dout_prefix *_dout << "Capability "
 
 
 /*
@@ -57,9 +64,9 @@ void Capability::Export::decode(ceph::buffer::list::const_iterator &p)
 void Capability::Export::dump(ceph::Formatter *f) const
 {
   f->dump_unsigned("cap_id", cap_id);
-  f->dump_unsigned("wanted", wanted);
-  f->dump_unsigned("issued", issued);
-  f->dump_unsigned("pending", pending);
+  f->dump_stream("wanted") << ccap_string(wanted);
+  f->dump_stream("issued") << ccap_string(issued);
+  f->dump_stream("pending") << ccap_string(pending);
   f->dump_unsigned("client_follows", client_follows);
   f->dump_unsigned("seq", seq);
   f->dump_unsigned("migrate_seq", mseq);
@@ -68,14 +75,8 @@ void Capability::Export::dump(ceph::Formatter *f) const
 
 void Capability::Export::generate_test_instances(std::list<Capability::Export*>& ls)
 {
-  ls.push_back(new Export);
-  ls.push_back(new Export);
-  ls.back()->wanted = 1;
-  ls.back()->issued = 2;
-  ls.back()->pending = 3;
-  ls.back()->client_follows = 4;
-  ls.back()->mseq = 5;
-  ls.back()->last_issue_stamp = utime_t(6, 7);
+  ls.push_back(new Export());
+  ls.push_back(new Export(1, 2, 3, 4, 5, 6, 7, utime_t(8, 9), 10));
 }
 
 void Capability::Import::encode(ceph::buffer::list &bl) const
@@ -103,6 +104,11 @@ void Capability::Import::dump(ceph::Formatter *f) const
   f->dump_unsigned("migrate_seq", mseq);
 }
 
+void Capability::Import::generate_test_instances(std::list<Capability::Import*>& ls)
+{
+  ls.push_back(new Import());
+  ls.push_back(new Import(1, 2, 3));
+}
 /*
  * Capability::revoke_info
  */
@@ -146,8 +152,7 @@ void Capability::revoke_info::generate_test_instances(std::list<Capability::revo
  * Capability
  */
 Capability::Capability(CInode *i, Session *s, uint64_t id) :
-  item_session_caps(this), item_snaprealm_caps(this),
-  item_revoking_caps(this), item_client_revoking_caps(this),
+  item_session_caps(this),
   lock_caches(member_offset(MDLockCache, item_cap_lock_cache)),
   inode(i), session(s), cap_id(id)
 {
@@ -174,6 +179,46 @@ Capability::Capability(CInode *i, Session *s, uint64_t id) :
 client_t Capability::get_client() const
 {
   return session ? session->get_client() : client_t(-1);
+}
+
+int Capability::confirm_receipt(ceph_seq_t seq, unsigned caps) {
+  int was_revoking = (_issued & ~_pending);
+  if (seq == last_sent) {
+    _revokes.clear();
+    _issued = caps;
+    // don't add bits
+    _pending &= caps;
+
+    // if the revoking is not totally finished just add the
+    // new revoking caps back.
+    if (was_revoking && revoking()) {
+      CInode *in = get_inode();
+      dout(10) << "revocation is not totally finished yet on " << *in
+               << ", the session " << *session << dendl;
+      _revokes.emplace_back(_pending, last_sent, last_issue);
+      if (!is_notable())
+        mark_notable();
+    }
+  } else {
+    // can i forget any revocations?
+    while (!_revokes.empty() && _revokes.front().seq < seq)
+      _revokes.pop_front();
+    if (!_revokes.empty()) {
+      if (_revokes.front().seq == seq)
+        _revokes.begin()->before = caps;
+      calc_issued();
+    } else {
+      // seq < last_sent
+      _issued = caps | _pending;
+    }
+  }
+
+  if (was_revoking && _issued == _pending) {
+    item_revoking_caps.remove_myself();
+    item_client_revoking_caps.remove_myself();
+    maybe_clear_notable();
+  }
+  return was_revoking & ~_issued; // return revoked
 }
 
 bool Capability::is_stale() const
@@ -212,15 +257,12 @@ void Capability::maybe_clear_notable()
 void Capability::set_wanted(int w) {
   CInode *in = get_inode();
   if (in) {
-    if (!_wanted && w) {
-      in->adjust_num_caps_wanted(1);
-    } else if (_wanted && !w) {
-      in->adjust_num_caps_wanted(-1);
-    }
     if (!is_wanted_notable(_wanted) && is_wanted_notable(w)) {
+      in->adjust_num_caps_notable(1);
       if (!is_notable())
 	mark_notable();
     } else if (is_wanted_notable(_wanted) && !is_wanted_notable(w)) {
+      in->adjust_num_caps_notable(-1);
       maybe_clear_notable();
     }
   }
@@ -257,10 +299,12 @@ void Capability::decode(ceph::buffer::list::const_iterator &bl)
 
 void Capability::dump(ceph::Formatter *f) const
 {
+  if (inode)
+    f->dump_stream("ino") << inode->ino();
   f->dump_unsigned("last_sent", last_sent);
-  f->dump_unsigned("last_issue_stamp", last_issue_stamp);
-  f->dump_unsigned("wanted", _wanted);
-  f->dump_unsigned("pending", _pending);
+  f->dump_stream("last_issue_stamp") << last_issue_stamp;
+  f->dump_stream("wanted") << ccap_string(_wanted);
+  f->dump_stream("pending") << ccap_string(_pending);
 
   f->open_array_section("revokes");
   for (const auto &r : _revokes) {

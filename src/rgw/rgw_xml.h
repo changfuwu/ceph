@@ -1,8 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#ifndef CEPH_RGW_XML_H
-#define CEPH_RGW_XML_H
+#pragma once
 
 #include <map>
 #include <stdexcept>
@@ -10,17 +9,18 @@
 #include <iosfwd>
 #include <include/types.h>
 #include <common/Formatter.h>
+#include "common/ceph_time.h"
 
 class XMLObj;
 class RGWXMLParser;
 
 class XMLObjIter {
 public:
-  typedef map<std::string, XMLObj *>::iterator map_iter_t;
-  typedef map<std::string, XMLObj *>::iterator const_map_iter_t;
+  typedef std::map<std::string, XMLObj *>::iterator map_iter_t;
+  typedef std::map<std::string, XMLObj *>::iterator const_map_iter_t;
 
   XMLObjIter();
-  ~XMLObjIter();
+  virtual ~XMLObjIter();
   void set(const XMLObjIter::const_map_iter_t &_cur, const XMLObjIter::const_map_iter_t &_end);
   XMLObj *get_next();
   bool get_name(std::string& name) const;
@@ -76,7 +76,7 @@ public:
   // return the first sub-tags matching the name
   XMLObj *find_first(const std::string& name);
 
-  friend ostream& operator<<(ostream &out, const XMLObj &obj);
+  friend std::ostream& operator<<(std::ostream &out, const XMLObj &obj);
   friend RGWXMLParser;
 };
 
@@ -122,7 +122,7 @@ private:
 protected:
   // if objects are created while parsing, this should be implemented in the derived class
   // and be a factory for creating the classes derived from XMLObj
-  // note that not all sub-tags has to be constructed here, any such tag which is not 
+  // note that not all sub-tags has to be constructed here, any such tag which is not
   // constructed will be lazily created when decode_xml() is invoked on it
   //
   // note that in case of different tags sharing the same name at different levels
@@ -133,7 +133,7 @@ protected:
 
 public:
   RGWXMLParser();
-  ~RGWXMLParser() override;
+  virtual ~RGWXMLParser() override;
 
   // initialize the parser, must be called before parsing
   bool init();
@@ -165,7 +165,7 @@ namespace RGWXMLDecoder {
   void decode_xml(const char *name, T& val, T& default_val, XMLObj* obj);
 }
 
-static inline ostream& operator<<(ostream &out, RGWXMLDecoder::err& err)
+static inline std::ostream& operator<<(std::ostream &out, RGWXMLDecoder::err& err)
 {
   return out << err.what();
 }
@@ -176,7 +176,7 @@ void decode_xml_obj(T& val, XMLObj *obj)
   val.decode_xml(obj);
 }
 
-static inline void decode_xml_obj(string& val, XMLObj *obj)
+static inline void decode_xml_obj(std::string& val, XMLObj *obj)
 {
   val = obj->get_data();
 }
@@ -191,6 +191,7 @@ void decode_xml_obj(bool& val, XMLObj *obj);
 void decode_xml_obj(bufferlist& val, XMLObj *obj);
 class utime_t;
 void decode_xml_obj(utime_t& val, XMLObj *obj);
+void decode_xml_obj(ceph::real_time& val, XMLObj *obj);
 
 template<class T>
 void decode_xml_obj(std::optional<T>& val, XMLObj *obj)
@@ -200,7 +201,7 @@ void decode_xml_obj(std::optional<T>& val, XMLObj *obj)
 }
 
 template<class T>
-void do_decode_xml_obj(list<T>& l, const string& name, XMLObj *obj)
+void do_decode_xml_obj(std::list<T>& l, const std::string& name, XMLObj *obj)
 {
   l.clear();
 
@@ -221,7 +222,7 @@ bool RGWXMLDecoder::decode_xml(const char *name, T& val, XMLObj *obj, bool manda
   XMLObj *o = iter.get_next();
   if (!o) {
     if (mandatory) {
-      string s = "missing mandatory field " + string(name);
+      std::string s = "missing mandatory field " + std::string(name);
       throw err(s);
     }
     val = T();
@@ -231,7 +232,7 @@ bool RGWXMLDecoder::decode_xml(const char *name, T& val, XMLObj *obj, bool manda
   try {
     decode_xml_obj(val, o);
   } catch (const err& e) {
-    string s = string(name) + ": ";
+    std::string s = std::string(name) + ": ";
     s.append(e.what());
     throw err(s);
   }
@@ -249,7 +250,7 @@ bool RGWXMLDecoder::decode_xml(const char *name, std::vector<T>& v, XMLObj *obj,
 
   if (!o) {
     if (mandatory) {
-      string s = "missing mandatory field " + string(name);
+      std::string s = "missing mandatory field " + std::string(name);
       throw err(s);
     }
     return false;
@@ -260,7 +261,7 @@ bool RGWXMLDecoder::decode_xml(const char *name, std::vector<T>& v, XMLObj *obj,
     try {
       decode_xml_obj(val, o);
     } catch (const err& e) {
-      string s = string(name) + ": ";
+      std::string s = std::string(name) + ": ";
       s.append(e.what());
       throw err(s);
     }
@@ -278,7 +279,7 @@ bool RGWXMLDecoder::decode_xml(const char *name, C& container, void (*cb)(C&, XM
   XMLObj *o = iter.get_next();
   if (!o) {
     if (mandatory) {
-      string s = "missing mandatory field " + string(name);
+      std::string s = "missing mandatory field " + std::string(name);
       throw err(s);
     }
     return false;
@@ -287,7 +288,7 @@ bool RGWXMLDecoder::decode_xml(const char *name, C& container, void (*cb)(C&, XM
   try {
     decode_xml_obj(container, cb, o);
   } catch (const err& e) {
-    string s = string(name) + ": ";
+    std::string s = std::string(name) + ": ";
     s.append(e.what());
     throw err(s);
   }
@@ -309,7 +310,7 @@ void RGWXMLDecoder::decode_xml(const char *name, T& val, T& default_val, XMLObj 
     decode_xml_obj(val, o);
   } catch (const err& e) {
     val = default_val;
-    string s = string(name) + ": ";
+    std::string s = std::string(name) + ": ";
     s.append(e.what());
     throw err(s);
   }
@@ -331,7 +332,8 @@ static void encode_xml(const char *name, const char *ns, const T& val, ceph::For
   f->close_section();
 }
 
-void encode_xml(const char *name, const string& val, ceph::Formatter *f);
+void encode_xml(const char *name, const std::string& val, ceph::Formatter *f);
+void encode_xml(const char *name, const std::string_view& val, ceph::Formatter *f);
 void encode_xml(const char *name, const char *val, ceph::Formatter *f);
 void encode_xml(const char *name, bool val, ceph::Formatter *f);
 void encode_xml(const char *name, int val, ceph::Formatter *f);
@@ -370,6 +372,3 @@ static void encode_xml(const char *name, const std::optional<T>& o, ceph::Format
 
   encode_xml(name, *o, f);
 }
-
-
-#endif

@@ -1,11 +1,11 @@
 """
 MDS admin socket scrubbing-related tests.
 """
-import json
 import logging
 import errno
 import time
 from teuthology.exceptions import CommandFailedError
+from teuthology.contextutil import safe_while
 import os
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
 
@@ -20,44 +20,65 @@ class TestScrubControls(CephFSTestCase):
     CLIENTS_REQUIRED = 1
 
     def _abort_scrub(self, expected):
-        res = self.fs.rank_tell(["scrub", "abort"])
+        res = self.fs.run_scrub(["abort"])
         self.assertEqual(res['return_code'], expected)
     def _pause_scrub(self, expected):
-        res = self.fs.rank_tell(["scrub", "pause"])
+        res = self.fs.run_scrub(["pause"])
         self.assertEqual(res['return_code'], expected)
     def _resume_scrub(self, expected):
-        res = self.fs.rank_tell(["scrub", "resume"])
+        res = self.fs.run_scrub(["resume"])
         self.assertEqual(res['return_code'], expected)
-    def _get_scrub_status(self):
-        return self.fs.rank_tell(["scrub", "status"])
-    def _check_task_status(self, expected_status):
-        task_status = self.fs.get_task_status("scrub status")
-        active = self.fs.get_active_names()
-        log.debug("current active={0}".format(active))
-        self.assertTrue(task_status[active[0]].startswith(expected_status))
+    def _check_task_status(self, expected_status, timo=120):
+        """ check scrub status for current active mds in ceph status """
+        with safe_while(sleep=1, tries=120, action='wait for task status') as proceed:
+            while proceed():
+                active = self.fs.get_active_names()
+                log.debug("current active={0}".format(active))
+                task_status = self.fs.get_task_status("scrub status")
+                try:
+                    if task_status[active[0]].startswith(expected_status):
+                        return True
+                except KeyError:
+                    pass
+
+    def _check_task_status_na(self, timo=120):
+        """ check absence of scrub status in ceph status """
+        with safe_while(sleep=1, tries=120, action='wait for task status') as proceed:
+            while proceed():
+                active = self.fs.get_active_names()
+                log.debug("current active={0}".format(active))
+                task_status = self.fs.get_task_status("scrub status")
+                if not active[0] in task_status:
+                    return True
+
+    def create_scrub_data(self, test_dir):
+        for i in range(32):
+            dirname = "dir.{0}".format(i)
+            dirpath = os.path.join(test_dir, dirname)
+            self.mount_a.run_shell_payload(f"""
+set -e
+mkdir -p {dirpath}
+for ((i = 0; i < 32; i++)); do
+    dd if=/dev/urandom of={dirpath}/filename.$i bs=1M conv=fdatasync count=1
+done
+""")
 
     def test_scrub_abort(self):
         test_dir = "scrub_control_test_path"
         abs_test_path = "/{0}".format(test_dir)
 
-        log.info("mountpoint: {0}".format(self.mount_a.mountpoint))
-        client_path = os.path.join(self.mount_a.mountpoint, test_dir)
-        log.info("client_path: {0}".format(client_path))
+        self.create_scrub_data(test_dir)
 
-        log.info("Cloning repo into place")
-        TestScrubChecks.clone_repo(self.mount_a, client_path)
-
-        out_json = self.fs.rank_tell(["scrub", "start", abs_test_path, "recursive"])
+        out_json = self.fs.run_scrub(["start", abs_test_path, "recursive"])
         self.assertNotEqual(out_json, None)
 
         # abort and verify
         self._abort_scrub(0)
-        out_json = self._get_scrub_status()
-        self.assertTrue("no active" in out_json['status'])
+        self.fs.wait_until_scrub_complete(sleep=5, timeout=30)
 
         # sleep enough to fetch updated task status
-        time.sleep(10)
-        self._check_task_status("idle")
+        checked = self._check_task_status_na()
+        self.assertTrue(checked)
 
     def test_scrub_pause_and_resume(self):
         test_dir = "scrub_control_test_path"
@@ -67,80 +88,83 @@ class TestScrubControls(CephFSTestCase):
         client_path = os.path.join(self.mount_a.mountpoint, test_dir)
         log.info("client_path: {0}".format(client_path))
 
-        log.info("Cloning repo into place")
-        _ = TestScrubChecks.clone_repo(self.mount_a, client_path)
+        self.create_scrub_data(test_dir)
 
-        out_json = self.fs.rank_tell(["scrub", "start", abs_test_path, "recursive"])
+        out_json = self.fs.run_scrub(["start", abs_test_path, "recursive"])
         self.assertNotEqual(out_json, None)
 
         # pause and verify
         self._pause_scrub(0)
-        out_json = self._get_scrub_status()
+        out_json = self.fs.get_scrub_status()
         self.assertTrue("PAUSED" in out_json['status'])
 
-        # sleep enough to fetch updated task status
-        time.sleep(10)
-        self._check_task_status("paused")
+        checked = self._check_task_status("paused")
+        self.assertTrue(checked)
 
         # resume and verify
         self._resume_scrub(0)
-        out_json = self._get_scrub_status()
+        out_json = self.fs.get_scrub_status()
         self.assertFalse("PAUSED" in out_json['status'])
+
+        checked = self._check_task_status_na()
+        self.assertTrue(checked)
 
     def test_scrub_pause_and_resume_with_abort(self):
         test_dir = "scrub_control_test_path"
         abs_test_path = "/{0}".format(test_dir)
 
-        log.info("mountpoint: {0}".format(self.mount_a.mountpoint))
-        client_path = os.path.join(self.mount_a.mountpoint, test_dir)
-        log.info("client_path: {0}".format(client_path))
+        self.create_scrub_data(test_dir)
 
-        log.info("Cloning repo into place")
-        _ = TestScrubChecks.clone_repo(self.mount_a, client_path)
-
-        out_json = self.fs.rank_tell(["scrub", "start", abs_test_path, "recursive"])
+        out_json = self.fs.run_scrub(["start", abs_test_path, "recursive"])
         self.assertNotEqual(out_json, None)
 
         # pause and verify
         self._pause_scrub(0)
-        out_json = self._get_scrub_status()
+        out_json = self.fs.get_scrub_status()
         self.assertTrue("PAUSED" in out_json['status'])
 
-        # sleep enough to fetch updated task status
-        time.sleep(10)
-        self._check_task_status("paused")
+        checked = self._check_task_status("paused")
+        self.assertTrue(checked)
 
         # abort and verify
         self._abort_scrub(0)
-        out_json = self._get_scrub_status()
+        out_json = self.fs.get_scrub_status()
         self.assertTrue("PAUSED" in out_json['status'])
         self.assertTrue("0 inodes" in out_json['status'])
 
-        # sleep enough to fetch updated task status
-        time.sleep(10)
-        self._check_task_status("paused")
+        # scrub status should still be paused...
+        checked = self._check_task_status("paused")
+        self.assertTrue(checked)
 
         # resume and verify
         self._resume_scrub(0)
-        out_json = self._get_scrub_status()
-        self.assertTrue("no active" in out_json['status'])
+        self.assertTrue(self.fs.wait_until_scrub_complete(sleep=5, timeout=30))
 
-        # sleep enough to fetch updated task status
-        time.sleep(10)
-        self._check_task_status("idle")
+        checked = self._check_task_status_na()
+        self.assertTrue(checked)
 
     def test_scrub_task_status_on_mds_failover(self):
-        # sleep enough to fetch updated task status
-        time.sleep(10)
-
         (original_active, ) = self.fs.get_active_names()
         original_standbys = self.mds_cluster.get_standby_daemons()
-        self._check_task_status("idle")
+
+        test_dir = "scrub_control_test_path"
+        abs_test_path = "/{0}".format(test_dir)
+
+        self.create_scrub_data(test_dir)
+
+        out_json = self.fs.run_scrub(["start", abs_test_path, "recursive"])
+        self.assertNotEqual(out_json, None)
+
+        # pause and verify
+        self._pause_scrub(0)
+        out_json = self.fs.get_scrub_status()
+        self.assertTrue("PAUSED" in out_json['status'])
+
+        checked = self._check_task_status("paused")
+        self.assertTrue(checked)
 
         # Kill the rank 0
         self.fs.mds_stop(original_active)
-
-        grace = float(self.fs.get_config("mds_beacon_grace", service_type="mon"))
 
         def promoted():
             active = self.fs.get_active_names()
@@ -148,14 +172,43 @@ class TestScrubControls(CephFSTestCase):
 
         log.info("Waiting for promotion of one of the original standbys {0}".format(
             original_standbys))
-        self.wait_until_true(promoted, timeout=grace*2)
+        self.wait_until_true(promoted, timeout=self.fs.beacon_timeout)
 
-        mgr_beacon_grace = float(self.fs.get_config("mgr_service_beacon_grace", service_type="mon"))
+        self._check_task_status_na()
 
-        def status_check():
-            task_status = self.fs.get_task_status("scrub status")
-            return original_active not in task_status
-        self.wait_until_true(status_check, timeout=mgr_beacon_grace*2)
+    def test_scrub_when_mds_is_inactive(self):
+        test_dir = "scrub_control_test_path"
+        abs_test_path = f"/{test_dir}"
+
+        self.create_scrub_data(test_dir)
+
+        # allow standby-replay
+        self.fs.set_max_mds(1)
+        self.fs.set_allow_standby_replay(True)
+        status = self.fs.wait_for_daemons()
+        sr_mds_id = self.fs.get_daemon_names('up:standby-replay', status=status)[0]
+
+        # start the scrub and verify
+        with self.assertRaises(CommandFailedError) as ce:
+            self.run_ceph_cmd('tell', f'mds.{sr_mds_id}', 'scrub', 
+                              'start', abs_test_path, 'recursive')
+        self.assertEqual(ce.exception.exitstatus, errno.EINVAL)
+
+        # pause and verify
+        with self.assertRaises(CommandFailedError) as ce:
+            self.run_ceph_cmd('tell', f'mds.{sr_mds_id}', 'scrub', 'pause')
+        self.assertEqual(ce.exception.exitstatus, errno.EINVAL)
+        
+        # abort and verify
+        with self.assertRaises(CommandFailedError) as ce:
+            self.run_ceph_cmd('tell', f'mds.{sr_mds_id}', 'scrub', 'abort')
+        self.assertEqual(ce.exception.exitstatus, errno.EINVAL)
+        
+        # resume and verify
+        with self.assertRaises(CommandFailedError) as ce:
+            self.run_ceph_cmd('tell', f'mds.{sr_mds_id}', 'scrub', 'resume')
+        self.assertEqual(ce.exception.exitstatus, errno.EINVAL)
+
 
 class TestScrubChecks(CephFSTestCase):
     """
@@ -179,6 +232,8 @@ class TestScrubChecks(CephFSTestCase):
 
     MDSS_REQUIRED = 1
     CLIENTS_REQUIRED = 1
+    def get_dsplits(self, dir_ino):
+        return self.fs.rank_asok(['dump', 'inode', str(dir_ino)])['dirfragtree']['splits']
 
     def test_scrub_checks(self):
         self._checks(0)
@@ -205,7 +260,7 @@ class TestScrubChecks(CephFSTestCase):
         success_validator = lambda j, r: self.json_validator(j, r, "return_code", 0)
 
         nep = "{test_path}/i/dont/exist".format(test_path=abs_test_path)
-        self.asok_command(mds_rank, "flush_path {nep}".format(nep=nep),
+        self.tell_command(mds_rank, "flush_path {nep}".format(nep=nep),
                           lambda j, r: self.json_validator(j, r, "return_code", -errno.ENOENT))
         self.tell_command(mds_rank, "scrub start {nep}".format(nep=nep),
                           lambda j, r: self.json_validator(j, r, "return_code", -errno.ENOENT))
@@ -216,7 +271,7 @@ class TestScrubChecks(CephFSTestCase):
         if run_seq == 0:
             log.info("First run: flushing {dirpath}".format(dirpath=dirpath))
             command = "flush_path {dirpath}".format(dirpath=dirpath)
-            self.asok_command(mds_rank, command, success_validator)
+            self.tell_command(mds_rank, command, success_validator)
         command = "scrub start {dirpath}".format(dirpath=dirpath)
         self.tell_command(mds_rank, command, success_validator)
 
@@ -225,21 +280,14 @@ class TestScrubChecks(CephFSTestCase):
         if run_seq == 0:
             log.info("First run: flushing {filepath}".format(filepath=filepath))
             command = "flush_path {filepath}".format(filepath=filepath)
-            self.asok_command(mds_rank, command, success_validator)
+            self.tell_command(mds_rank, command, success_validator)
         command = "scrub start {filepath}".format(filepath=filepath)
         self.tell_command(mds_rank, command, success_validator)
-
-        filepath = "{repo_path}/suites/fs/basic/clusters/fixed-3-cephfs.yaml". \
-            format(repo_path=test_repo_path)
-        command = "scrub start {filepath}".format(filepath=filepath)
-        self.tell_command(mds_rank, command,
-                          lambda j, r: self.json_validator(j, r, "performed_validation",
-                                                           False))
 
         if run_seq == 0:
             log.info("First run: flushing base dir /")
             command = "flush_path /"
-            self.asok_command(mds_rank, command, success_validator)
+            self.tell_command(mds_rank, command, success_validator)
         command = "scrub start /"
         self.tell_command(mds_rank, command, success_validator)
 
@@ -248,7 +296,7 @@ class TestScrubChecks(CephFSTestCase):
                                                         i=run_seq)
         self.mount_a.run_shell(["mkdir", new_dir])
         command = "flush_path {dir}".format(dir=test_new_dir)
-        self.asok_command(mds_rank, command, success_validator)
+        self.tell_command(mds_rank, command, success_validator)
 
         new_file = "{repo_path}/new_file_{i}".format(repo_path=repo_path,
                                                      i=run_seq)
@@ -257,32 +305,68 @@ class TestScrubChecks(CephFSTestCase):
         self.mount_a.write_n_mb(new_file, 1)
 
         command = "flush_path {file}".format(file=test_new_file)
-        self.asok_command(mds_rank, command, success_validator)
+        self.tell_command(mds_rank, command, success_validator)
 
         # check that scrub fails on errors
         ino = self.mount_a.path_to_ino(new_file)
         rados_obj_name = "{ino:x}.00000000".format(ino=ino)
         command = "scrub start {file}".format(file=test_new_file)
 
-        # Missing parent xattr -> ENODATA
-        self.fs.rados(["rmxattr", rados_obj_name, "parent"], pool=self.fs.get_data_pool_name())
-        self.tell_command(mds_rank, command,
-                          lambda j, r: self.json_validator(j, r, "return_code", -errno.ENODATA))
+        def _check_and_clear_damage(ino, dtype):
+            all_damage = self.fs.rank_tell(["damage", "ls"], rank=mds_rank)
+            damage = [d for d in all_damage if d['ino'] == ino and d['damage_type'] == dtype]
+            for d in damage:
+                self.run_ceph_cmd(
+                    'tell', f'mds.{self.fs.get_active_names()[mds_rank]}',
+                    "damage", "rm", str(d['id']))
+            return len(damage) > 0
 
-        # Missing object -> ENOENT
-        self.fs.rados(["rm", rados_obj_name], pool=self.fs.get_data_pool_name())
-        self.tell_command(mds_rank, command,
-                          lambda j, r: self.json_validator(j, r, "return_code", -errno.ENOENT))
+        # Missing parent xattr
+        self.assertFalse(_check_and_clear_damage(ino, "backtrace"));
+        self.fs.rados(["rmxattr", rados_obj_name, "parent"], pool=self.fs.get_data_pool_name())
+        self.tell_command(mds_rank, command, success_validator)
+        self.fs.wait_until_scrub_complete(sleep=5, timeout=30)
+        self.assertTrue(_check_and_clear_damage(ino, "backtrace"));
 
         command = "flush_path /"
-        self.asok_command(mds_rank, command, success_validator)
+        self.tell_command(mds_rank, command, success_validator)
+
+    def scrub_with_stray_evaluation(self, fs, mnt, path, flag, files=2000,
+                                    _hard_links=3):
+        fs.set_allow_new_snaps(True)
+
+        test_dir = "stray_eval_dir"
+        mnt.run_shell(["mkdir", test_dir])
+        client_path = os.path.join(mnt.mountpoint, test_dir)
+        mnt.create_n_files(fs_path=f"{test_dir}/file", count=files,
+                           hard_links=_hard_links)
+        mnt.run_shell(["mkdir", f"{client_path}/.snap/snap1-{test_dir}"])
+        mnt.run_shell(f"find {client_path}/ -type f -delete")
+        mnt.run_shell(["rmdir", f"{client_path}/.snap/snap1-{test_dir}"])
+        perf_dump = fs.rank_tell(["perf", "dump"], rank=0)
+        self.assertNotEqual(perf_dump.get('mds_cache').get('num_strays'),
+                            0, "mdcache.num_strays is zero")
+
+        log.info(
+            f"num of strays: {perf_dump.get('mds_cache').get('num_strays')}")
+
+        out_json = fs.run_scrub(["start", path, flag])
+        self.assertNotEqual(out_json, None)
+        self.assertEqual(out_json["return_code"], 0)
+
+        self.assertEqual(
+            fs.wait_until_scrub_complete(tag=out_json["scrub_tag"]), True)
+
+        perf_dump = fs.rank_tell(["perf", "dump"], rank=0)
+        self.assertEqual(int(perf_dump.get('mds_cache').get('num_strays')),
+                         0, "mdcache.num_strays is non-zero")
 
     def test_scrub_repair(self):
         mds_rank = 0
         test_dir = "scrub_repair_path"
 
-        self.mount_a.run_shell(["sudo", "mkdir", test_dir])
-        self.mount_a.run_shell(["sudo", "touch", "{0}/file".format(test_dir)])
+        self.mount_a.run_shell(["mkdir", test_dir])
+        self.mount_a.run_shell(["touch", "{0}/file".format(test_dir)])
         dir_objname = "{:x}.00000000".format(self.mount_a.path_to_ino(test_dir))
 
         self.mount_a.umount_wait()
@@ -292,18 +376,16 @@ class TestScrubChecks(CephFSTestCase):
         self.fs.mds_stop()
 
         # remove the dentry from dirfrag, cause incorrect fragstat/rstat
-        self.fs.rados(["rmomapkey", dir_objname, "file_head"],
-                      pool=self.fs.get_metadata_pool_name())
+        self.fs.radosm(["rmomapkey", dir_objname, "file_head"])
 
         self.fs.mds_fail_restart()
         self.fs.wait_for_daemons()
 
-        self.mount_a.mount()
-        self.mount_a.wait_until_mounted()
+        self.mount_a.mount_wait()
 
         # fragstat indicates the directory is not empty, rmdir should fail
         with self.assertRaises(CommandFailedError) as ar:
-            self.mount_a.run_shell(["sudo", "rmdir", test_dir])
+            self.mount_a.run_shell(["rmdir", test_dir])
         self.assertEqual(ar.exception.exitstatus, 1)
 
         self.tell_command(mds_rank, "scrub start /{0} repair".format(test_dir),
@@ -313,7 +395,101 @@ class TestScrubChecks(CephFSTestCase):
         time.sleep(10)
 
         # fragstat should be fixed
-        self.mount_a.run_shell(["sudo", "rmdir", test_dir])
+        self.mount_a.run_shell(["rmdir", test_dir])
+
+    def test_scrub_merge_dirfrags(self):
+        """
+        That a directory is merged during scrub.
+        """
+
+        test_path = "testdir"
+        abs_test_path = f"/{test_path}"
+        split_size = 20
+        merge_size = 5
+        split_bits = 1
+        self.config_set('mds', 'mds_bal_split_size', split_size)
+        self.config_set('mds', 'mds_bal_merge_size', merge_size)
+        self.config_set('mds', 'mds_bal_split_bits', split_bits)
+
+        self.mount_a.run_shell(["mkdir", test_path])
+        dir_ino=self.mount_a.path_to_ino(test_path)
+
+        self.assertEqual(len(self.get_dsplits(dir_ino)), 0)
+        self.mount_a.create_n_files(f"{test_path}/file", split_size * 2)
+
+        self.mount_a.umount_wait()
+
+        self.fs.flush()
+        self.fs.mds_fail_restart()
+        self.fs.wait_for_daemons()
+
+        split_size = 100
+        merge_size = 30
+        self.config_set('mds', 'mds_bal_split_size', split_size)
+        self.config_set('mds', 'mds_bal_merge_size', merge_size)
+
+        #Assert to ensure split is present
+        self.assertGreater(len(self.get_dsplits(dir_ino)), 0)
+        out_json = self.fs.run_scrub(["start", abs_test_path, "recursive"])
+        self.assertNotEqual(out_json, None)
+
+        #Wait until no splits to confirm merge by scrub
+        self.wait_until_true(
+            lambda: len(self.get_dsplits(dir_ino)) == 0,
+            timeout=30
+        )
+
+    def test_scrub_split_dirfrags(self):
+        """
+        That a directory is split during scrub.
+        """
+
+        test_path = "testdir"
+        abs_test_path = f"/{test_path}"
+        split_size = 20
+        merge_size = 5
+        split_bits = 1
+
+        self.mount_a.run_shell(["mkdir", test_path])
+        dir_ino=self.mount_a.path_to_ino(test_path)
+
+        self.assertEqual(len(self.get_dsplits(dir_ino)), 0)
+        self.mount_a.create_n_files(f"{test_path}/file", split_size + 1)
+
+        self.mount_a.umount_wait()
+
+        self.fs.flush()
+        self.fs.mds_fail_restart()
+        self.fs.wait_for_daemons()
+
+        self.config_set('mds', 'mds_bal_split_size', split_size)
+        self.config_set('mds', 'mds_bal_merge_size', merge_size)
+        self.config_set('mds', 'mds_bal_split_bits', split_bits)
+
+        #Assert to ensure no splits are present
+        self.assertEqual(len(self.get_dsplits(dir_ino)), 0)
+        out_json = self.fs.run_scrub(["start", abs_test_path, "recursive"])
+        self.assertNotEqual(out_json, None)
+
+        #Wait until split is present to confirm split by scrub
+        self.wait_until_true(
+            lambda: len(self.get_dsplits(dir_ino)) > 0,
+            timeout=30
+        )
+
+    def test_stray_evaluation_with_scrub(self):
+        """
+        test that scrub can iterate over ~mdsdir and evaluate strays
+        """
+        self.scrub_with_stray_evaluation(self.fs, self.mount_a, "~mdsdir",
+                                         "recursive")
+
+    def test_flag_scrub_mdsdir(self):
+        """
+        test flag scrub_mdsdir
+        """
+        self.scrub_with_stray_evaluation(self.fs, self.mount_a, "/",
+                                         "recursive,scrub_mdsdir")
 
     @staticmethod
     def json_validator(json_out, rc, element, expected_value):
@@ -329,7 +505,7 @@ class TestScrubChecks(CephFSTestCase):
         log.info("Running command '{command}'".format(command=command))
 
         command_list = command.split()
-        jout = self.fs.rank_tell(command_list, mds_rank)
+        jout = self.fs.rank_tell(command_list, rank=mds_rank, check_status=False)
 
         log.info("command '{command}' returned '{jout}'".format(
                      command=command, jout=jout))
@@ -337,33 +513,6 @@ class TestScrubChecks(CephFSTestCase):
         success, errstring = validator(jout, 0)
         if not success:
             raise AsokCommandFailedError(command, 0, jout, errstring)
-        return jout
-
-    def asok_command(self, mds_rank, command, validator):
-        log.info("Running command '{command}'".format(command=command))
-
-        command_list = command.split()
-
-        # we just assume there's an active mds for every rank
-        mds_id = self.fs.get_active_names()[mds_rank]
-        proc = self.fs.mon_manager.admin_socket('mds', mds_id,
-                                                command_list, check_status=False)
-        rout = proc.exitstatus
-        sout = proc.stdout.getvalue()
-
-        if sout.strip():
-            jout = json.loads(sout)
-        else:
-            jout = None
-
-        log.info("command '{command}' got response code '{rout}' and stdout '{sout}'".format(
-            command=command, rout=rout, sout=sout))
-
-        success, errstring = validator(jout, rout)
-
-        if not success:
-            raise AsokCommandFailedError(command, rout, jout, errstring)
-
         return jout
 
     @staticmethod

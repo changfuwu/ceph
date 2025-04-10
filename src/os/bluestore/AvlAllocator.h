@@ -7,6 +7,7 @@
 #include <boost/intrusive/avl_set.hpp>
 
 #include "Allocator.h"
+#include "AllocatorBase.h"
 #include "os/bluestore/bluestore_types.h"
 #include "include/mempool.h"
 
@@ -49,7 +50,7 @@ struct range_seg_t {
   boost::intrusive::avl_set_member_hook<> size_hook;
 };
 
-class AvlAllocator : public Allocator {
+class AvlAllocator : public AllocatorBase {
   struct dispose_rs {
     void operator()(range_seg_t* p)
     {
@@ -65,37 +66,45 @@ protected:
   */
   AvlAllocator(CephContext* cct, int64_t device_size, int64_t block_size,
     uint64_t max_mem,
-    const std::string& name);
+    std::string_view name);
 
 public:
   AvlAllocator(CephContext* cct, int64_t device_size, int64_t block_size,
-	       const std::string& name);
+	       std::string_view name);
+  ~AvlAllocator();
+  const char* get_type() const override
+  {
+    return "avl";
+  }
   int64_t allocate(
     uint64_t want,
     uint64_t unit,
     uint64_t max_alloc_size,
     int64_t  hint,
     PExtentVector *extents) override;
-  void release(const interval_set<uint64_t>& release_set) override;
-  int64_t get_capacity() const {
-    return num_total;
-  }
-
-  uint64_t get_block_size() const {
-    return block_size;
-  }
+  void release(const release_set_t& release_set) override;
   uint64_t get_free() override;
   double get_fragmentation() override;
 
   void dump() override;
-  void dump(std::function<void(uint64_t offset, uint64_t length)> notify) override;
+  void foreach(
+    std::function<void(uint64_t offset, uint64_t length)> notify) override;
   void init_add_free(uint64_t offset, uint64_t length) override;
   void init_rm_free(uint64_t offset, uint64_t length) override;
   void shutdown() override;
 
 private:
-  template<class Tree>
-  uint64_t _block_picker(const Tree& t, uint64_t *cursor, uint64_t size,
+  CephContext* cct;
+  std::mutex lock;
+
+  // pick a range by search from cursor forward
+  uint64_t _pick_block_after(
+    uint64_t *cursor,
+    uint64_t size,
+    uint64_t align);
+  // pick a range with exactly the same size or larger
+  uint64_t _pick_block_fits(
+    uint64_t size,
     uint64_t align);
   int _allocate(
     uint64_t size,
@@ -129,8 +138,6 @@ private:
       boost::intrusive::constant_time_size<true>>;
   range_size_tree_t range_size_tree;
 
-  const int64_t num_total;   ///< device size
-  const uint64_t block_size; ///< block size
   uint64_t num_free = 0;     ///< total bytes in freelist
 
   /*
@@ -156,7 +163,18 @@ private:
    * switch to using best-fit allocations.
    */
   int range_size_alloc_free_pct = 0;
-
+  /*
+   * Maximum number of segments to check in the first-fit mode, without this
+   * limit, fragmented device can see lots of iterations and _block_picker()
+   * becomes the performance limiting factor on high-performance storage.
+   */
+  const uint32_t max_search_count;
+  /*
+   * Maximum distance to search forward from the last offset, without this
+   * limit, fragmented device can see lots of iterations and _block_picker()
+   * becomes the performance limiting factor on high-performance storage.
+   */
+  const uint32_t max_search_bytes;
   /*
   * Max amount of range entries allowed. 0 - unlimited
   */
@@ -212,26 +230,46 @@ private:
     // i.e. (range_count_cap > 0)
     ceph_assert(false);
   }
+  // to be overriden by Hybrid wrapper
+  virtual uint64_t _get_spilled_over() const {
+    return 0;
+  }
+  virtual uint64_t _spillover_allocate(uint64_t want,
+                                      uint64_t unit,
+                                      uint64_t max_alloc_size,
+                                      int64_t  hint,
+                                      PExtentVector* extents) {
+    // this should be overriden when range count cap is present,
+    // i.e. (range_count_cap > 0)
+    ceph_assert(false);
+    return 0;
+  }
+
 protected:
   // called when extent to be released/marked free
   virtual void _add_to_tree(uint64_t start, uint64_t size);
 
-protected:
-  CephContext* cct;
-  std::mutex lock;
+  CephContext* get_context() { return cct; }
+
+  std::mutex& get_lock() {
+    return lock;
+  }
 
   double _get_fragmentation() const {
-    auto free_blocks = p2align(num_free, block_size) / block_size;
+    auto free_blocks = p2align(num_free, (uint64_t)block_size) / block_size;
     if (free_blocks <= 1) {
       return .0;
     }
     return (static_cast<double>(range_tree.size() - 1) / (free_blocks - 1));
   }
   void _dump() const;
+  void _foreach(std::function<void(uint64_t offset, uint64_t length)>) const;
 
   uint64_t _lowest_size_available() {
     auto rs = range_size_tree.begin();
-    return rs != range_size_tree.end() ? rs->length() : 0;
+    return rs != range_size_tree.end() ?
+      rs->length() :
+      std::numeric_limits<uint64_t>::max();
   }
 
   int64_t _allocate(
@@ -241,7 +279,7 @@ protected:
     int64_t  hint,
     PExtentVector *extents);
 
-  void _release(const interval_set<uint64_t>& release_set);
+  void _release(const release_set_t& release_set);
   void _release(const PExtentVector&  release_set);
   void _shutdown();
 

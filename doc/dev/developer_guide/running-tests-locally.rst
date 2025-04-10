@@ -36,6 +36,8 @@ This means the cluster is running.
 Step 3 - run s3-tests
 ^^^^^^^^^^^^^^^^^^^^^
 
+.. highlight:: console
+
 To run the s3tests suite do the following::
 
    $ ../qa/workunits/rgw/run-s3tests.sh
@@ -51,15 +53,33 @@ The Python tests in Ceph repository can be executed on your local machine
 using `vstart_runner.py`_. To do that, you'd need `teuthology`_ installed::
 
     $ git clone https://github.com/ceph/teuthology
-    $ cd teuthology/
-    $ virtualenv -p python2.7 ./venv
+    $ cd teuthology
+    $ ./bootstrap install
+
+This will create a virtual environment named ``virtualenv`` in root of the
+teuthology repository and install teuthology in it.
+
+You can also install teuthology via ``pip`` if you would like to install it
+in a custom virtual environment with clone `teuthology`_ repository using
+``git``::
+
+    $ virtualenv --python=python3 venv
     $ source venv/bin/activate
-    $ pip install --upgrade pip
-    $ pip install -r requirements.txt
-    $ python setup.py develop
+    $ pip install 'setuptools >= 12'
+    $ pip install teuthology[test]@git+https://github.com/ceph/teuthology
     $ deactivate
 
-.. note:: The pip command above is pip2, not pip3; run ``pip --version``.
+If for some unforeseen reason above approaches do no work (maybe boostrap
+script doesn't work due to a bug or you can't download tethology at the
+moment) teuthology can be installed manually manually from copy of
+teuthology repo already present on your machine::
+
+    $ cd teuthology
+    $ virtualenv -p python3 venv
+    $ source venv/bin/activate
+    $ pip install -r requirements.txt
+    $ pip install .
+    $ deactivate
 
 The above steps installs teuthology in a virtual environment. Before running
 a test locally, build Ceph successfully from the source (refer
@@ -73,23 +93,19 @@ To run a specific test, say `test_reconnect_timeout`_ from
 `TestClientRecovery`_ in ``qa/tasks/cephfs/test_client_recovery``, you can
 do::
 
-    $ python2 ../qa/tasks/vstart_runner.py tasks.cephfs.test_client_recovery.TestClientRecovery.test_reconnect_timeout
+    $ python ../qa/tasks/vstart_runner.py tasks.cephfs.test_client_recovery.TestClientRecovery.test_reconnect_timeout
 
 The above command runs vstart_runner.py and passes the test to be executed as
 an argument to vstart_runner.py. In a similar way, you can also run the group
 of tests in the following manner::
 
     $ # run all tests in class TestClientRecovery
-    $ python2 ../qa/tasks/vstart_runner.py tasks.cephfs.test_client_recovery.TestClientRecovery
+    $ python ../qa/tasks/vstart_runner.py tasks.cephfs.test_client_recovery.TestClientRecovery
     $ # run  all tests in test_client_recovery.py
-    $ python2 ../qa/tasks/vstart_runner.py tasks.cephfs.test_client_recovery
+    $ python ../qa/tasks/vstart_runner.py tasks.cephfs.test_client_recovery
 
 Based on the argument passed, vstart_runner.py collects tests and executes as
 it would execute a single test.
-
-.. note:: vstart_runner.py as well as most tests in ``qa/`` are only
-          compatible with ``python2``. Therefore, use ``python2`` to run the
-          tests locally.
 
 vstart_runner.py can take the following options -
 
@@ -100,17 +116,20 @@ vstart_runner.py can take the following options -
 --interactive               drops a Python shell when a test fails
 --log-ps-output             logs ps output; might be useful while debugging
 --teardown                  tears Ceph cluster down after test(s) has finished
-                            runnng
+                            running
 --kclient                   use the kernel cephfs client instead of FUSE
+--brxnet=<net/mask>         specify a new net/mask for the mount clients' network
+                            namespace container (Default: 192.168.0.0/16)
 
 .. note:: If using the FUSE client, ensure that the fuse package is installed
           and enabled on the system and that ``user_allow_other`` is added
           to ``/etc/fuse.conf``.
 
 .. note:: If using the kernel client, the user must have the ability to run
-          commands with passwordless sudo access. A failure on the kernel
-          client may crash the host, so it's recommended to use this
-          functionality within a virtual machine.
+          commands with passwordless sudo access.
+
+.. note:: A failure on the kernel client may crash the host, so it's
+          recommended to use this functionality within a virtual machine.
 
 Internal working of vstart_runner.py -
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -136,6 +155,38 @@ vstart_runner.py primarily does three things -
     ``LocalCephManager`` provides methods to run Ceph cluster commands with
     and without admin socket and ``LocalCephCluster`` provides methods to set
     or clear ``ceph.conf``.
+
+.. note:: vstart_runner.py deletes "adjust-ulimits" and "ceph-coverage" from
+          the command arguments unconditionally since they are not applicable
+          when tests are run on a developer's machine.
+
+.. note:: "omit_sudo" is re-set to False unconditionally in cases of commands
+          "passwd" and "chown".
+
+.. note:: The presence of binary file named after the first argument is
+          checked in ``<ceph-repo-root>/build/bin/``. If present, the first
+          argument is replaced with the path to binary file.
+
+Running Workunits Using vstart_enviroment.sh
+--------------------------------------------
+
+Code can be tested by building Ceph locally from source, starting a vstart
+cluster, and running any suite against it.
+Similar to S3-Tests, other workunits can be run against by configuring your environment.
+
+Set up the environment
+^^^^^^^^^^^^^^^^^^^^^^
+
+Configure your environment::
+
+    $ . ./build/vstart_enviroment.sh
+
+Running a test
+^^^^^^^^^^^^^^
+
+To run a workunit (e.g ``mon/osd.sh``) do the following::
+
+    $ ./qa/workunits/mon/osd.sh
 
 .. _test_reconnect_timeout: https://github.com/ceph/ceph/blob/master/qa/tasks/cephfs/test_client_recovery.py#L133
 .. _TestClientRecovery: https://github.com/ceph/ceph/blob/master/qa/tasks/cephfs/test_client_recovery.py#L86

@@ -1,6 +1,8 @@
 #include "auth/Crypto.h"
-#include "common/Clock.h"
 
+#include <iostream> // for std::cout
+
+#include "common/Clock.h"
 #include "common/config.h"
 #include "common/debug.h"
 
@@ -9,6 +11,8 @@
 #define AES_KEY_LEN	16
 
 #define dout_context g_ceph_context
+
+using namespace std;
 
 int main(int argc, char *argv[])
 {

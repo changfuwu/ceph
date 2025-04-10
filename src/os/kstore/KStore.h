@@ -21,12 +21,11 @@
 
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
 #include <condition_variable>
 
 #include "include/ceph_assert.h"
-#include "include/unordered_map.h"
 #include "common/Finisher.h"
-#include "common/RWLock.h"
 #include "common/Throttle.h"
 #include "common/WorkQueue.h"
 #include "os/ObjectStore.h"
@@ -116,7 +115,7 @@ public:
 	&Onode::lru_item> > lru_list_t;
 
     std::mutex lock;
-    ceph::unordered_map<ghobject_t,OnodeRef> onode_map;  ///< forward lookups
+    std::unordered_map<ghobject_t, OnodeRef> onode_map;  ///< forward lookups
     lru_list_t lru;                                      ///< lru
 
     OnodeHashLRU(CephContext* cct) : cct(cct) {}
@@ -166,25 +165,6 @@ public:
     Collection(KStore *ns, coll_t c);
   };
   using CollectionRef = ceph::ref_t<Collection>;
-
-  class OmapIteratorImpl : public ObjectMap::ObjectMapIteratorImpl {
-    CollectionRef c;
-    OnodeRef o;
-    KeyValueDB::Iterator it;
-    std::string head, tail;
-  public:
-    OmapIteratorImpl(CollectionRef c, OnodeRef o, KeyValueDB::Iterator it);
-    int seek_to_first() override;
-    int upper_bound(const std::string &after) override;
-    int lower_bound(const std::string &to) override;
-    bool valid() override;
-    int next() override;
-    std::string key() override;
-    ceph::buffer::list value() override;
-    int status() override {
-      return 0;
-    }
-  };
 
   struct TransContext {
     typedef enum {
@@ -277,6 +257,11 @@ public:
       std::lock_guard<std::mutex> l(qlock);
       q.push_back(*txc);
     }
+    void undo_queue(TransContext* txc) {
+      std::lock_guard<std::mutex> l(qlock);
+      ceph_assert(&q.back() == txc);
+      q.pop_back();
+    }
 
     void flush() {
       std::unique_lock<std::mutex> l(qlock);
@@ -320,7 +305,7 @@ private:
 
   /// rwlock to protect coll_map
   ceph::shared_mutex coll_lock = ceph::make_shared_mutex("KStore::coll_lock");
-  ceph::unordered_map<coll_t, CollectionRef> coll_map;
+  std::unordered_map<coll_t, CollectionRef> coll_map;
   std::map<coll_t,CollectionRef> new_coll_map;
 
   std::mutex nid_lock;
@@ -437,7 +422,7 @@ public:
   }
   void dump_perf_counters(ceph::Formatter *f) override {
     f->open_object_section("perf_counters");
-    logger->dump_formatted(f, false);
+    logger->dump_formatted(f, false, select_labeled_t::unlabeled);
     f->close_section();
   }
   void get_db_statistics(ceph::Formatter *f) override {
@@ -487,7 +472,9 @@ public:
   using ObjectStore::getattr;
   int getattr(CollectionHandle& c, const ghobject_t& oid, const char *name, ceph::buffer::ptr& value) override;
   using ObjectStore::getattrs;
-  int getattrs(CollectionHandle& c, const ghobject_t& oid, std::map<std::string,ceph::buffer::ptr>& aset) override;
+  int getattrs(CollectionHandle& c,
+	       const ghobject_t& oid,
+	       std::map<std::string,ceph::buffer::ptr,std::less<>>& aset) override;
 
   int list_collections(std::vector<coll_t>& ls) override;
   bool collection_exists(const coll_t& c) override;
@@ -541,11 +528,12 @@ public:
     std::set<std::string> *out         ///< [out] Subset of keys defined on oid
     ) override;
 
-  using ObjectStore::get_omap_iterator;
-  ObjectMap::ObjectMapIterator get_omap_iterator(
-    CollectionHandle& c,              ///< [in] collection
-    const ghobject_t &oid  ///< [in] object
-    ) override;
+  int omap_iterate(
+    CollectionHandle &c,   ///< [in] collection
+    const ghobject_t &oid, ///< [in] object
+    omap_iter_seek_t start_from, ///< [in] where the iterator should point to at the beginning
+    std::function<omap_iter_ret_t(std::string_view, std::string_view)> f
+  ) override;
 
   void set_fsid(uuid_d u) override {
     fsid = u;
@@ -561,6 +549,8 @@ public:
   objectstore_perf_stat_t get_cur_stats() override {
     return objectstore_perf_stat_t();
   }
+  void refresh_perf_counters() override {
+  }
   const PerfCounters* get_perf_counters() const override {
     return logger;
   }
@@ -572,9 +562,10 @@ public:
     TrackedOpRef op = TrackedOpRef(),
     ThreadPool::TPHandle *handle = NULL) override;
 
-  void compact () override {
+  int compact () override {
     ceph_assert(db);
     db->compact();
+    return 0;
   }
   
 private:

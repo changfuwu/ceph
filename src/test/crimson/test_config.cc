@@ -6,21 +6,20 @@
 #include "common/ceph_argparse.h"
 #include "common/config_obs.h"
 #include "crimson/common/config_proxy.h"
+#include "test/crimson/ctest_utils.h"
 
+using namespace std::literals;
 using Config = crimson::common::ConfigProxy;
 const std::string test_uint_option = "osd_max_pgls";
 const uint64_t INVALID_VALUE = (uint64_t)(-1);
+const uint64_t EXPECTED_VALUE = 42;
 
 class ConfigObs : public ceph::md_config_obs_impl<Config> {
   uint64_t last_change = INVALID_VALUE;
   uint64_t num_changes = 0;
 
-  const char** get_tracked_conf_keys() const override {
-    static const char* keys[] = {
-      test_uint_option.c_str(),
-      nullptr,
-    };
-    return keys;
+  std::vector<std::string> get_tracked_keys() const noexcept override {
+    return { test_uint_option };
   }
   void handle_conf_change(const Config& conf,
                           const std::set <std::string> &changes) override{
@@ -38,7 +37,7 @@ public:
   uint64_t get_num_changes() const { return num_changes; }
   seastar::future<> stop() {
     crimson::common::local_conf().remove_observer(this);
-    return seastar::now();
+    return seastar::make_ready_future<>();
   }
 };
 
@@ -46,7 +45,7 @@ seastar::sharded<ConfigObs> sharded_cobs;
 
 static seastar::future<> test_config()
 {
-  return crimson::common::sharded_conf().start(EntityName{}, string_view{"ceph"}).then([] {
+  return crimson::common::sharded_conf().start(EntityName{}, "ceph"sv).then([] {
     std::vector<const char*> args;
     std::string cluster;
     std::string conf_file_list;
@@ -63,20 +62,17 @@ static seastar::future<> test_config()
   }).then([] {
     return sharded_cobs.start();
   }).then([] {
-    return crimson::common::sharded_conf().invoke_on_all([](Config& config) {
-      return config.set_val(test_uint_option,
-                            std::to_string(seastar::engine().cpu_id()));
-    });
+    auto& conf = crimson::common::local_conf();
+    return conf.set_val(test_uint_option, std::to_string(EXPECTED_VALUE));
   }).then([] {
-    auto expected = crimson::common::local_conf().get_val<uint64_t>(test_uint_option);
-    return crimson::common::sharded_conf().invoke_on_all([expected](Config& config) {
-      if (expected != config.get_val<uint64_t>(test_uint_option)) {
+    return crimson::common::sharded_conf().invoke_on_all([](Config& config) {
+      if (config.get_val<uint64_t>(test_uint_option) != EXPECTED_VALUE) {
         throw std::runtime_error("configurations don't match");
       }
-      if (expected != sharded_cobs.local().get_last_change()) {
+      if (sharded_cobs.local().get_last_change() != EXPECTED_VALUE) {
         throw std::runtime_error("last applied changes don't match the latest config");
       }
-      if (seastar::smp::count != sharded_cobs.local().get_num_changes()) {
+      if (sharded_cobs.local().get_num_changes() != 1) {
         throw std::runtime_error("num changes don't match actual changes");
       }
     });
@@ -89,7 +85,7 @@ static seastar::future<> test_config()
 
 int main(int argc, char** argv)
 {
-  seastar::app_template app;
+  seastar::app_template app{get_smp_opts_from_ctest()};
   return app.run(argc, argv, [&] {
     return test_config().then([] {
       std::cout << "All tests succeeded" << std::endl;

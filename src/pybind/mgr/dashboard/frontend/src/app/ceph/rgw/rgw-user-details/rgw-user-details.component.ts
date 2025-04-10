@@ -1,17 +1,19 @@
 import { Component, Input, OnChanges, OnInit, TemplateRef, ViewChild } from '@angular/core';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
-import * as _ from 'lodash';
-import { BsModalService } from 'ngx-bootstrap/modal';
+import _ from 'lodash';
 
-import { RgwUserService } from '../../../shared/api/rgw-user.service';
-import { Icons } from '../../../shared/enum/icons.enum';
-import { CdTableColumn } from '../../../shared/models/cd-table-column';
-import { CdTableSelection } from '../../../shared/models/cd-table-selection';
+import { RgwUserService } from '~/app/shared/api/rgw-user.service';
+import { Icons } from '~/app/shared/enum/icons.enum';
+import { CdTableColumn } from '~/app/shared/models/cd-table-column';
+import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
 import { RgwUserS3Key } from '../models/rgw-user-s3-key';
 import { RgwUserSwiftKey } from '../models/rgw-user-swift-key';
 import { RgwUserS3KeyModalComponent } from '../rgw-user-s3-key-modal/rgw-user-s3-key-modal.component';
 import { RgwUserSwiftKeyModalComponent } from '../rgw-user-swift-key-modal/rgw-user-swift-key-modal.component';
+import { CdTableAction } from '~/app/shared/models/cd-table-action';
+import { Permissions } from '~/app/shared/models/permissions';
+import { RgwRateLimitConfig } from '../models/rgw-rate-limit';
+import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
 
 @Component({
   selector: 'cd-rgw-user-details',
@@ -19,13 +21,13 @@ import { RgwUserSwiftKeyModalComponent } from '../rgw-user-swift-key-modal/rgw-u
   styleUrls: ['./rgw-user-details.component.scss']
 })
 export class RgwUserDetailsComponent implements OnChanges, OnInit {
-  @ViewChild('accessKeyTpl', { static: false })
+  @ViewChild('accessKeyTpl')
   public accessKeyTpl: TemplateRef<any>;
-  @ViewChild('secretKeyTpl', { static: false })
+  @ViewChild('secretKeyTpl')
   public secretKeyTpl: TemplateRef<any>;
 
   @Input()
-  selection: CdTableSelection;
+  selection: any;
 
   // Details tab
   user: any;
@@ -35,37 +37,44 @@ export class RgwUserDetailsComponent implements OnChanges, OnInit {
   keys: any = [];
   keysColumns: CdTableColumn[] = [];
   keysSelection: CdTableSelection = new CdTableSelection();
+  tableAction: CdTableAction[] = [];
+  permissions: Permissions;
 
   icons = Icons;
 
-  constructor(
-    private rgwUserService: RgwUserService,
-    private bsModalService: BsModalService,
-    private i18n: I18n
-  ) {}
+  constructor(private rgwUserService: RgwUserService, private cdsModalService: ModalCdsService) {}
 
   ngOnInit() {
     this.keysColumns = [
       {
-        name: this.i18n('Username'),
+        name: $localize`Username`,
         prop: 'username',
         flexGrow: 1
       },
       {
-        name: this.i18n('Type'),
+        name: $localize`Type`,
         prop: 'type',
         flexGrow: 1
       }
     ];
     this.maxBucketsMap = {
-      '-1': this.i18n('Disabled'),
-      0: this.i18n('Unlimited')
+      '-1': $localize`Disabled`,
+      0: $localize`Unlimited`
     };
   }
 
   ngOnChanges() {
-    if (this.selection.hasSelection) {
-      this.user = this.selection.first();
+    this.tableAction = [
+      {
+        name: $localize`Show`,
+        permission: 'read',
+        click: () => this.showKeyModal(),
+        icon: Icons.show
+      }
+    ];
+
+    if (this.selection) {
+      this.user = this.selection;
 
       // Sort subusers and capabilities.
       this.user.subusers = _.sortBy(this.user.subusers, 'id');
@@ -73,6 +82,11 @@ export class RgwUserDetailsComponent implements OnChanges, OnInit {
 
       // Load the user/bucket quota of the selected user.
       this.rgwUserService.getQuota(this.user.uid).subscribe((resp: object) => {
+        _.extend(this.user, resp);
+      });
+
+      // Load the user rate limit of the selected user.
+      this.rgwUserService.getUserRateLimit(this.user.uid).subscribe((resp: RgwRateLimitConfig) => {
         _.extend(this.user, resp);
       });
 
@@ -109,16 +123,16 @@ export class RgwUserDetailsComponent implements OnChanges, OnInit {
 
   showKeyModal() {
     const key = this.keysSelection.first();
-    const modalRef = this.bsModalService.show(
+    const modalRef = this.cdsModalService.show(
       key.type === 'S3' ? RgwUserS3KeyModalComponent : RgwUserSwiftKeyModalComponent
     );
     switch (key.type) {
       case 'S3':
-        modalRef.content.setViewing();
-        modalRef.content.setValues(key.ref.user, key.ref.access_key, key.ref.secret_key);
+        modalRef.setViewing();
+        modalRef.setValues(key.ref.user, key.ref.access_key, key.ref.secret_key);
         break;
       case 'Swift':
-        modalRef.content.setValues(key.ref.user, key.ref.secret_key);
+        modalRef.setValues(key.ref.user, key.ref.secret_key);
         break;
     }
   }

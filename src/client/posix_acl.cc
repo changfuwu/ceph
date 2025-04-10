@@ -1,5 +1,6 @@
 #include "include/compat.h"
 #include "include/types.h"
+#include "include/fs_types.h"
 #include <sys/stat.h>
 #include "posix_acl.h"
 #include "UserPerm.h"

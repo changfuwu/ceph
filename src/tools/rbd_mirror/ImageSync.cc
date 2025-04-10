@@ -12,11 +12,14 @@
 #include "librbd/ImageState.h"
 #include "librbd/Utils.h"
 #include "librbd/internal.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/deep_copy/Handler.h"
 #include "tools/rbd_mirror/Threads.h"
 #include "tools/rbd_mirror/image_sync/SyncPointCreateRequest.h"
 #include "tools/rbd_mirror/image_sync/SyncPointPruneRequest.h"
 #include "tools/rbd_mirror/image_sync/Types.h"
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror

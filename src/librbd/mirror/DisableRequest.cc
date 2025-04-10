@@ -2,7 +2,6 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/mirror/DisableRequest.h"
-#include "common/WorkQueue.h"
 #include "common/dout.h"
 #include "common/errno.h"
 #include "cls/journal/cls_journal_client.h"
@@ -12,11 +11,14 @@
 #include "librbd/Journal.h"
 #include "librbd/Operations.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/journal/PromoteRequest.h"
 #include "librbd/mirror/GetInfoRequest.h"
 #include "librbd/mirror/ImageRemoveRequest.h"
 #include "librbd/mirror/ImageStateUpdateRequest.h"
 #include "librbd/mirror/snapshot/PromoteRequest.h"
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -219,15 +221,14 @@ Context *DisableRequest<I>::handle_get_clients(int *result) {
   CephContext *cct = m_image_ctx->cct;
   ldout(cct, 10) << "r=" << *result << dendl;
 
+  std::unique_lock locker{m_lock};
+  ceph_assert(m_current_ops.empty());
+
   if (*result < 0) {
     lderr(cct) << "failed to get registered clients: " << cpp_strerror(*result)
                << dendl;
     return m_on_finish;
   }
-
-  std::lock_guard locker{m_lock};
-
-  ceph_assert(m_current_ops.empty());
 
   for (auto client : m_clients) {
     journal::ClientData client_data;
@@ -257,7 +258,7 @@ Context *DisableRequest<I>::handle_get_clients(int *result) {
     m_ret[client.id] = 0;
 
     journal::MirrorPeerClientMeta client_meta =
-      boost::get<journal::MirrorPeerClientMeta>(client_data.client_meta);
+      std::get<journal::MirrorPeerClientMeta>(client_data.client_meta);
 
     for (const auto& sync : client_meta.sync_points) {
       send_remove_snap(client.id, sync.snap_namespace, sync.snap_name);
@@ -276,6 +277,7 @@ Context *DisableRequest<I>::handle_get_clients(int *result) {
     } else if (!m_remove) {
       return m_on_finish;
     }
+    locker.unlock();
 
     // no mirror clients to unregister
     send_remove_mirror_image();
@@ -342,7 +344,7 @@ Context *DisableRequest<I>::handle_remove_snap(int *result,
   CephContext *cct = m_image_ctx->cct;
   ldout(cct, 10) << "r=" << *result << dendl;
 
-  std::lock_guard locker{m_lock};
+  std::unique_lock locker{m_lock};
 
   ceph_assert(m_current_ops[client_id] > 0);
   m_current_ops[client_id]--;
@@ -360,6 +362,8 @@ Context *DisableRequest<I>::handle_remove_snap(int *result,
       if (m_ret[client_id] < 0) {
         return m_on_finish;
       }
+      locker.unlock();
+
       send_remove_mirror_image();
       return nullptr;
     }
@@ -404,7 +408,7 @@ Context *DisableRequest<I>::handle_unregister_client(
   CephContext *cct = m_image_ctx->cct;
   ldout(cct, 10) << "r=" << *result << dendl;
 
-  std::lock_guard locker{m_lock};
+  std::unique_lock locker{m_lock};
   ceph_assert(m_current_ops[client_id] == 0);
   m_current_ops.erase(client_id);
 
@@ -422,6 +426,7 @@ Context *DisableRequest<I>::handle_unregister_client(
     *result = m_error_result;
     return m_on_finish;
   }
+  locker.unlock();
 
   send_get_clients();
   return nullptr;

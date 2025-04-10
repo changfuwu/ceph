@@ -19,6 +19,9 @@
 #include <iterator>
 #include <map>
 #include <ostream>
+#include <fmt/ranges.h>
+#include "common/fmt_common.h"
+#include "common/dout.h"
 
 #include "encoding.h"
 
@@ -30,9 +33,11 @@
  * flat_map and btree_map).
  */
 
-template<typename T, typename Map = std::map<T,T>>
+template<typename T, template<typename, typename, typename ...> class C = std::map, bool strict = true>
 class interval_set {
  public:
+  enum UnittestType { test_strict = strict }; // Required by test_interval_set.cc
+  using Map = C<T, T>;
   using value_type = typename Map::value_type;
   using offset_type = T;
   using length_type = T;
@@ -42,9 +47,15 @@ class interval_set {
 
   class const_iterator;
 
-  class iterator : public std::iterator <std::forward_iterator_tag, T>
+  class iterator
   {
     public:
+        using difference_type = ssize_t;
+        using value_type = typename Map::value_type;
+        using pointer = typename Map::value_type*;
+        using reference = typename Map::value_type&;
+        using iterator_category = std::forward_iterator_tag;
+
         explicit iterator(typename Map::iterator iter)
           : _iter(iter)
         { }
@@ -99,6 +110,21 @@ class interval_set {
           return prev;
         }
 
+        // Predecrement
+        iterator& operator--()
+        {
+          --_iter;
+          return *this;
+        }
+
+        // Postdecrement
+        iterator operator--(int)
+        {
+          iterator prev(_iter);
+          --_iter;
+          return prev;
+        }
+
     friend class interval_set::const_iterator;
 
     protected:
@@ -106,9 +132,15 @@ class interval_set {
     friend class interval_set;
   };
 
-  class const_iterator : public std::iterator <std::forward_iterator_tag, T>
+  class const_iterator
   {
     public:
+        using difference_type = ssize_t;
+        using value_type = const typename Map::value_type;
+        using pointer = const typename Map::value_type*;
+        using reference = const typename Map::value_type&;
+        using iterator_category = std::forward_iterator_tag;
+
         explicit const_iterator(typename Map::const_iterator iter)
           : _iter(iter)
         { }
@@ -129,7 +161,7 @@ class interval_set {
         }
 
         // Dereference this iterator to get a pair.
-        const_reference operator*() const {
+        reference operator*() const {
           return *_iter;
         }
 
@@ -158,6 +190,21 @@ class interval_set {
         {
           const_iterator prev(_iter);
           ++_iter;
+          return prev;
+        }
+
+        // Predecrement
+        iterator& operator--()
+        {
+          --_iter;
+          return *this;
+        }
+
+        // Postdecrement
+        iterator operator--(int)
+        {
+          iterator prev(_iter);
+          --_iter;
           return prev;
         }
 
@@ -200,6 +247,35 @@ class interval_set {
 
   const_iterator end() const {
     return const_iterator(m.end());
+  }
+
+  void print(std::ostream& os) const {
+    os << "[";
+    bool first = true;
+    for (const auto& [start, len] : *this) {
+      if (!first) {
+        os << ",";
+      }
+      os << start << "~" << len;
+      first = false;
+    }
+    os << "]";
+  }
+
+  std::string fmt_print() const
+  requires fmt::formattable<T> {
+    std::string s = "[";
+    bool first = true;
+    for (const auto& [start, len] : *this) {
+      if (!first) {
+        s += ",";
+      } else {
+        first = false;
+      }
+      s += fmt::format("{}~{}", start, len);
+    }
+    s += "]";
+    return s;
   }
 
   // helpers
@@ -397,6 +473,11 @@ class interval_set {
     if (p->first+p->second < start+len) return false;
     return true;
   }
+  bool contains(interval_set const &other) const {
+    interval_set tmp;
+    tmp.intersection_of(*this, other);
+    return tmp == other;
+  }
   bool intersects(T start, T len) const {
     interval_set a;
     a.insert(start, len);
@@ -417,9 +498,8 @@ class interval_set {
   }
   offset_type range_end() const {
     ceph_assert(!empty());
-    auto p = m.end();
-    p--;
-    return p->first+p->second;
+    auto p = m.rbegin();
+    return p->first + p->second;
   }
 
   // interval start after p (where p not in set)
@@ -446,7 +526,21 @@ class interval_set {
     insert(val, 1);
   }
 
-  void insert(T start, T len, T *pstart=0, T *plen=0) {
+  /** This insert function adds an interval into the interval map, for cases
+   * where intervals are required to never overlap. Inserts must be a new
+   * interval or append to an existing interval. Adding an interval which
+   * intersects with an existing interval will result in an assert firing.
+   *
+   * NOTE: Unless you need the policing provided by this function, you are
+   *       probably better off with union_insert().
+   *
+   * @param start - the offset at the start of the interval
+   * @param len - the length of the interval being added.
+   * @param pstart (optional) returns the start of the resulting interval
+   * @param plen (optional) returns the length of the resulting interval.
+   */
+  void insert(T start, T len, T *pstart=0, T *plen=0) requires (strict)
+  {
     //cout << "insert " << start << "~" << len << endl;
     ceph_assert(len > 0);
     _size += len;
@@ -459,25 +553,26 @@ class interval_set {
 	*plen = len;
     } else {
       if (p->first < start) {
-        
+
         if (p->first + p->second != start) {
           //cout << "p is " << p->first << "~" << p->second << ", start is " << start << ", len is " << len << endl;
           ceph_abort();
         }
-        
+
         p->second += len;               // append to end
-        
+
         auto n = p;
         ++n;
 	if (pstart)
 	  *pstart = p->first;
-        if (n != m.end() && 
+        if (n != m.end() &&
             start+len == n->first) {   // combine with next, too!
           p->second += n->second;
 	  if (plen)
 	    *plen = p->second;
           m.erase(n);
         } else {
+          ceph_assert(n == m.end() || start + len < n->first);
 	  if (plen)
 	    *plen = p->second;
 	}
@@ -502,27 +597,85 @@ class interval_set {
     }
   }
 
+  /** This insert method adds an interval into the interval map, without any
+   * restrictions. The interval can prepend/append/span any number of existing
+   * intervals.
+   *
+   * @param start - the offset at the start of the interval
+   * @param len - the length of the interval being added.
+   */
+  void union_insert(T start, T len) {
+    //cout << "insert " << start << "~" << len << endl;
+    T new_len = len;
+    auto p = find_adj_m(start);
+    T end = start + len;
+
+    if(len == 0) {
+      //No-op
+    } else if (p == m.end()) {
+      m[start] = len;                  // new interval
+    } else {
+      if (p->first < start) {
+        T pend = p->first + p->second;
+        new_len = new_len - (std::min(pend, end) - start); // Remove the overlap
+        p->second = std::max(pend, end) - p->first; // Adjust existing
+
+        // Some usages of interval_set do not implement the + operator.
+        auto n = p;
+        ++n;
+        for (; n != m.end() && end >= n->first; n = m.erase(n)) {
+          // The follow is split out to avoid template issues.
+          // This adds the part of n which is not overlapping with the insert.
+          T a = n->second;
+          T b = end - n->first;
+          new_len = new_len - std::min(a, b);
+          p->second += n->second - std::min(a, b);
+        }
+      } else {
+        T old_len = 0;
+        T new_end = end;
+        for (;p != m.end() && end >= p->first; p = m.erase(p)) {
+          T pend = p->first + p->second;
+          new_end = std::max(pend, end);
+          old_len = old_len + p->second;
+        }
+        m[start] = new_end - start;
+        new_len = new_end - start - old_len;
+      }
+    }
+
+    _size += new_len;
+  }
+
+  void insert(T start, T len) requires(!strict)
+  {
+    union_insert(start, len);
+  }
+
   void swap(interval_set& other) {
     m.swap(other.m);
     std::swap(_size, other._size);
-  }    
+  }
   
-  void erase(iterator &i) {
+  iterator erase(const iterator &i) {
     _size -= i.get_len();
-    ceph_assert(_size >= 0);
-    m.erase(i._iter);
+    return iterator(m.erase(i._iter));
   }
 
   void erase(T val) {
     erase(val, 1);
   }
 
-  void erase(T start, T len, 
-    std::function<bool(T, T)> claim = {}) {
+  /* This variant of erase allows the client to determine whether touching
+   * intervals should also be erased. This variant will assert that the
+   * intersection of the interval (start~len) is entirely contained by a single
+   * interval in *this.
+   */
+  void erase(T start, T len,
+    std::function<bool(T, T)> claim = {}) requires (strict) {
     auto p = find_inc_m(start);
 
     _size -= len;
-    ceph_assert(_size >= 0);
 
     ceph_assert(p != m.end());
     ceph_assert(p->first <= start);
@@ -549,7 +702,84 @@ class interval_set {
     }
   }
 
-  void subtract(const interval_set &a) {
+  /** This variant of erase allows for general erases (making it useful for
+   * functions like subtract). It can cope with any overlaps and will erase
+   * multiple. entries.
+   */
+  void erase(T start, T len) requires(!strict) {
+    T begin = start;
+    T end = start + len;
+
+    auto p = find_inc_m(begin);
+
+    while ( p != m.end() && begin < end && end > p->first) {
+      T pend = p->first + p->second;
+
+      // Skip any gap.
+      if (begin < p->first) begin = p->first;
+      _size -= pend - begin;
+
+      // Truncate (delete later if empty)
+      p->second = begin - p->first;
+
+      // Handle splits
+      if (end < pend) {
+        _size += pend - end;
+        // For some maps, inserting here corrupts p, so we need
+        // to insert, then recover p, so that we can delete it if needed.
+        p = m.insert(p, std::pair(end, pend-end));
+        --p;
+      }
+
+      // Erase empty interval or move on.
+      if (!p->second) p = m.erase(p);
+      else ++p;
+
+      begin = pend;
+    }
+  }
+
+  /** This general erase method erases after a particular offset.
+  */
+  void erase_after(T start) requires(!strict)
+  {
+    T begin = start;
+
+    auto p = find_inc_m(begin);
+
+    while ( p != m.end()) {
+      T pend = p->first + p->second;
+
+      // Skip any gap.
+      if (begin < p->first) begin = p->first;
+      _size -= pend - begin;
+
+      // Truncate (delete later if empty)
+      p->second = begin - p->first;
+
+      // Erase empty interval or move on.
+      if (!p->second) p = m.erase(p);
+      else ++p;
+
+      begin = pend;
+    }
+  }
+
+  void subtract(const interval_set &a) requires (!strict) {
+    if (empty() || a.empty()) return;
+
+    auto start = range_start();
+    auto end = range_end();
+
+    /* Only loop over the overlapping range of a */
+    for (auto ap = a.find_inc(start);
+         ap != a.m.end() && ap->first <= end;
+        ++ap) {
+      erase(ap->first, ap->second);
+    }
+  }
+
+  void subtract(const interval_set &a) requires (strict) {
     for (const auto& [start, len] : a.m) {
       erase(start, len);
     }
@@ -627,36 +857,21 @@ class interval_set {
     swap(a);
     intersection_of(a, b);
   }
-
+  /** Clear the current interval set, then populate with a union of a and b.
+   */
   void union_of(const interval_set &a, const interval_set &b) {
     ceph_assert(&a != this);
     ceph_assert(&b != this);
     clear();
-    
-    //cout << "union_of" << endl;
-
-    // a
-    m = a.m;
-    _size = a._size;
-
-    // - (a*b)
-    interval_set ab;
-    ab.intersection_of(a, b);
-    subtract(ab);
-
-    // + b
-    insert(b);
-    return;
-  }
-  void union_of(const interval_set &b) {
-    interval_set a;
-    swap(a);    
-    union_of(a, b);
-  }
-  void union_insert(T off, T len) {
-    interval_set a;
-    a.insert(off, len);
     union_of(a);
+    union_of(b);
+  }
+
+  /** Union the current contents of the interval set with a */
+  void union_of(const interval_set &a) {
+    for (const auto& [start, len] : a.m) {
+      union_insert(start, len);
+    }
   }
 
   bool subset_of(const interval_set &big) const {
@@ -724,6 +939,20 @@ class interval_set {
     return std::move(m);
   }
 
+  /*
+  * Round down interval starts and round up interval ends to specified alignment.
+  */
+  void align(T alignment) {
+    interval_set tmp;
+    for (const auto& [start, len] : m) {
+      T aligned_start = (start / alignment) * alignment;
+      T aligned_len = ((start + len + alignment - 1) / alignment) * alignment - aligned_start;
+
+      tmp.union_insert(aligned_start, aligned_len);
+    }
+    swap(tmp);
+  }
+
 private:
   // data
   uint64_t _size = 0;
@@ -732,50 +961,42 @@ private:
 
 // declare traits explicitly because (1) it's templatized, and (2) we
 // want to include _nohead variants.
-template<typename T, typename Map>
-struct denc_traits<interval_set<T,Map>> {
+template<typename T, template<typename, typename, typename ...> class C>
+struct denc_traits<interval_set<T, C>> {
+private:
+  using container_t = interval_set<T, C>;
+public:
   static constexpr bool supported = true;
   static constexpr bool bounded = false;
   static constexpr bool featured = false;
-  static constexpr bool need_contiguous = denc_traits<T,Map>::need_contiguous;
-  static void bound_encode(const interval_set<T,Map>& v, size_t& p) {
+  static constexpr bool need_contiguous = denc_traits<T, C<T,T>>::need_contiguous;
+  static void bound_encode(const container_t& v, size_t& p) {
     v.bound_encode(p);
   }
-  static void encode(const interval_set<T,Map>& v,
+  static void encode(const container_t& v,
 		     ceph::buffer::list::contiguous_appender& p) {
     v.encode(p);
   }
-  static void decode(interval_set<T,Map>& v, ceph::buffer::ptr::const_iterator& p) {
+  static void decode(container_t& v, ceph::buffer::ptr::const_iterator& p) {
     v.decode(p);
   }
   template<typename U=T>
     static typename std::enable_if<sizeof(U) && !need_contiguous>::type
-  decode(interval_set<T,Map>& v, ceph::buffer::list::iterator& p) {
+  decode(container_t& v, ceph::buffer::list::iterator& p) {
     v.decode(p);
   }
-  static void encode_nohead(const interval_set<T,Map>& v,
+  static void encode_nohead(const container_t& v,
 			    ceph::buffer::list::contiguous_appender& p) {
     v.encode_nohead(p);
   }
-  static void decode_nohead(size_t n, interval_set<T,Map>& v,
+  static void decode_nohead(size_t n, container_t& v,
 			    ceph::buffer::ptr::const_iterator& p) {
     v.decode_nohead(n, p);
   }
 };
 
-
-template<class T, typename Map>
-inline std::ostream& operator<<(std::ostream& out, const interval_set<T,Map> &s) {
-  out << "[";
-  bool first = true;
-  for (const auto& [start, len] : s) {
-    if (!first) out << ",";
-    out << start << "~" << len;
-    first = false;
-  }
-  out << "]";
-  return out;
-}
-
+// make sure fmt::range would not try (and fail) to treat interval_set as a range
+template<typename T, template<typename, typename, typename ...> class C, bool strict>
+struct fmt::is_range<interval_set<T, C, strict>, char> : std::false_type {};
 
 #endif

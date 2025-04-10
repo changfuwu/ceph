@@ -31,7 +31,7 @@
 #define EVENT_SESSIONS     12
 
 #define EVENT_UPDATE       20
-#define EVENT_SLAVEUPDATE  21
+#define EVENT_PEERUPDATE   21
 #define EVENT_OPEN         22
 #define EVENT_COMMITTED    23
 #define EVENT_PURGED       24
@@ -42,10 +42,17 @@
 #define EVENT_SUBTREEMAP_TEST   50
 #define EVENT_NOOP        51
 
+#define EVENT_SEGMENT      100
+#define EVENT_LID          101
+
 
 #include "include/buffer_fwd.h"
-#include "include/Context.h"
 #include "include/utime.h"
+
+#include <map>
+#include <memory>
+#include <ostream>
+#include <string>
 
 class MDSRank;
 class LogSegment;
@@ -89,7 +96,7 @@ public:
     ENCODE_FINISH(bl);
   }
 
-  virtual void print(ostream& out) const { 
+  virtual void print(std::ostream& out) const {
     out << "event(" << _type << ")";
   }
 
@@ -124,10 +131,5 @@ private:
   uint64_t _start_off = 0;
   LogSegment *_segment = nullptr;
 };
-
-inline ostream& operator<<(ostream& out, const LogEvent &le) {
-  le.print(out);
-  return out;
-}
 
 #endif
