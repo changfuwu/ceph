@@ -68,6 +68,7 @@ Cluster with one API and then retrieve that data with the other API.
    Server-Side Encryption <encryption>
    Bucket Policy <bucketpolicy>
    Dynamic Bucket Index Resharding <dynamicresharding>
+   Bucket Object Limits and Optimization <bucket-object-limits>
    Multi-factor Authentication <mfa>
    Sync Modules <sync-modules>
    Bucket Notifications <notifications>
