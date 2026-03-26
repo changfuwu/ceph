@@ -190,7 +190,9 @@ const char *rgw_find_mime_by_ext(string& ext)
     return iter->second.c_str();
   }
 
-  // Fall back to the built-in content type map.
+  // Fall back to the built-in content type map. The returned c_str()
+  // pointer is valid for the lifetime of the program since
+  // builtin_content_type_map has static storage duration.
   auto builtin_iter = builtin_content_type_map.find(ext);
   if (builtin_iter != builtin_content_type_map.end()) {
     return builtin_iter->second.c_str();
