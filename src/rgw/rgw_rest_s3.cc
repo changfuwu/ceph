@@ -2916,6 +2916,21 @@ int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
     position = uint64_t(pos_tmp);
   }
 
+  if (!s->generic_attrs.count(RGW_ATTR_CONTENT_TYPE)) {
+    ldpp_dout(this, 5) << "content type wasn't provided, trying to guess" << dendl;
+    const char *suffix = strrchr(s->object->get_name().c_str(), '.');
+    if (suffix) {
+      suffix++;
+      if (*suffix) {
+        string suffix_str(suffix);
+        const char *mime = rgw_find_mime_by_ext(suffix_str);
+        if (mime) {
+          s->generic_attrs[RGW_ATTR_CONTENT_TYPE] = mime;
+        }
+      }
+    }
+  }
+
   return RGWPutObj_ObjStore::get_params(y);
 }
 
