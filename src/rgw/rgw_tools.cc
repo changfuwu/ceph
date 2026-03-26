@@ -15,6 +15,87 @@
 
 using namespace std;
 
+// Built-in content type map for common file extensions.
+// Used as a fallback when the system mime.types file is not available
+// or does not contain an entry for the given extension.
+static const std::map<std::string, std::string> builtin_content_type_map = {
+  // text
+  {"css",   "text/css"},
+  {"csv",   "text/csv"},
+  {"htm",   "text/html"},
+  {"html",  "text/html"},
+  {"ics",   "text/calendar"},
+  {"js",    "text/javascript"},
+  {"mjs",   "text/javascript"},
+  {"txt",   "text/plain"},
+  {"xml",   "text/xml"},
+  // image
+  {"bmp",   "image/bmp"},
+  {"gif",   "image/gif"},
+  {"ico",   "image/x-icon"},
+  {"jpeg",  "image/jpeg"},
+  {"jpg",   "image/jpeg"},
+  {"png",   "image/png"},
+  {"svg",   "image/svg+xml"},
+  {"svgz",  "image/svg+xml"},
+  {"tif",   "image/tiff"},
+  {"tiff",  "image/tiff"},
+  {"webp",  "image/webp"},
+  // audio
+  {"aac",   "audio/aac"},
+  {"flac",  "audio/flac"},
+  {"m4a",   "audio/mp4"},
+  {"mid",   "audio/midi"},
+  {"midi",  "audio/midi"},
+  {"mp3",   "audio/mpeg"},
+  {"oga",   "audio/ogg"},
+  {"ogg",   "audio/ogg"},
+  {"opus",  "audio/opus"},
+  {"wav",   "audio/wav"},
+  {"weba",  "audio/webm"},
+  // video
+  {"avi",   "video/x-msvideo"},
+  {"m4v",   "video/mp4"},
+  {"mkv",   "video/x-matroska"},
+  {"mov",   "video/quicktime"},
+  {"mp4",   "video/mp4"},
+  {"mpeg",  "video/mpeg"},
+  {"mpg",   "video/mpeg"},
+  {"ogv",   "video/ogg"},
+  {"ts",    "video/mp2t"},
+  {"webm",  "video/webm"},
+  // application
+  {"bin",   "application/octet-stream"},
+  {"bz",    "application/x-bzip"},
+  {"bz2",   "application/x-bzip2"},
+  {"doc",   "application/msword"},
+  {"docx",  "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+  {"gz",    "application/gzip"},
+  {"jar",   "application/java-archive"},
+  {"json",  "application/json"},
+  {"jsonld","application/ld+json"},
+  {"odp",   "application/vnd.oasis.opendocument.presentation"},
+  {"ods",   "application/vnd.oasis.opendocument.spreadsheet"},
+  {"odt",   "application/vnd.oasis.opendocument.text"},
+  {"pdf",   "application/pdf"},
+  {"ppt",   "application/vnd.ms-powerpoint"},
+  {"pptx",  "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+  {"rtf",   "application/rtf"},
+  {"sh",    "application/x-sh"},
+  {"tar",   "application/x-tar"},
+  {"xhtml", "application/xhtml+xml"},
+  {"xls",   "application/vnd.ms-excel"},
+  {"xlsx",  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+  {"xul",   "application/vnd.mozilla.xul+xml"},
+  {"zip",   "application/zip"},
+  {"7z",    "application/x-7z-compressed"},
+  // font
+  {"otf",   "font/otf"},
+  {"ttf",   "font/ttf"},
+  {"woff",  "font/woff"},
+  {"woff2", "font/woff2"},
+};
+
 static std::map<std::string, std::string>* ext_mime_map;
 
 void parse_mime_map_line(const char *start, const char *end)
@@ -103,11 +184,19 @@ done:
 
 const char *rgw_find_mime_by_ext(string& ext)
 {
+  // First, check the dynamically loaded mime map (from system file).
   map<string, string>::iterator iter = ext_mime_map->find(ext);
-  if (iter == ext_mime_map->end())
-    return NULL;
+  if (iter != ext_mime_map->end()) {
+    return iter->second.c_str();
+  }
 
-  return iter->second.c_str();
+  // Fall back to the built-in content type map.
+  auto builtin_iter = builtin_content_type_map.find(ext);
+  if (builtin_iter != builtin_content_type_map.end()) {
+    return builtin_iter->second.c_str();
+  }
+
+  return NULL;
 }
 
 int rgw_tools_init(const DoutPrefixProvider *dpp, CephContext *cct)
